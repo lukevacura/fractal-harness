@@ -20,3 +20,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/fractal_harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

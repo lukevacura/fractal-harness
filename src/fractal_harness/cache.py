@@ -56,7 +56,7 @@ class ClaimCache:
     def put(self, post: str, reads: list[str], *, pre: str = "", kind: str = "knowledge",
             probe: dict | None = None, writes: list[str] | None = None,
             depends_on: list[str] | None = None, parent_id: str | None = None,
-            delta: bool = False) -> Edge:
+            delta: bool = False, level: int | None = None, region: list[str] | None = None) -> Edge:
         """Assert a claim and check it immediately. Re-putting an existing claim re-asserts it.
 
         `delta=True` marks this as a delta repair (counts toward the keyframe interval);
@@ -83,7 +83,8 @@ class ClaimCache:
             writes=sorted(set(_norm(w) for w in writes or [])), probe=probe,
             status="pending", fingerprint=None, hashes={}, detail="",
             parent_id=parent_id, created_at=0, updated_at=0, depends_on=depends_on,
-            delta_count=delta_count,
+            delta_count=delta_count, level=level,
+            region=sorted(set(_norm(r) for r in region)) if region else [],
         )
         self.store.upsert(edge)
         self.store.log("put", eid, edge_kind=kind, has_probe=probe is not None)

@@ -55,7 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     put = sub.add_parser("put", help="assert a claim and check it")
     put.add_argument("claim", help="the postcondition / claim text")
     put.add_argument("--pre", default="", help="precondition")
-    put.add_argument("--kind", default="knowledge", choices=["knowledge", "workflow", "task", "invariant"],
+    put.add_argument("--kind", default="knowledge",
+                     choices=["knowledge", "workflow", "task", "invariant", "interface"],
                      help="invariant: a rule the code must follow; `fractal check` fails when it breaks")
     put.add_argument("--read", action="append", default=[], help="source path it depends on (repeatable)")
     put.add_argument("--write", action="append", default=[], help="path it may modify (repeatable)")
@@ -64,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     put.add_argument("--probe", help='json probe, e.g. \'{"type":"grep","pattern":"x","paths":["src/**/*.py"]}\'')
     put.add_argument("--run", help="shorthand for a command probe that must exit 0")
     put.add_argument("--delta", action="store_true", help="this put is a delta repair (see `repair`)")
+    put.add_argument("--level", type=int, choices=[1, 2, 3], help="zoom level: 1 coarse .. 3 fine")
+    put.add_argument("--region", action="append", default=[], help="code region (glob) the claim describes")
 
     nd = sub.add_parser("needed", help="is a step needed? (redundant if its outcome already holds)")
     nd.add_argument("claim", help="the step's outcome (postcondition)")
@@ -96,9 +99,22 @@ def main(argv: list[str] | None = None) -> int:
     v = sub.add_parser("verify", help="re-run probes (default: all edges)")
     v.add_argument("ids", nargs="*")
     sub.add_parser("stats", help="counts and telemetry summary")
+    mf = sub.add_parser("manifest", help="render verified claims for a region/level as an owner's context")
+    mf.add_argument("--region", action="append", default=[], help="glob(s); default: whole repo")
+    mf.add_argument("--level", type=int, choices=[1, 2, 3], help="maximum detail level")
     au = sub.add_parser("audit", help="mutation-test probes in memory: do they fail when the claim breaks?")
     au.add_argument("ids", nargs="*")
     au.add_argument("--all-verdicts", action="store_true", help="also list claims that passed the audit")
+    pl = sub.add_parser("plan", help="(prototype) plan a task as parallel edges: writes a skeleton commit")
+    pl.add_argument("task")
+    pl.add_argument("--test-cmd", required=True, help='shell template with {test}, e.g. "python -m pytest -q {test}"')
+    pl.add_argument("--max-edges", type=int, default=4)
+    pl.add_argument("--model", default="sonnet")
+    rn = sub.add_parser("run", help="(prototype) implement a plan's edges in parallel worktrees and merge")
+    rn.add_argument("plan_id")
+    rn.add_argument("--sequential", action="store_true", help="one agent implements every edge (baseline)")
+    rn.add_argument("--workers", type=int, default=4)
+    rn.add_argument("--model", default="sonnet")
     ck = sub.add_parser("check", help="pre-commit/CI gate: re-check claims; exit 1 if an invariant is violated")
     ck.add_argument("--strict", action="store_true", help="also fail when non-invariant claims need repair")
     sub.add_parser("mcp", help="serve the cache over MCP (stdio)")
@@ -164,6 +180,26 @@ def main(argv: list[str] | None = None) -> int:
         if report:
             print(report, file=sys.stderr if code else sys.stdout)
         return code
+    if args.cmd in ("plan", "run"):
+        from . import planner
+        if args.cmd == "plan":
+            p = planner.plan(root, args.task, args.test_cmd, args.model, args.max_edges)
+            print(f"plan {p.id}: {len(p.edges)} edges, skeleton {p.skeleton[:10]}, ${p.cost_usd:.2f}, {p.duration_s}s")
+            print(p.summary())
+            for d in p.dropped:
+                print(f"dropped {d['id']}: {d['reason']}")
+            return 0
+        p = planner.load(root, args.plan_id)
+        r = planner.run_sequential(root, p, args.model) if args.sequential else \
+            planner.run_parallel(root, p, args.model, args.workers)
+        out = root / ".fractal" / "plans" / f"{p.id}-{r['mode']}.json"
+        out.write_text(json.dumps(r, indent=2))
+        print(json.dumps({k: v for k, v in r.items() if k != "edges"}, indent=2))
+        return 0 if r["merge"]["integration"] else 1
+    if args.cmd == "manifest":
+        from .manifest import manifest
+        print(manifest(root, args.region or None, args.level), end="")
+        return 0
     if args.cmd == "audit":
         from .audit import audit
         results = audit(root, args.ids or None)
@@ -187,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
                 probe = {"type": "command", "run": args.run}
             _emit(args, [cache.put(args.claim, args.read, pre=args.pre, kind=args.kind, probe=probe,
                                    writes=args.write, depends_on=args.dep, parent_id=args.parent,
-                                   delta=args.delta)])
+                                   delta=args.delta, level=args.level, region=args.region)])
         elif args.cmd == "needed":
             probe = json.loads(args.probe) if args.probe else None
             if args.run:

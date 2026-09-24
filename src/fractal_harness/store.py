@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS edges (
     anchors     TEXT NOT NULL DEFAULT '[]',  -- json keyframe: lines the probe matched, with context
     repair      TEXT,                        -- json {kind, residuals} when a repair is needed
     delta_count INTEGER NOT NULL DEFAULT 0,  -- delta repairs since the last full verification
+    level       INTEGER,                     -- zoom level: 1 coarse (~10K lines) .. 3 fine (~100 lines)
+    region      TEXT NOT NULL DEFAULT '[]',  -- json globs of the code region this claim describes
     detail      TEXT NOT NULL DEFAULT '',
     parent_id   TEXT,
     created_at  REAL NOT NULL,
@@ -97,6 +99,8 @@ class Edge:
     anchors: list[dict] = field(default_factory=list)
     repair: dict | None = None
     delta_count: int = 0
+    level: int | None = None
+    region: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -113,6 +117,8 @@ class Edge:
             "depends_on": self.depends_on,
             "repair": self.repair,
             "delta_count": self.delta_count,
+            "level": self.level,
+            "region": self.region,
         }
 
 
@@ -123,7 +129,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(edges)")}
         for col, ddl in (("anchors", "TEXT NOT NULL DEFAULT '[]'"), ("repair", "TEXT"),
-                         ("delta_count", "INTEGER NOT NULL DEFAULT 0")):
+                         ("delta_count", "INTEGER NOT NULL DEFAULT 0"), ("level", "INTEGER"),
+                         ("region", "TEXT NOT NULL DEFAULT '[]'")):
             if cols and col not in cols:  # stores created before motion estimation
                 self.db.execute(f"ALTER TABLE edges ADD COLUMN {col} {ddl}")
         fts_sql = self.db.execute("SELECT sql FROM sqlite_master WHERE name = 'edges_fts'").fetchone()
@@ -166,6 +173,8 @@ class Store:
             anchors=json.loads(row["anchors"]),
             repair=json.loads(row["repair"]) if row["repair"] else None,
             delta_count=row["delta_count"],
+            level=row["level"],
+            region=json.loads(row["region"]),
         )
 
     def get(self, edge_id: str) -> Edge | None:
@@ -181,19 +190,21 @@ class Store:
             self.db.execute(
                 """INSERT INTO edges (id, kind, pre, post, reads, writes, probe, status,
                                       fingerprint, hashes, detail, parent_id, created_at, updated_at,
-                                      anchors, repair, delta_count)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      anchors, repair, delta_count, level, region)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      reads=excluded.reads, writes=excluded.writes, probe=excluded.probe,
                      status=excluded.status, fingerprint=excluded.fingerprint,
                      hashes=excluded.hashes,
                      detail=excluded.detail, parent_id=excluded.parent_id,
                      updated_at=excluded.updated_at, anchors=excluded.anchors,
-                     repair=excluded.repair, delta_count=excluded.delta_count""",
+                     repair=excluded.repair, delta_count=excluded.delta_count,
+                     level=excluded.level, region=excluded.region""",
                 (e.id, e.kind, e.pre, e.post, json.dumps(e.reads), json.dumps(e.writes),
                  json.dumps(e.probe) if e.probe else None, e.status, e.fingerprint,
                  json.dumps(e.hashes), e.detail, e.parent_id, now, now,
-                 json.dumps(e.anchors), json.dumps(e.repair) if e.repair else None, e.delta_count),
+                 json.dumps(e.anchors), json.dumps(e.repair) if e.repair else None, e.delta_count,
+                 e.level, json.dumps(e.region)),
             )
             self.db.execute("DELETE FROM edges_fts WHERE id = ?", (e.id,))
             self.db.execute("INSERT INTO edges_fts (id, body) VALUES (?, ?)", (e.id, _body(e)))
