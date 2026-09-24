@@ -1,0 +1,194 @@
+"""`fractal` command line. Works against any repo (--root, $FRACTAL_ROOT, or the enclosing git repo)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from .cache import CacheError, ClaimCache
+from .probes import ProbeError
+from .store import Edge
+
+
+def resolve_root(explicit: str | None, serving: bool = False) -> Path:
+    if explicit:
+        return Path(explicit).resolve()
+    # Claude Code sets CLAUDE_PROJECT_DIR for MCP servers. Only trust it when serving:
+    # shells spawned by Claude Code inherit it even when cd'd into another repo.
+    for var in ("FRACTAL_ROOT", "CLAUDE_PROJECT_DIR") if serving else ("FRACTAL_ROOT",):
+        if os.environ.get(var):
+            return Path(os.environ[var]).resolve()
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True)
+        return Path(out.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return Path.cwd()
+
+
+def _fmt(e: Edge) -> str:
+    pre = f"{{{e.pre}}} ⟹ " if e.pre else ""
+    line = f"{e.id}  [{e.status:8}] {e.kind}: {pre}{e.post}"
+    if e.detail and e.status not in ("verified",):
+        line += f"\n{'':20}{e.detail}"
+    return line
+
+
+def _emit(args: argparse.Namespace, edges: list[Edge]) -> None:
+    if args.json:
+        print(json.dumps([e.to_dict() for e in edges], indent=2))
+    else:
+        for e in edges:
+            print(_fmt(e))
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="fractal", description=__doc__)
+    p.add_argument("--root", help="target repo (default: $FRACTAL_ROOT or enclosing git repo)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    put = sub.add_parser("put", help="assert a claim and check it")
+    put.add_argument("claim", help="the postcondition / claim text")
+    put.add_argument("--pre", default="", help="precondition")
+    put.add_argument("--kind", default="knowledge", choices=["knowledge", "workflow", "task"])
+    put.add_argument("--read", action="append", default=[], help="source path it depends on (repeatable)")
+    put.add_argument("--write", action="append", default=[], help="path it may modify (repeatable)")
+    put.add_argument("--dep", action="append", default=[], help="edge id it depends on (repeatable)")
+    put.add_argument("--parent", help="parent edge id (for zoomed sub-edges)")
+    put.add_argument("--probe", help='json probe, e.g. \'{"type":"grep","pattern":"x","paths":["src/**/*.py"]}\'')
+    put.add_argument("--run", help="shorthand for a command probe that must exit 0")
+
+    nd = sub.add_parser("needed", help="is a step needed? (redundant if its outcome already holds)")
+    nd.add_argument("claim", help="the step's outcome (postcondition)")
+    nd.add_argument("--pre", default="")
+    nd.add_argument("--kind", default="task", choices=["knowledge", "workflow", "task"])
+    nd.add_argument("--read", action="append", default=[])
+    nd.add_argument("--probe", help="json probe that passes only once the outcome holds")
+    nd.add_argument("--run", help="shorthand for a command probe that must exit 0")
+    nd.add_argument("--deliberate", action="store_true", help="intentional redundancy; never pruned")
+
+    q = sub.add_parser("query", help="find claims (re-verifies stale matches)")
+    q.add_argument("text", nargs="?", default="")
+    q.add_argument("--path", action="append", default=[], help="only claims reading under this path")
+    q.add_argument("--all", action="store_true", help="include stale/failed/pending")
+    q.add_argument("--limit", type=int, default=20)
+
+    sub.add_parser("list", help="list every edge")
+    show = sub.add_parser("show", help="show one edge as json")
+    show.add_argument("id")
+    rm = sub.add_parser("rm", help="delete an edge")
+    rm.add_argument("id")
+    sub.add_parser("refresh", help="mark edges whose sources changed as stale (no probes run)")
+    v = sub.add_parser("verify", help="re-run probes (default: all edges)")
+    v.add_argument("ids", nargs="*")
+    sub.add_parser("stats", help="counts and telemetry summary")
+    sub.add_parser("mcp", help="serve the cache over MCP (stdio)")
+    ini = sub.add_parser("init", help="set up the target repo for Claude Code (idempotent)")
+    ini.add_argument("--no-settings", action="store_true", help="don't touch .claude/settings.json")
+    ini.add_argument("--mcp", action="store_true", help="also register the fractal-claims MCP server")
+    sub.add_parser("doctor", help="check the target repo is ready")
+    hk = sub.add_parser("hook", help="Claude Code hook entry points (read hook JSON on stdin)")
+    hk.add_argument("event", choices=["prompt", "stop"],
+                    help="prompt: UserPromptSubmit claim injection; stop: queue session for `record`")
+    rec = sub.add_parser("record", help="extract claims from queued (or given) session transcripts")
+    rec.add_argument("transcripts", nargs="*", type=Path, help="transcript/stream-json files (default: queue)")
+    rec.add_argument("--model", default="sonnet")
+    rec.add_argument("--max-per-session", type=int, default=4)
+    rec.add_argument("--dry-run", action="store_true", help="print the extraction prompt, don't run it")
+    rec.add_argument("--force", action="store_true", help="record even hits, light, and duplicate sessions")
+
+    args = p.parse_args(argv)
+    root = resolve_root(args.root, serving=args.cmd == "mcp")
+
+    if args.cmd == "mcp":
+        from .mcp_server import serve
+        serve(root)
+        return 0
+    if args.cmd == "hook":
+        from .hook import prompt_hook, stop_hook
+        if args.event == "stop":
+            stop_hook(sys.stdin.read())
+            return 0
+        out = prompt_hook(sys.stdin.read())
+        if out:
+            print(out)
+        return 0
+    if args.cmd == "record":
+        from .record import record
+        r = record(root, args.transcripts or None, args.model, args.max_per_session, args.dry_run, args.force)
+        if args.dry_run and "prompt" in r:
+            print(r["prompt"])
+        print(json.dumps({k: v for k, v in r.items() if k != "prompt"}, indent=2),
+              file=sys.stderr if args.dry_run else sys.stdout)
+        return 0
+    if args.cmd == "init":
+        from .setup import init
+        changes = init(root, settings=not args.no_settings, mcp=args.mcp)
+        print(f"fractal init: {root}")
+        for c in changes:
+            print(f"  {c}")
+        print("\nNext: run /fractal-onboard in Claude Code (optionally with a path) to seed claims."
+              "\nMatching verified claims are then injected into each prompt automatically;"
+              "\nrun `fractal record` now and then to learn claims from finished sessions.")
+        return 0
+    if args.cmd == "doctor":
+        from .setup import doctor
+        results = doctor(root)
+        for ok, msg in results:
+            print(f"{'ok  ' if ok else 'FAIL'} {msg}")
+        return 0 if all(ok for ok, _ in results) else 1
+
+    cache = ClaimCache(root)
+    try:
+        if args.cmd == "put":
+            probe = json.loads(args.probe) if args.probe else None
+            if args.run:
+                probe = {"type": "command", "run": args.run}
+            _emit(args, [cache.put(args.claim, args.read, pre=args.pre, kind=args.kind, probe=probe,
+                                   writes=args.write, depends_on=args.dep, parent_id=args.parent)])
+        elif args.cmd == "needed":
+            probe = json.loads(args.probe) if args.probe else None
+            if args.run:
+                probe = {"type": "command", "run": args.run}
+            v = cache.needed(args.claim, args.read, pre=args.pre, kind=args.kind, probe=probe,
+                             deliberate=args.deliberate)
+            print(json.dumps(v, indent=2) if args.json else
+                  f"{'NEEDED   ' if v['needed'] else 'REDUNDANT'} {v['reason']}")
+            return 0 if v["needed"] else 3
+        elif args.cmd == "query":
+            _emit(args, cache.query(args.text, args.path, None if args.all else ("verified", "trusted"),
+                                    args.limit))
+        elif args.cmd == "list":
+            _emit(args, cache.store.all())
+        elif args.cmd == "show":
+            e = cache.get(args.id)
+            if e is None:
+                raise CacheError(f"unknown edge: {args.id}")
+            print(json.dumps(e.to_dict(), indent=2))
+        elif args.cmd == "rm":
+            stale = cache.delete(args.id)
+            print(f"deleted {args.id}; {len(stale)} dependents now stale")
+        elif args.cmd == "refresh":
+            stale = cache.refresh()
+            _emit(args, [cache.get(i) for i in stale])
+            if not args.json:
+                print(f"{len(stale)} edges newly stale")
+        elif args.cmd == "verify":
+            _emit(args, cache.verify(args.ids or None))
+        elif args.cmd == "stats":
+            print(json.dumps(cache.stats(), indent=2))
+    except (CacheError, ProbeError, json.JSONDecodeError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        cache.close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

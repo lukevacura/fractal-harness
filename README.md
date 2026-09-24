@@ -1,0 +1,165 @@
+# fractal-harness
+
+A contract-chunked agent harness. Work is a DAG of edges `{pre} ⟹ {post}`; each
+edge is tied to the source files it reads, checked by a deterministic probe, and
+cached. When a source file changes, the edges that read it go stale, and so do the
+edges downstream of them. Stale edges are re-checked the next time someone
+queries them.
+
+This first layer is the **claim cache**: a store of verified claims about a codebase
+that invalidates itself. It works against any repo and is exposed to agent harnesses
+over MCP.
+
+Design notes live in `context/`, which is gitignored.
+
+## Quick start: onboard a repo
+
+```sh
+# once per machine: puts `fractal` on your PATH (editable, so harness edits apply immediately)
+uv tool install --editable /path/to/fractal-harness
+
+# once per target repo
+cd /path/to/target-repo
+fractal init      # store, .gitignore, .mcp.json, /fractal-onboard skill, settings, CLAUDE.md block
+fractal doctor    # verify the setup
+claude            # approve the fractal-claims server when prompted (once per repo)
+> /fractal-onboard            # map the whole repo at coarse zoom
+> /fractal-onboard src/api    # or zoom into one area
+```
+
+`fractal init` is idempotent. It merges into an existing `.mcp.json`, `.claude/settings.json`, `.gitignore`
+and `CLAUDE.md` instead of overwriting them, and it only manages its own marked block in `CLAUDE.md`.
+Re-run it after upgrading the harness to refresh the skill. `--no-claude-md` and `--no-settings` skip
+those two files.
+
+What it writes into the target repo:
+
+| File | Purpose |
+|---|---|
+| `.fractal/edges.db` | The claim store (gitignored; claims are per-machine for now) |
+| `.mcp.json` | Registers the `fractal-claims` MCP server (`fractal mcp`) |
+| `.claude/skills/fractal-onboard/SKILL.md` | The `/fractal-onboard` procedure |
+| `.claude/settings.json` | Enables the server, allows its tools, and installs the prompt hook |
+| `CLAUDE.md` | Tells Claude to query claims before exploring and record them after tasks |
+
+Claude Code still asks you to approve a project's MCP server the first time. Project settings
+can't approve their own servers, which is intentional.
+
+## Develop
+
+```sh
+uv sync
+```
+
+## Claims
+
+A claim is text plus the files it reads plus an optional probe:
+
+| Status | Meaning |
+|---|---|
+| `verified` | Probe passed against the current source, and every dependency is verified |
+| `trusted` | No probe, or depends on a trusted claim. Treat as a hint. |
+| `stale` | Sources or upstream changed since the verdict. It is re-checked on query. |
+| `failed` | Probe did not pass |
+| `pending` | Planned but not generated yet |
+
+Probes:
+
+```json
+{"type": "grep", "pattern": "auth_middleware", "paths": ["src/**/*.py"], "expect": "present"}
+{"type": "command", "run": "pytest -q tests/test_auth.py", "expect_exit": 0}
+```
+
+A `grep` probe's `expect` is `"present"`, `"absent"`, `{"count": n}`, `{"min": n}` or `{"max": n}`.
+
+A trusted claim whose sources change stays `stale` until someone re-asserts it with
+`put`. Re-checking it automatically would launder the change.
+
+## Claim injection (hook)
+
+Waiting for the agent to query the cache didn't pay off in practice. The agent often
+skipped it, loading the MCP tools cost a turn, and keyword queries missed. So `fractal init`
+also installs a `UserPromptSubmit` hook, `fractal hook prompt`. It ranks verified and trusted
+claims against the prompt (BM25 over claim text and read paths) and injects the top 6 as
+context before the agent's first turn. In repos without a store, and on any error, it
+does nothing.
+
+Search is ranked: any query term can match, identifiers like `_gpsDistanceFilterM` are
+tokenized, and stopword-only queries return nothing.
+
+## Learning from sessions (`fractal record`)
+
+The `Stop` hook only appends the session's transcript path to `.fractal/queue.jsonl`. It
+makes no model call and adds no context. `fractal record` processes the queue later, in one
+headless session that verifies facts in the source and records them as claims with probes.
+That cost counts as investment, not as part of any task.
+
+Recording only pays off for sessions where the cache fell short, so `record` triages first:
+
+| Session | Recorded? |
+|---|---|
+| Explored ≥2 files no injected claim covered | yes, pointed at the uncovered files |
+| Made ≥6 exploration calls (even inside covered files) | yes: the injected claims fell short |
+| Hit: the cache covered what it explored, little searching | skipped |
+| Question ≥0.6 similar to one already recorded | skipped (`--force` overrides) |
+
+If nothing qualifies, no model call is made. On round-3 benchmark data, triage keeps 3 of 15
+sessions: the three most expensive questions.
+
+```sh
+fractal record              # process the queue
+fractal record --dry-run    # show the extraction prompt and what would be skipped
+```
+
+## Probe-first pruning
+
+A step is redundant if its outcome already holds before any work is done (`P ⟹ Q`), like
+sorting an already-sorted list. `needed` / `claims_needed` takes the step's outcome and a
+probe that passes only once the outcome holds. It reports the step as redundant if the
+outcome is already a verified claim or the probe passes now. Otherwise the step is needed.
+Steps marked `deliberate` (e.g. re-validation at a trust boundary) are never pruned.
+`fractal stats` reports the **redundancy rate**. A weak probe can wrongly prune a step,
+so write probes that fail until the work is done.
+
+## CLI
+
+The target repo is `--root`, then `$FRACTAL_ROOT`, then the enclosing git repo.
+`fractal mcp` also checks `$CLAUDE_PROJECT_DIR` before the git repo.
+The store lives at `<root>/.fractal/edges.db`.
+
+```sh
+fractal put "every handler is wrapped in auth_middleware" \
+  --read src/app.py --probe '{"type":"grep","pattern":"auth_middleware","paths":["src/*.py"]}'
+fractal put "tests pass" --read src/app.py --run "pytest -q"
+fractal query auth                 # re-verifies stale matches
+fractal query --path src/ --all    # include stale/failed
+fractal refresh                    # mark stale after edits (no probes run)
+fractal needed "config loader exists" --read src/config.py \
+  --probe '{"type":"grep","pattern":"def load_config","paths":["src/*.py"]}'
+                                   # REDUNDANT (exit 3) if the outcome already holds
+fractal verify                     # re-run every probe
+fractal stats
+```
+
+Run any of these as `uv run fractal ...` from this repo, or install the package elsewhere.
+
+## MCP
+
+`fractal init` registers the server. To register it by hand instead:
+
+```sh
+claude mcp add fractal-claims -- fractal mcp
+```
+
+The server resolves the target repo from `$CLAUDE_PROJECT_DIR`, which Claude Code sets.
+
+Tools: `claims_query`, `claims_put`, `claims_needed`, `claims_verify`, `claims_stats`.
+
+Command probes run shell commands in the target repo. Only point the server at
+repos whose claims you trust.
+
+## Tests
+
+```sh
+uv run pytest
+```

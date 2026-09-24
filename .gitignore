@@ -1,0 +1,6 @@
+context/
+.venv/
+.fractal/
+__pycache__/
+*.pyc
+.pytest_cache/
