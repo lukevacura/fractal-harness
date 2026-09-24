@@ -84,3 +84,23 @@ def test_leftover_stubs_found_outside_comments(tmp_path):
     (tmp_path / "cli.py").write_text("def main():\n    # raise NotImplementedError was here\n    raise NotImplementedError\n")
     (tmp_path / "done.py").write_text("def f():\n    return 1\n")
     assert leftover_stubs(tmp_path, ["cli.py", "done.py", "missing.py"]) == ["cli.py:3"]
+
+
+def test_budget_stops_agent_calls(monkeypatch, tmp_path):
+    import fractal_harness.planner as pl
+    calls = []
+
+    class Proc:
+        stdout = '{"total_cost_usd": 0.6, "num_turns": 1, "result": "ok"}'
+        stderr = ""
+
+    monkeypatch.setattr(pl.subprocess, "run", lambda *a, **k: calls.append(1) or Proc())
+    pl.BUDGET.set(1.0)
+    try:
+        pl._agent(tmp_path, "p", "python -m pytest {test}", "m")
+        pl._agent(tmp_path, "p", "python -m pytest {test}", "m")   # 1.2 spent: over after this one
+        with pytest.raises(pl.BudgetExceeded):
+            pl._agent(tmp_path, "p", "python -m pytest {test}", "m")
+        assert len(calls) == 2
+    finally:
+        pl.BUDGET.set(None)

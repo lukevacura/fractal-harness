@@ -78,12 +78,16 @@ class ClaimCache:
             raise CacheError(f"unknown parent: {parent_id}")
         existing = self.store.get(eid)
         delta_count = (existing.delta_count + 1) if (delta and existing) else 0
+        # Invariants are human-owned: a new one starts as a proposal, and re-asserting an
+        # existing one never changes the state a human gave it (enforced / rejected).
+        rule_state = (existing.rule_state if existing and existing.rule_state else "proposed") \
+            if kind == "invariant" else None
         edge = Edge(
             id=eid, kind=kind, pre=pre.strip(), post=post.strip(), reads=reads,
             writes=sorted(set(_norm(w) for w in writes or [])), probe=probe,
             status="pending", fingerprint=None, hashes={}, detail="",
             parent_id=parent_id, created_at=0, updated_at=0, depends_on=depends_on,
-            delta_count=delta_count, level=level,
+            delta_count=delta_count, level=level, rule_state=rule_state,
             region=sorted(set(_norm(r) for r in region)) if region else [],
         )
         self.store.upsert(edge)
@@ -119,6 +123,20 @@ class ClaimCache:
                 verdict = {"needed": True, "reason": "no probe: cannot show it already holds"}
         self.store.log("prune", eid, needed=verdict["needed"], reason=verdict["reason"].split(":")[0])
         return {"id": eid, **verdict}
+
+    def set_rule(self, eid: str, state: str) -> Edge:
+        """Human step: accept (enforce) or reject a proposed invariant."""
+        if state not in ("enforced", "rejected", "proposed"):
+            raise CacheError(f"bad rule state {state!r}")
+        e = self._require(eid)
+        if e.kind != "invariant":
+            raise CacheError(f"{eid} is a {e.kind} claim, not an invariant")
+        self.store.set_rule_state(eid, state)
+        self.store.log("rule", eid, state=state)
+        return self._require(eid)
+
+    def invariants(self, states: tuple[str, ...] = ("proposed", "enforced", "rejected")) -> list[Edge]:
+        return [e for e in self.store.all() if e.kind == "invariant" and e.rule_state in states]
 
     def delete(self, eid: str) -> list[str]:
         """Remove an edge; its dependents become stale (blocked)."""
@@ -305,9 +323,31 @@ class ClaimCache:
             "checks": len(checks),
             "checks_failed": sum(1 for c in checks if c["status"] == "failed"),
             "stale_events": len(self.store.events("stale")),
+            **self._usage(),
             "steps_checked": len(prunes),
             "steps_redundant": redundant,
             "redundancy_rate": round(redundant / len(prunes), 3) if prunes else None,
+        }
+
+    def _usage(self) -> dict:
+        """Real-use metrics: how often prompts hit the cache, and what learning/upkeep cost."""
+        injects = self.store.events("inject")
+        prompts = [e for e in injects if e.get("session_id")]   # real sessions (not experiments)
+        hits = [e for e in prompts if e.get("claims")]
+        records = self.store.events("record")
+        repairs = self.store.events("repair")
+        updates = self.store.events("update")
+        return {
+            "prompts_seen": len(prompts),
+            "prompts_with_claims": len(hits),
+            "hit_rate": round(len(hits) / len(prompts), 3) if prompts else None,
+            "claims_injected": sum(e.get("claims", 0) for e in prompts),
+            "sessions_recorded": sum(e.get("sessions", 0) for e in records),
+            "claims_recorded": sum(e.get("claims_added", 0) for e in records),
+            "record_cost_usd": round(sum(e.get("cost_usd", 0.0) for e in records), 3),
+            "repairs": sum(e.get("entries", 0) for e in repairs),
+            "repair_cost_usd": round(sum(e.get("cost_usd", 0.0) for e in repairs), 3),
+            "update_runs": len(updates),
         }
 
     # --- internals -----------------------------------------------------------

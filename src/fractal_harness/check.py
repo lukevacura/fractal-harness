@@ -1,8 +1,9 @@
 """`fractal check`: a commit/CI gate built from claims. Local, deterministic, no model call.
 
 Re-checks every claim affected by the working tree's changes (`update`). A failing
-`invariant` claim is a violation: the code broke a rule, so the check fails. Other broken
-claims mean the cache needs repair, which is a warning unless `strict`.
+*enforced* invariant is a violation: the code broke a rule a human accepted, so the check
+fails. A failing *proposed* invariant is reported but never blocks. Other broken claims mean
+the cache needs repair, which is a warning unless `strict`.
 """
 
 from __future__ import annotations
@@ -22,10 +23,12 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
         edges = cache.store.all()
     finally:
         cache.close()
-    violations = [e for e in edges if e.kind == "invariant" and e.status == "failed"]
+    violations = [e for e in edges if e.enforced and e.status == "failed"]
+    proposed_failing = [e for e in edges if e.kind == "invariant" and e.rule_state == "proposed"
+                        and e.status == "failed"]
     needs_repair = [e for e in edges if e.kind != "invariant" and e.status in ("failed", "stale")
                     and e.repair is not None]
-    lines = []
+    lines = [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}" for e in proposed_failing]
     for e in violations:
         lines.append(f"VIOLATION {e.id}: {e.post}\n          probe: {e.detail}")
     if needs_repair:

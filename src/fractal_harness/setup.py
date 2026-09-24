@@ -13,7 +13,12 @@ SERVER = "fractal-claims"
 SKILL = "fractal-onboard"
 PROMPT_HOOK = "fractal hook prompt"
 STOP_HOOK = "fractal hook stop"
+EDIT_HOOK = "fractal hook edit"
+EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
 CLI_PERMISSION = "Bash(fractal:*)"
+# Accepting or rejecting a rule is a human decision: deny these to agents even though the
+# rest of the CLI is allowed (deny wins over allow).
+HUMAN_ONLY = ["Bash(fractal accept:*)", "Bash(fractal reject:*)"]
 # Marker of the CLAUDE.md block earlier versions wrote; init now removes it. Standing
 # instructions change agent behavior even on a cache miss, so all guidance travels inside
 # the injected context instead.
@@ -127,6 +132,9 @@ def init(root: Path, settings: bool = True, mcp: bool = False, git_hook: bool = 
         before = json.dumps(s, sort_keys=True)
         allow = s.setdefault("permissions", {}).setdefault("allow", [])
         _add_unique(allow, CLI_PERMISSION)
+        deny = s["permissions"].setdefault("deny", [])
+        for rule in HUMAN_ONLY:
+            _add_unique(deny, rule)
         enabled = s.get("enabledMcpjsonServers", [])
         if mcp:
             _add_unique(s.setdefault("enabledMcpjsonServers", []), SERVER)
@@ -138,14 +146,17 @@ def init(root: Path, settings: bool = True, mcp: bool = False, git_hook: bool = 
                     del s["enabledMcpjsonServers"]
             if f"mcp__{SERVER}" in allow:
                 allow.remove(f"mcp__{SERVER}")
-        for event, command in (("UserPromptSubmit", PROMPT_HOOK), ("Stop", STOP_HOOK)):
+        for event, command, matcher in (("UserPromptSubmit", PROMPT_HOOK, None), ("Stop", STOP_HOOK, None),
+                                        ("PostToolUse", EDIT_HOOK, EDIT_MATCHER)):
             if not _has_hook(s, event, command):
-                s.setdefault("hooks", {}).setdefault(event, []).append(
-                    {"hooks": [{"type": "command", "command": command}]})
+                group = {"hooks": [{"type": "command", "command": command}]}
+                if matcher:
+                    group = {"matcher": matcher, **group}
+                s.setdefault("hooks", {}).setdefault(event, []).append(group)
         if json.dumps(s, sort_keys=True) != before:
             _write_json(settings_path, s)
-            done.append("settings   .claude/settings.json (prompt hook injects claims, stop hook queues "
-                        "sessions for `fractal record`, allow the fractal CLI)")
+            done.append("settings   .claude/settings.json (prompt hook injects claims, edit hook enforces "
+                        "invariants, stop hook queues sessions, allow the fractal CLI except accept/reject)")
 
     claude_md = root / "CLAUDE.md"
     text = claude_md.read_text() if claude_md.exists() else ""
@@ -180,6 +191,9 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
         s = {}
     checks.append((_has_hook(s, "UserPromptSubmit", PROMPT_HOOK), "UserPromptSubmit hook injects claims"))
     checks.append((_has_hook(s, "Stop", STOP_HOOK), "Stop hook queues sessions for `fractal record`"))
+    checks.append((_has_hook(s, "PostToolUse", EDIT_HOOK), "PostToolUse hook enforces invariants on edits"))
+    deny = s.get("permissions", {}).get("deny", [])
+    checks.append((all(r in deny for r in HUMAN_ONLY), "agents are denied `fractal accept`/`reject`"))
     md = root / "CLAUDE.md"
     checks.append((not (md.exists() and BEGIN in md.read_text()), "CLAUDE.md has no fractal block"))
 

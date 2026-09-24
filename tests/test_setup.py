@@ -18,6 +18,9 @@ def test_init_default_leaves_misses_untouched(tmp_path: Path):
     assert "disable-model-invocation: true" in skill
     s = _settings(tmp_path)
     assert s["permissions"]["allow"] == ["Bash(fractal:*)"]
+    assert s["permissions"]["deny"] == ["Bash(fractal accept:*)", "Bash(fractal reject:*)"]
+    assert s["hooks"]["PostToolUse"][0] == {"matcher": "Edit|Write|MultiEdit|NotebookEdit",
+                                            "hooks": [{"type": "command", "command": "fractal hook edit"}]}
     assert s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "fractal hook prompt"
     assert s["hooks"]["Stop"][0]["hooks"][0]["command"] == "fractal hook stop"
     assert "enabledMcpjsonServers" not in s

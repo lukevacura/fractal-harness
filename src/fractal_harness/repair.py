@@ -80,7 +80,9 @@ def _entry(e: Edge, kind: str) -> str:
 
 def candidates(cache: ClaimCache, ids: list[str] | None = None, everything: bool = False) -> list[tuple[Edge, str]]:
     """(edge, delta|keyframe) for claims needing repair: given ids, all, or demanded since last repair."""
-    broken = {e.id: e for e in cache.store.all() if e.repair and e.status in ("failed", "stale")}
+    # Enforced invariants are human-owned: a failure is a violation to report, never to repair.
+    broken = {e.id: e for e in cache.store.all()
+              if e.repair and e.status in ("failed", "stale") and not e.enforced and e.rule_state != "rejected"}
     if ids:
         chosen = [broken[i] for i in ids if i in broken]
     elif everything:

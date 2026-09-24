@@ -22,7 +22,7 @@ import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from fractal_harness.planner import git, plan, run_direct, run_parallel, run_sequential
+from fractal_harness.planner import BUDGET, BudgetExceeded, git, plan, run_direct, run_parallel, run_sequential
 from fractal_harness.recursive import build
 
 TESTBEDS = Path(__file__).parent / "testbeds"
@@ -64,12 +64,24 @@ def main() -> None:
     ap.add_argument("--plan-only", action="store_true", help="recursive: plan, don't fill leaves")
     ap.add_argument("--leaf-max-turns", type=int, default=60)
     ap.add_argument("--check-model", default=None, help="model for checker agents (default: --model)")
+    ap.add_argument("--budget", type=float, default=None,
+                    help="hard spend limit in USD for agent calls; the run stops cleanly when reached")
     ap.add_argument("--protocol", choices=["tests", "implement"], default="tests",
                     help="leaf protocol: write faked-dependency tests, or implement only (checkers verify)")
     ap.add_argument("--no-manifest-too", action="store_true",
                     help="with --manifest: also plan once (plan only) without the manifest, for comparison")
     ap.add_argument("--recursive", default="", help="recursive configs: <plan model>:<max depth>[:<root groups>],... e.g. sonnet:2:3")
     args = ap.parse_args()
+    BUDGET.set(args.budget)
+    try:
+        run(args)
+    except BudgetExceeded as e:
+        print(f"STOPPED: {e}. Partial results are in {args.out / 'report.json'}.")
+    finally:
+        print(f"agent spend this run: ${BUDGET.spent:.2f}" + (f" of ${args.budget:.2f}" if args.budget else ""))
+
+
+def run(args) -> None:
     global TESTBED
     TESTBED = TESTBEDS / args.testbed
     args.out.mkdir(parents=True, exist_ok=True)
@@ -90,7 +102,9 @@ def main() -> None:
             skill.write_text(_template("onboard_skill.md"))
             with (repo / ".git" / "info" / "exclude").open("a") as f:
                 f.write(".claude/\n")
+            BUDGET.check()
             ob = onboard(repo, "sonnet")
+            BUDGET.add(ob.get("cost_usd") or 0.0)
             entry["onboard"] = ob
             print(f"[{name}] onboard: {ob}")
             if args.no_manifest_too:

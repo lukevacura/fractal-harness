@@ -77,6 +77,19 @@ def main(argv: list[str] | None = None) -> int:
     nd.add_argument("--run", help="shorthand for a command probe that must exit 0")
     nd.add_argument("--deliberate", action="store_true", help="intentional redundancy; never pruned")
 
+    pr = sub.add_parser("propose", help="propose an invariant (a rule the code must follow); a human accepts it")
+    pr.add_argument("rule", help="the rule, stated so a violation is unambiguous")
+    pr.add_argument("--read", action="append", default=[], help="source path it depends on (repeatable)")
+    pr.add_argument("--probe", help="json probe that fails when the rule is violated")
+    pr.add_argument("--run", help="shorthand for a command probe that must exit 0")
+    inv = sub.add_parser("invariants", help="list invariants by state: proposed, enforced, rejected")
+    inv.add_argument("--state", choices=["proposed", "enforced", "rejected"])
+    inv.add_argument("--audit", action="store_true", help="show each rule's probe audit verdict")
+    for name, verb in (("accept", "enforce"), ("reject", "reject")):
+        a = sub.add_parser(name, help=f"(human) {verb} proposed invariants")
+        a.add_argument("ids", nargs="+")
+        a.add_argument("--yes", action="store_true", help="allow a non-interactive terminal (scripts)")
+
     q = sub.add_parser("query", help="find claims (re-verifies stale matches)")
     q.add_argument("text", nargs="?", default="")
     q.add_argument("--path", action="append", default=[], help="only claims reading under this path")
@@ -124,8 +137,9 @@ def main(argv: list[str] | None = None) -> int:
     ini.add_argument("--git-hook", action="store_true", help="install `fractal check` as a git pre-commit hook")
     sub.add_parser("doctor", help="check the target repo is ready")
     hk = sub.add_parser("hook", help="Claude Code hook entry points (read hook JSON on stdin)")
-    hk.add_argument("event", choices=["prompt", "stop"],
-                    help="prompt: UserPromptSubmit claim injection; stop: queue session for `record`")
+    hk.add_argument("event", choices=["prompt", "stop", "edit"],
+                    help="prompt: UserPromptSubmit claim injection; stop: queue session for `record`; "
+                         "edit: PostToolUse re-check of enforced invariants governing the edited file")
     rec = sub.add_parser("record", help="extract claims from queued (or given) session transcripts")
     rec.add_argument("transcripts", nargs="*", type=Path, help="transcript/stream-json files (default: queue)")
     rec.add_argument("--model", default="sonnet")
@@ -141,7 +155,12 @@ def main(argv: list[str] | None = None) -> int:
         serve(root)
         return 0
     if args.cmd == "hook":
-        from .hook import prompt_hook, stop_hook
+        from .hook import edit_hook, prompt_hook, stop_hook
+        if args.event == "edit":
+            code, msg = edit_hook(sys.stdin.read())
+            if msg:
+                print(msg, file=sys.stderr)
+            return code
         if args.event == "stop":
             stop_hook(sys.stdin.read())
             return 0
@@ -215,9 +234,45 @@ def main(argv: list[str] | None = None) -> int:
             print(" ".join(f"{k}={v}" for k, v in counts.items()))
         return 1 if any(a.verdict == "weak" for a in results) else 0
 
+    if args.cmd in ("accept", "reject") and not (sys.stdin.isatty() or args.yes):
+        print(f"error: `fractal {args.cmd}` is a human decision; run it in an interactive terminal "
+              "(or pass --yes from a script you control)", file=sys.stderr)
+        return 2
+
     cache = ClaimCache(root)
     try:
-        if args.cmd == "put":
+        if args.cmd == "propose":
+            probe = json.loads(args.probe) if args.probe else None
+            if args.run:
+                probe = {"type": "command", "run": args.run}
+            e = cache.put(args.rule, args.read, kind="invariant", probe=probe)
+            _emit(args, [e])
+            if not args.json and e.rule_state == "proposed":
+                print(f"{'':20}proposed; a human enforces it with: fractal accept {e.id}")
+        elif args.cmd in ("accept", "reject"):
+            state = "enforced" if args.cmd == "accept" else "rejected"
+            for i in args.ids:
+                e = cache.set_rule(i, state)
+                print(f"{e.id}  {state}: {e.post}" + (f"  (currently {e.status}: {e.detail})"
+                                                       if e.status != "verified" else ""))
+        elif args.cmd == "invariants":
+            rules = cache.invariants((args.state,) if args.state else ("proposed", "enforced", "rejected"))
+            verdicts = {}
+            if args.audit:
+                from .audit import audit_edge
+                verdicts = {e.id: audit_edge(e, cache.root).verdict for e in rules}
+            if args.json:
+                print(json.dumps([{**e.to_dict(), "audit": verdicts.get(e.id)} for e in rules], indent=2))
+            else:
+                order = {"enforced": 0, "proposed": 1, "rejected": 2}
+                for e in sorted(rules, key=lambda e: (order[e.rule_state], e.post)):
+                    audit_note = f" audit={verdicts[e.id]}" if e.id in verdicts else ""
+                    print(f"{e.id}  [{e.rule_state:8}] [{e.status:8}]{audit_note} {e.post}")
+                    if e.status != "verified":
+                        print(f"{'':20}{e.detail}")
+                print(" ".join(f"{s}={sum(e.rule_state == s for e in rules)}"
+                               for s in ("enforced", "proposed", "rejected")))
+        elif args.cmd == "put":
             probe = json.loads(args.probe) if args.probe else None
             if args.run:
                 probe = {"type": "command", "run": args.run}

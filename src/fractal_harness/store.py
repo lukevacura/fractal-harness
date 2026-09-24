@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS edges (
     delta_count INTEGER NOT NULL DEFAULT 0,  -- delta repairs since the last full verification
     level       INTEGER,                     -- zoom level: 1 coarse (~10K lines) .. 3 fine (~100 lines)
     region      TEXT NOT NULL DEFAULT '[]',  -- json globs of the code region this claim describes
+    rule_state  TEXT,                        -- invariants only: proposed | enforced | rejected
     detail      TEXT NOT NULL DEFAULT '',
     parent_id   TEXT,
     created_at  REAL NOT NULL,
@@ -101,6 +102,11 @@ class Edge:
     delta_count: int = 0
     level: int | None = None
     region: list[str] = field(default_factory=list)
+    rule_state: str | None = None
+
+    @property
+    def enforced(self) -> bool:
+        return self.kind == "invariant" and self.rule_state == "enforced"
 
     def to_dict(self) -> dict:
         return {
@@ -119,6 +125,7 @@ class Edge:
             "delta_count": self.delta_count,
             "level": self.level,
             "region": self.region,
+            "rule_state": self.rule_state,
         }
 
 
@@ -130,9 +137,11 @@ class Store:
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(edges)")}
         for col, ddl in (("anchors", "TEXT NOT NULL DEFAULT '[]'"), ("repair", "TEXT"),
                          ("delta_count", "INTEGER NOT NULL DEFAULT 0"), ("level", "INTEGER"),
-                         ("region", "TEXT NOT NULL DEFAULT '[]'")):
-            if cols and col not in cols:  # stores created before motion estimation
+                         ("region", "TEXT NOT NULL DEFAULT '[]'"), ("rule_state", "TEXT")):
+            if cols and col not in cols:  # stores created before this column existed
                 self.db.execute(f"ALTER TABLE edges ADD COLUMN {col} {ddl}")
+                if col == "rule_state":   # invariants predating the lifecycle stay binding
+                    self.db.execute("UPDATE edges SET rule_state='enforced' WHERE kind='invariant'")
         fts_sql = self.db.execute("SELECT sql FROM sqlite_master WHERE name = 'edges_fts'").fetchone()
         if fts_sql and "porter" not in fts_sql[0]:  # index built before stemming: rebuild it
             self.db.execute("DROP TABLE edges_fts")
@@ -175,6 +184,7 @@ class Store:
             delta_count=row["delta_count"],
             level=row["level"],
             region=json.loads(row["region"]),
+            rule_state=row["rule_state"],
         )
 
     def get(self, edge_id: str) -> Edge | None:
@@ -190,8 +200,8 @@ class Store:
             self.db.execute(
                 """INSERT INTO edges (id, kind, pre, post, reads, writes, probe, status,
                                       fingerprint, hashes, detail, parent_id, created_at, updated_at,
-                                      anchors, repair, delta_count, level, region)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      anchors, repair, delta_count, level, region, rule_state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      reads=excluded.reads, writes=excluded.writes, probe=excluded.probe,
                      status=excluded.status, fingerprint=excluded.fingerprint,
@@ -199,12 +209,12 @@ class Store:
                      detail=excluded.detail, parent_id=excluded.parent_id,
                      updated_at=excluded.updated_at, anchors=excluded.anchors,
                      repair=excluded.repair, delta_count=excluded.delta_count,
-                     level=excluded.level, region=excluded.region""",
+                     level=excluded.level, region=excluded.region, rule_state=excluded.rule_state""",
                 (e.id, e.kind, e.pre, e.post, json.dumps(e.reads), json.dumps(e.writes),
                  json.dumps(e.probe) if e.probe else None, e.status, e.fingerprint,
                  json.dumps(e.hashes), e.detail, e.parent_id, now, now,
                  json.dumps(e.anchors), json.dumps(e.repair) if e.repair else None, e.delta_count,
-                 e.level, json.dumps(e.region)),
+                 e.level, json.dumps(e.region), e.rule_state),
             )
             self.db.execute("DELETE FROM edges_fts WHERE id = ?", (e.id,))
             self.db.execute("INSERT INTO edges_fts (id, body) VALUES (?, ?)", (e.id, _body(e)))
@@ -235,6 +245,11 @@ class Store:
                 self.db.execute("UPDATE edges SET anchors=? WHERE id=?", (json.dumps(anchors), edge_id))
             self.db.execute("UPDATE edges SET repair=? WHERE id=?",
                             (json.dumps(repair) if repair else None, edge_id))
+
+    def set_rule_state(self, edge_id: str, state: str) -> None:
+        with self.db:
+            self.db.execute("UPDATE edges SET rule_state=?, updated_at=? WHERE id=? AND kind='invariant'",
+                            (state, time.time(), edge_id))
 
     def put_snapshot(self, sha: str, line_hashes: list[str]) -> None:
         with self.db:

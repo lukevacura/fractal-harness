@@ -55,7 +55,9 @@ def select(root: Path, prompt: str, session_id: str | None = None, log: bool = T
             best = scored[0][1]
             ids = [i for i, score, _ in scored if score <= best * RELATIVE_CUTOFF]  # bm25 is negative
             resolved = cache.resolve(ids)
-            hits = [e for e in resolved if e.status == "verified"][:MAX_CLAIMS]
+            # Proposed or rejected rules are not facts and not (yet) rules: never inject them.
+            hits = [e for e in resolved if e.status == "verified"
+                    and (e.kind != "invariant" or e.enforced)][:MAX_CLAIMS]
             # Claims this prompt wanted but that need repair: `fractal repair` fixes demanded ones.
             wanted = [e.id for e in resolved if e.repair and e.status in ("failed", "stale")]
             if log and wanted:
@@ -78,6 +80,83 @@ def context_for(root: Path, prompt: str, session_id: str | None = None) -> str |
 def _disabled() -> bool:
     from .record import NO_HOOKS_ENV
     return bool(os.environ.get(NO_HOOKS_ENV))
+
+
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+MAX_VIOLATION_LINES = 5
+
+
+def _rel_in_repo(root: Path, path: str | None) -> str | None:
+    if not path:
+        return None
+    p = Path(path)
+    p = p if p.is_absolute() else root / p
+    try:
+        return p.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def edit_violations(root: Path, rel: str) -> tuple[int, list[str]]:
+    """Re-check the enforced invariants whose verdict depends on `rel`.
+
+    Returns (rules checked, violation messages). Runs only those rules' probes (ms), updates
+    their status in the store, and logs the check.
+    """
+    from . import probes
+    from .cache import dependencies
+    from .regions import affects
+    cache = ClaimCache(root)
+    try:
+        rules = [e for e in cache.invariants(("enforced",)) if e.probe and affects(dependencies(e), rel)]
+        messages = []
+        for e in rules:
+            result = probes.run(e.probe, cache.root)
+            if not result.passed:
+                where = []
+                for f, line in result.matches[:MAX_VIOLATION_LINES]:
+                    try:
+                        text = (cache.root / f).read_text(errors="replace").splitlines()[line].strip()
+                    except (OSError, IndexError):
+                        text = ""
+                    where.append(f"    {f}:{line + 1}: {text[:160]}")
+                messages.append("\n".join([f"- [{e.id}] {e.post}", f"    probe: {result.detail}", *where]))
+            cache.check(e.id)
+        cache.store.log("edit_check", None, file=rel, rules=len(rules), violations=len(messages))
+        return len(rules), messages
+    finally:
+        cache.close()
+
+
+def edit_hook(stdin: str) -> tuple[int, str]:
+    """PostToolUse hook for file edits: (exit code, stderr). Exit 2 feeds stderr back to the
+    agent so it fixes a violation of an enforced invariant right away; the edit itself has
+    already happened and is not undone."""
+    if _disabled():
+        return 0, ""
+    try:
+        data = json.loads(stdin or "{}")
+        if data.get("tool_name") not in EDIT_TOOLS:
+            return 0, ""
+        root = Path(os.environ.get("FRACTAL_ROOT") or os.environ.get("CLAUDE_PROJECT_DIR")
+                    or data.get("cwd") or os.getcwd()).resolve()
+        if not (root / STORE_DIR / "edges.db").exists():
+            return 0, ""
+        inp = data.get("tool_input") or {}
+        rel = _rel_in_repo(root, inp.get("file_path") or inp.get("notebook_path"))
+        if rel is None:
+            return 0, ""
+        _, messages = edit_violations(root, rel)
+    except Exception as e:  # a broken cache must never break the agent's edit loop
+        return 0, f"fractal hook: {e}"
+    if not messages:
+        return 0, ""
+    return 2, "\n".join([
+        f"fractal: your edit to {rel} violates {len(messages)} enforced invariant(s):",
+        *messages,
+        "Fix the code so every rule holds. These rules are human-owned: do not edit, remove, or "
+        "work around the claims or their probes. If a rule itself should change, stop and tell the user.",
+    ])
 
 
 def stop_hook(stdin: str) -> None:

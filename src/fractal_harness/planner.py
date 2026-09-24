@@ -33,6 +33,37 @@ from .cache import STORE_DIR
 from .record import NO_HOOKS_ENV
 
 PLAN_FILE = ".fractal-plan.json"
+
+
+class BudgetExceeded(RuntimeError):
+    pass
+
+
+class Budget:
+    """Process-wide spend limit for agent calls. Checked before every call; each call's cost
+    is added after it returns, so a run can overshoot by at most the calls already in flight."""
+
+    def __init__(self) -> None:
+        import threading
+        self.limit: float | None = None
+        self.spent = 0.0
+        self._lock = threading.Lock()
+
+    def set(self, limit: float | None) -> None:
+        with self._lock:
+            self.limit, self.spent = limit, 0.0
+
+    def check(self) -> None:
+        with self._lock:
+            if self.limit is not None and self.spent >= self.limit:
+                raise BudgetExceeded(f"budget ${self.limit:.2f} reached (spent ${self.spent:.2f})")
+
+    def add(self, cost: float) -> None:
+        with self._lock:
+            self.spent += cost or 0.0
+
+
+BUDGET = Budget()
 # An edge is not done while any stub in its write set is left unimplemented, even if its
 # test passes: the test may not exercise every stub (a contract claiming more than it checks).
 STUB_MARKERS = ("raise NotImplementedError",)
@@ -194,6 +225,7 @@ def _agent(cwd: Path, prompt: str, test_cmd: str, model: str, max_turns: int = 6
     tools = ["Read", "Grep", "Glob", "Bash(ls:*)"]
     if edit:
         tools += ["Edit", "Write", f"Bash({runner}:*)"]
+    BUDGET.check()
     cmd = ["claude", "-p", prompt, "--output-format", "json", "--model", model,
            "--strict-mcp-config", "--permission-mode", "acceptEdits" if edit else "default",
            "--allowedTools", *tools, "--no-session-persistence", "--max-turns", str(max_turns)]
@@ -204,6 +236,7 @@ def _agent(cwd: Path, prompt: str, test_cmd: str, model: str, max_turns: int = 6
         r = json.loads(proc.stdout)
     except json.JSONDecodeError:
         r = {"result": proc.stderr[-500:]}
+    BUDGET.add(r.get("total_cost_usd") or 0.0)
     return {"cost_usd": r.get("total_cost_usd") or 0.0, "turns": r.get("num_turns"),
             "duration_s": round(time.time() - t0, 1), "summary": (r.get("result") or "")[-400:],
             "result": r.get("result") or ""}

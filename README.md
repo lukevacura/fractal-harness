@@ -150,6 +150,46 @@ memory*, without writing files or calling a model, in about a second for 40 clai
 File names and identifiers absent from the probed files are ignored. Exit code 1 if any
 probe is weak.
 
+## Invariants: the tent-pole of agent alignment
+
+An agent is aligned with a codebase when it knows the rules before it acts, is checked
+against them as it acts, and can't commit a violation. Invariants are human-owned:
+
+```
+proposed (agent) ──human accepts──→ enforced ──code breaks it──→ violated
+                                        ↑                            │
+                                        └── fix the code, or change the rule deliberately
+```
+
+```sh
+fractal propose "src never imports legacy" --read src/app.py \
+  --probe '{"type":"grep","pattern":"^import legacy\\b","paths":["src/**/*.py"],"expect":"absent"}'
+fractal invariants --audit       # proposed / enforced / rejected, with probe audit verdicts
+fractal accept <id>              # human only: needs an interactive terminal
+fractal reject <id>
+```
+
+- `put --kind invariant` and `propose` always create a **proposal**. Re-asserting a rule
+  never changes the state a human gave it.
+- `fractal init` denies agents `fractal accept`/`reject` (`permissions.deny`, which beats
+  the allow on the rest of the CLI).
+- **While editing:** a `PostToolUse` hook (`fractal hook edit`) re-checks the enforced
+  rules whose probes scan the edited file, in milliseconds. On a violation it exits 2, so
+  Claude sees the rule and the offending lines and fixes them, or asks you if the request
+  conflicts with the rule. The edit itself isn't undone; the commit gate is the backstop.
+- **At commit:** `fractal check` fails on any violated enforced rule. Proposed rules are
+  reported but never block.
+- Repair never rewrites an enforced rule.
+
+## Region tree
+
+Claims are placed on a capacity-bounded tree over the code's own address space
+(directories → files): each claim sits at the smallest region containing everything it
+depends on, and a rule placed at a region governs everything beneath it. `affects(deps, file)`
+decides which rules an edit re-checks. Glob matching follows `Path.glob` semantics
+(`**/` matches zero or more directories). The tree underlies the coming coverage map and
+rule-first injection.
+
 ## Invariants and the commit gate (`fractal check`)
 
 Record rules the code must follow with `--kind invariant`. `fractal check` re-checks every

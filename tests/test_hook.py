@@ -57,3 +57,13 @@ def test_stop_hook_queues_and_is_disabled_in_recorder(tmp_path: Path, monkeypatc
     stop_hook(json.dumps({"session_id": "s3", "transcript_path": "/t/s3.jsonl", "cwd": str(root)}))
     assert _ctx(root, "what GPS distance filter do we use?") == ""
     assert len(pending(root)) == 2
+
+
+def test_stats_report_real_use_hit_rate(tmp_path: Path):
+    root = _repo(tmp_path)
+    prompt_hook(json.dumps({"prompt": "what GPS distance filter do we use?", "cwd": str(root), "session_id": "s1"}))
+    prompt_hook(json.dumps({"prompt": "how does fog of war reveal work?", "cwd": str(root), "session_id": "s2"}))
+    c = ClaimCache(root)
+    s = c.stats()
+    c.close()
+    assert (s["prompts_seen"], s["prompts_with_claims"], s["hit_rate"], s["claims_injected"]) == (2, 1, 0.5, 1)
