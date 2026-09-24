@@ -52,8 +52,15 @@ def test_source_change_that_breaks_claim_fails_on_query(cache, repo):
     assert cache.get(e.id).status == "failed"
 
 
-def test_unrelated_change_does_not_invalidate(cache, repo):
+def test_scanned_files_are_dependencies(cache, repo):
     e = cache.put("handlers call auth_middleware", ["src/app.py"], probe=grep("auth_middleware"))
+    (repo / "src" / "db.py").write_text("POOL_SIZE = 20\n")   # scanned by the probe's src/*.py
+    assert cache.refresh() == [e.id]
+    assert cache.resolve([e.id])[0].status == "verified"
+
+
+def test_unrelated_change_does_not_invalidate(cache, repo):
+    e = cache.put("handlers call auth_middleware", ["src/app.py"], probe=grep("auth_middleware", "src/app.py"))
     (repo / "src" / "db.py").write_text("POOL_SIZE = 20\n")
     assert cache.refresh() == []
     assert cache.get(e.id).status == "verified"
@@ -70,7 +77,7 @@ def test_trusted_claim_is_not_laundered_by_recheck(cache, repo):
 
 def test_failure_propagates_downstream_as_stale(cache, repo):
     a = cache.put("handlers call auth_middleware", ["src/app.py"], probe=grep("auth_middleware"))
-    b = cache.put("every request is authenticated", [], probe=grep("handler"), depends_on=[a.id])
+    b = cache.put("every request is authenticated", [], probe=grep("POOL", "src/db.py"), depends_on=[a.id])
     assert b.status == "verified"
     (repo / "src" / "app.py").write_text("def handler():\n    pass\n")
     cache.refresh()

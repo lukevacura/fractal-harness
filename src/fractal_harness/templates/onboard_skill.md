@@ -32,7 +32,9 @@ Record at most ~15 claims before going deeper:
   with a command probe (`--run "<cmd>"`) only when the command is fast (< ~60s) and has no
   side effects.
 - **Cross-cutting invariants**: auth, error handling, config loading, data access
-  conventions: anything a new contributor would break by not knowing.
+  conventions: anything a new contributor would break by not knowing. Record rules the
+  code must follow with `--kind invariant`: `fractal check` (pre-commit/CI) fails the
+  commit when one breaks, so only mark real rules, not descriptions of current behavior.
 - **Flows people ask about**: how a request, event, or record moves through several files.
   These are the questions that cost the most exploration without claims.
 

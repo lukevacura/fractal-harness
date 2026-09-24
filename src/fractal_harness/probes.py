@@ -60,18 +60,20 @@ def validate(probe: dict) -> None:
         raise ProbeError(f"unknown probe type: {kind!r}")
 
 
-def run(probe: dict, root: Path) -> ProbeResult:
+def run(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> ProbeResult:
+    """Run a probe. `overlay` maps repo-relative paths to substitute contents (grep only),
+    so audits can test probes against mutated code without touching the working tree."""
     validate(probe)
     if probe["type"] == "command":
         return _run_command(probe, root)
     if probe["type"] == "all":
-        results = [run(sub, root) for sub in probe["probes"]]
+        results = [run(sub, root, overlay) for sub in probe["probes"]]
         matches = [m for r in results for m in r.matches]
         failed = [f"#{i}: {r.detail}" for i, r in enumerate(results) if not r.passed]
         if failed:
             return ProbeResult(False, "; ".join(failed), matches)
         return ProbeResult(True, f"all {len(results)} probes passed", matches)
-    return _run_grep(probe, root)
+    return _run_grep(probe, root, overlay)
 
 
 def _run_command(probe: dict, root: Path) -> ProbeResult:
@@ -103,7 +105,7 @@ def _expectation(expect: object) -> tuple[str, int]:
     raise ProbeError(f"invalid grep expectation: {expect!r}")
 
 
-def _run_grep(probe: dict, root: Path) -> ProbeResult:
+def _run_grep(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> ProbeResult:
     pattern = re.compile(probe["pattern"])
     exclude = re.compile(probe["exclude"]) if probe.get("exclude") else None
     op, n = _expectation(probe.get("expect", "present"))
@@ -113,11 +115,12 @@ def _run_grep(probe: dict, root: Path) -> ProbeResult:
     count = 0
     matches: list[tuple[str, int]] = []
     for path in sorted(files):
+        rel = path.relative_to(root).as_posix()
         try:
-            lines = path.read_text(errors="replace").splitlines()
+            text = overlay[rel] if overlay and rel in overlay else path.read_text(errors="replace")
         except OSError:
             continue
-        rel = path.relative_to(root).as_posix()
+        lines = text.splitlines()
         for i, line in enumerate(lines):
             if pattern.search(line) and not (exclude and exclude.search(line)):
                 count += 1

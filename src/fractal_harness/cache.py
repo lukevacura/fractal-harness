@@ -24,6 +24,23 @@ class CacheError(ValueError):
     pass
 
 
+def dependencies(e: Edge) -> list[str]:
+    """What a claim's verdict depends on: its declared reads plus every path its probe scans.
+
+    A grep probe over `app/lib/**/*.dart` depends on all of those files; watching only the
+    declared reads would miss an edit to any other scanned file (e.g. a newly violated rule).
+    """
+    paths = set(e.reads)
+    stack = [e.probe] if e.probe else []
+    while stack:
+        p = stack.pop()
+        if p.get("type") == "all":
+            stack.extend(p["probes"])
+        elif p.get("type") == "grep":
+            paths.update(p["paths"])
+    return sorted(paths)
+
+
 class ClaimCache:
     def __init__(self, root: Path | str, checker_version: str = CHECKER_VERSION):
         self.root = Path(root).resolve()
@@ -121,7 +138,7 @@ class ClaimCache:
             self.store.set_status(eid, "stale", "blocked by upstream: " + ", ".join(
                 f"{d} ({self._status(d)})" for d in blocked))
         else:
-            hashes = read_hashes(self.root, e.reads)
+            hashes = read_hashes(self.root, dependencies(e))
             fp = fingerprint(hashes, e.probe, self.checker_version)
             trusted_deps = [d for d in e.depends_on if self._status(d) == "trusted"]
             if e.probe is None:
@@ -171,13 +188,18 @@ class ClaimCache:
         return self._require(eid)
 
     def refresh(self) -> list[str]:
-        """Cheap invalidation scan: no probes run. Returns ids newly marked stale."""
+        """Cheap invalidation scan: no probes run. Returns ids newly marked stale.
+
+        Good claims whose sources changed become stale. So do failed claims whose sources
+        changed since they failed: the edit may have fixed the code (e.g. a reverted
+        violation), and only a re-check can tell.
+        """
         stale = []
         memo: dict[str, str] = {}
         for e in self.store.all():
-            if e.status not in GOOD:
+            if e.status not in GOOD and e.status != "failed":
                 continue
-            hashes = {r: memo.setdefault(r, read_hashes(self.root, [r])[r]) for r in e.reads}
+            hashes = {r: memo.setdefault(r, read_hashes(self.root, [r])[r]) for r in dependencies(e)}
             if fingerprint(hashes, e.probe, self.checker_version) != e.fingerprint:
                 changed = _changed(e.hashes, hashes) or ["checker version"]
                 self.store.set_status(e.id, "stale", "sources changed: " + ", ".join(changed))

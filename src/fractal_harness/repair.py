@@ -36,9 +36,10 @@ and act on it with the fractal CLI (do not modify any source files):
 - CHANGED: the code changed and the claim should say something different:
   `fractal rm <id>`, then `fractal put "<new claim>" --read ... --probe '<json>' {delta_flag}`.
 - NO LONGER TRUE and not worth replacing: `fractal rm <id>`.
-- VIOLATION: the claim states a rule the code is supposed to follow (an invariant, a
+- VIOLATION: the claim states a rule the code is supposed to follow (kind "invariant", a
   "never"/"must"/"always" rule, an "absent" probe) and the code now breaks it. Do NOT
-  edit or remove the claim; just report it.
+  edit or remove the claim; just report it. Invariant entries are only listed here when
+  their probe is brittle; if the code truly violates one, it is a VIOLATION.
 
 "Still true" means true AND still an adequate description: if the claim is literally true
 but the code around it changed what matters about its subject (e.g. a rewrite replaced the
@@ -64,7 +65,7 @@ Entries:
 
 
 def _entry(e: Edge, kind: str) -> str:
-    lines = [f"### {e.id} [{kind.upper()}]", f"Claim: {e.post}"]
+    lines = [f"### {e.id} [{kind.upper()}]{' [INVARIANT]' if e.kind == 'invariant' else ''}", f"Claim: {e.post}"]
     if e.pre:
         lines.append(f"Precondition: {e.pre}")
     lines += [f"Reads: {', '.join(e.reads)}", f"Probe: {json.dumps(e.probe)}", f"Status now: {e.detail}"]

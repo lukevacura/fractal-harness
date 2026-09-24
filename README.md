@@ -135,6 +135,32 @@ so does every claim after 3 delta repairs in a row, so patches can't drift. By d
 about stay broken for free. A failing invariant is reported as a violation and left alone:
 the code may be what's wrong.
 
+## Auditing probes (`fractal audit`)
+
+A claim is only as good as its probe. `fractal audit` mutation-tests every grep probe *in
+memory*, without writing files or calling a model, in about a second for 40 claims:
+
+| Check | Mutation | Expected | Finding if not |
+|---|---|---|---|
+| removal | delete the lines the probe matched | probe fails | **weak**: the probe doesn't depend on its matches |
+| injection | (absent probes) add a line violating the rule | probe fails | **weak**: the rule can never fail (e.g. an over-broad `exclude`) |
+| values | change each number the claim states | probe fails | **partial**: the claim states a value the probe doesn't check |
+| identifiers | rename each identifier the claim mentions | probe fails | **partial**: the claim mentions something the probe doesn't check |
+
+File names and identifiers absent from the probed files are ignored. Exit code 1 if any
+probe is weak.
+
+## Invariants and the commit gate (`fractal check`)
+
+Record rules the code must follow with `--kind invariant`. `fractal check` re-checks every
+claim affected by the working tree (locally, no model call) and exits 1 if an invariant is
+violated. Other broken claims are reported as needing repair (they fail the check only
+with `--strict`). `fractal init --git-hook` installs it as a pre-commit hook. It never
+overwrites an existing hook; it tells you to add `fractal check` yourself instead.
+
+Every path a probe scans counts as a dependency, alongside the declared `--read` files.
+A rule probed over `app/lib/**/*.dart` is re-checked when *any* of those files changes.
+
 ## Probe-first pruning
 
 A step is redundant if its outcome already holds before any work is done (`P ⟹ Q`), like

@@ -52,7 +52,32 @@ def _has_hook(settings: dict, event: str, command: str) -> bool:
                for g in settings.get("hooks", {}).get(event, []) for h in g.get("hooks", []))
 
 
-def init(root: Path, settings: bool = True, mcp: bool = False) -> list[str]:
+GIT_HOOK = """#!/bin/sh
+# Installed by `fractal init --git-hook`: fail the commit when a claimed invariant is violated.
+command -v fractal >/dev/null 2>&1 || exit 0
+exec fractal check
+"""
+
+
+def _install_git_hook(root: Path) -> str | None:
+    import subprocess
+    try:
+        hooks = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=root,
+                               capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "git hook   skipped (not a git repo)"
+    path = (root / hooks / "pre-commit").resolve()
+    if path.exists():
+        if "fractal check" in path.read_text():
+            return None
+        return f"git hook   skipped: {path} exists; add `fractal check` to it yourself"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(GIT_HOOK)
+    path.chmod(0o755)
+    return f"git hook   {path} runs `fractal check`"
+
+
+def init(root: Path, settings: bool = True, mcp: bool = False, git_hook: bool = False) -> list[str]:
     """Set up `root`; returns a line per change made.
 
     By default a session that misses the cache is identical to one without it: no CLAUDE.md
@@ -130,6 +155,9 @@ def init(root: Path, settings: bool = True, mcp: bool = False) -> list[str]:
         new = "\n\n".join(part for part in (head, tail) if part)
         claude_md.write_text(new + "\n" if new else "")
         done.append("CLAUDE.md  removed block from an earlier fractal version")
+
+    if git_hook and (msg := _install_git_hook(root)):
+        done.append(msg)
 
     return done
 

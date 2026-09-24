@@ -55,7 +55,8 @@ def main(argv: list[str] | None = None) -> int:
     put = sub.add_parser("put", help="assert a claim and check it")
     put.add_argument("claim", help="the postcondition / claim text")
     put.add_argument("--pre", default="", help="precondition")
-    put.add_argument("--kind", default="knowledge", choices=["knowledge", "workflow", "task"])
+    put.add_argument("--kind", default="knowledge", choices=["knowledge", "workflow", "task", "invariant"],
+                     help="invariant: a rule the code must follow; `fractal check` fails when it breaks")
     put.add_argument("--read", action="append", default=[], help="source path it depends on (repeatable)")
     put.add_argument("--write", action="append", default=[], help="path it may modify (repeatable)")
     put.add_argument("--dep", action="append", default=[], help="edge id it depends on (repeatable)")
@@ -95,10 +96,16 @@ def main(argv: list[str] | None = None) -> int:
     v = sub.add_parser("verify", help="re-run probes (default: all edges)")
     v.add_argument("ids", nargs="*")
     sub.add_parser("stats", help="counts and telemetry summary")
+    au = sub.add_parser("audit", help="mutation-test probes in memory: do they fail when the claim breaks?")
+    au.add_argument("ids", nargs="*")
+    au.add_argument("--all-verdicts", action="store_true", help="also list claims that passed the audit")
+    ck = sub.add_parser("check", help="pre-commit/CI gate: re-check claims; exit 1 if an invariant is violated")
+    ck.add_argument("--strict", action="store_true", help="also fail when non-invariant claims need repair")
     sub.add_parser("mcp", help="serve the cache over MCP (stdio)")
     ini = sub.add_parser("init", help="set up the target repo for Claude Code (idempotent)")
     ini.add_argument("--no-settings", action="store_true", help="don't touch .claude/settings.json")
     ini.add_argument("--mcp", action="store_true", help="also register the fractal-claims MCP server")
+    ini.add_argument("--git-hook", action="store_true", help="install `fractal check` as a git pre-commit hook")
     sub.add_parser("doctor", help="check the target repo is ready")
     hk = sub.add_parser("hook", help="Claude Code hook entry points (read hook JSON on stdin)")
     hk.add_argument("event", choices=["prompt", "stop"],
@@ -136,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "init":
         from .setup import init
-        changes = init(root, settings=not args.no_settings, mcp=args.mcp)
+        changes = init(root, settings=not args.no_settings, mcp=args.mcp, git_hook=args.git_hook)
         print(f"fractal init: {root}")
         for c in changes:
             print(f"  {c}")
@@ -150,6 +157,27 @@ def main(argv: list[str] | None = None) -> int:
         for ok, msg in results:
             print(f"{'ok  ' if ok else 'FAIL'} {msg}")
         return 0 if all(ok for ok, _ in results) else 1
+
+    if args.cmd == "check":
+        from .check import check
+        code, report = check(root, strict=args.strict)
+        if report:
+            print(report, file=sys.stderr if code else sys.stdout)
+        return code
+    if args.cmd == "audit":
+        from .audit import audit
+        results = audit(root, args.ids or None)
+        if args.json:
+            print(json.dumps([a.to_dict() for a in results], indent=2))
+        else:
+            for a in results:
+                if a.verdict in ("weak", "partial") or args.all_verdicts:
+                    print(f"{a.id}  [{a.verdict:7}] {a.claim[:100]}")
+                    for f in a.findings:
+                        print(f"{'':20}- {f}")
+            counts = {v: sum(a.verdict == v for a in results) for v in ("ok", "partial", "weak", "n/a")}
+            print(" ".join(f"{k}={v}" for k, v in counts.items()))
+        return 1 if any(a.verdict == "weak" for a in results) else 0
 
     cache = ClaimCache(root)
     try:
