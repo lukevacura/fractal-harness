@@ -67,3 +67,42 @@ def test_stats_report_real_use_hit_rate(tmp_path: Path):
     s = c.stats()
     c.close()
     assert (s["prompts_seen"], s["prompts_with_claims"], s["hit_rate"], s["claims_injected"]) == (2, 1, 0.5, 1)
+
+
+# --- rules first, with evidence ---------------------------------------------------------------
+
+def _rules_repo(tmp_path: Path) -> Path:
+    import subprocess
+    root = _repo(tmp_path)
+    (root / "legacy_free.py").write_text("import os\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    c = ClaimCache(root)
+    wide = c.put("no file imports legacy", ["*.py"], kind="invariant",
+                 probe={"type": "grep", "pattern": r"^import legacy", "paths": ["*.py"], "expect": "absent"})
+    c.set_rule(wide.id, "enforced")
+    c.put("proposal only", ["app.py"], kind="invariant",
+          probe={"type": "grep", "pattern": "GPS_FILTER", "paths": ["app.py"]})
+    c.close()
+    return root
+
+
+def test_rules_come_first_with_evidence_and_facts_have_evidence(tmp_path):
+    root = _rules_repo(tmp_path)
+    ctx = _ctx(root, "what GPS distance filter do we use?")
+    assert ctx.index("RULES") < ctx.index("FACTS")
+    assert "no file imports legacy" in ctx and "✓ holds now:" in ctx
+    assert "✓ app.py:1: GPS_FILTER = 5" in ctx
+    assert "proposal only" not in ctx
+
+
+def test_enforced_repo_rules_show_even_without_matching_facts(tmp_path):
+    root = _rules_repo(tmp_path)
+    ctx = _ctx(root, "refactor the build pipeline")
+    assert ctx.startswith("RULES") and "FACTS" not in ctx
+
+
+def test_violated_rule_is_flagged(tmp_path):
+    root = _rules_repo(tmp_path)
+    (root / "legacy_free.py").write_text("import legacy\n")
+    ctx = _ctx(root, "anything about the build")
+    assert "✗ VIOLATED NOW" in ctx

@@ -31,7 +31,7 @@ from pathlib import Path
 
 from .planner import (_accept, _agent, _drop_worktree, _exclude_store, _worktree, changed_files, git,
                       leftover_stubs, outside, run_test)
-from .cache import STORE_DIR
+from fractal_harness.cache import STORE_DIR
 
 DECOMPOSE_PROMPT = """\
 You plan one node of a recursive, contract-first implementation. Do NOT write code files.
@@ -387,8 +387,9 @@ def _owner_context(root: Path, leaf: Node, use_manifest: bool) -> str:
     """The leaf owner's refreshable context: the manifest for its region, if claims exist."""
     if not use_manifest:
         return ""
-    from .manifest import manifest
-    return KNOWN.format(manifest=manifest(root, leaf.writes))
+    from fractal_harness.manifest import manifest
+    from fractal_harness.regions import placement, tracked_files
+    return KNOWN.format(manifest=manifest(root, placement(leaf.writes, tracked_files(root))))
 
 
 def _fill_leaf(root: Path, tree: Node, leaf: Node, task: str, skeleton: str, test_cmd: str, model: str,
@@ -499,7 +500,7 @@ def build(root: Path, task: str, test_cmd: str, model: str = "sonnet", plan_mode
     head = git(root, "rev-parse", "HEAD")
     text = None
     if use_manifest:
-        from .manifest import manifest
+        from fractal_harness.manifest import manifest
         text = manifest(root)
     early: dict[str, Future] = {}
 

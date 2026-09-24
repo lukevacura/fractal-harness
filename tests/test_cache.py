@@ -134,41 +134,6 @@ def test_query_by_path_and_stats(cache):
     assert s["edges"] == 2 and s["queries"] == 2 and s["queries_with_hits"] == 2
 
 
-def test_needed_when_probe_fails(cache):
-    v = cache.needed("config loader exists", ["src/app.py"], probe=grep("load_config"))
-    assert v["needed"] and v["reason"].startswith("probe fails")
-
-
-def test_redundant_when_outcome_already_holds_and_records_it(cache):
-    v = cache.needed("handlers call auth_middleware", ["src/app.py"], probe=grep("auth_middleware"))
-    assert not v["needed"] and v["reason"].startswith("already holds")
-    assert cache.get(v["id"]).status == "verified"
-
-
-def test_redundant_when_cached(cache):
-    cache.put("handlers call auth_middleware", ["src/app.py"], kind="task", probe=grep("auth_middleware"))
-    v = cache.needed("handlers call auth_middleware", ["src/app.py"])
-    assert not v["needed"] and v["reason"].startswith("cached")
-
-
-def test_cached_but_now_false_is_needed(cache, repo):
-    cache.put("handlers call auth_middleware", ["src/app.py"], kind="task", probe=grep("auth_middleware"))
-    (repo / "src" / "app.py").write_text("def handler():\n    pass\n")
-    assert cache.needed("handlers call auth_middleware", ["src/app.py"])["needed"]
-
-
-def test_deliberate_and_unprobed_steps_are_needed(cache):
-    assert cache.needed("re-validate input", ["src/app.py"], probe=grep("handler"), deliberate=True)["needed"]
-    assert cache.needed("something vague", ["src/app.py"])["needed"]
-
-
-def test_redundancy_rate(cache):
-    cache.needed("a", ["src/app.py"], probe=grep("auth_middleware"))
-    cache.needed("b", ["src/app.py"], probe=grep("nope"))
-    s = cache.stats()
-    assert (s["steps_checked"], s["steps_redundant"], s["redundancy_rate"]) == (2, 1, 0.5)
-
-
 def test_grep_is_line_based_with_exclude(cache, repo):
     (repo / "src" / "old.py").write_text("# SegmentIndex was deleted\nx = 1\n")
     plain = grep(r"\bSegmentIndex\b", expect="absent")

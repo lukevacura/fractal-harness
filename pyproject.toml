@@ -1,12 +1,10 @@
 [project]
 name = "fractal-harness"
 version = "0.1.0"
-description = "Contract-chunked agent harness: verified, self-invalidating claim cache for codebases."
+description = "Invariant-aligned coding agents: human-owned rules and verified, self-maintaining facts, enforced before, during and after every edit."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-    "mcp>=2.2,<3",
-]
+dependencies = []
 
 [project.scripts]
 fractal = "fractal_harness.cli:main"
@@ -22,4 +20,5 @@ build-backend = "hatchling.build"
 packages = ["src/fractal_harness"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "experiments/tests"]
+pythonpath = ["experiments"]

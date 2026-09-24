@@ -29,8 +29,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from .cache import STORE_DIR
-from .record import NO_HOOKS_ENV
+from fractal_harness.cache import STORE_DIR
+from fractal_harness.record import NO_HOOKS_ENV
 
 PLAN_FILE = ".fractal-plan.json"
 
@@ -268,7 +268,8 @@ def leftover_stubs(wt: Path, writes: list[str]) -> list[str]:
 
 
 def outside(files: list[str], writes: list[str]) -> list[str]:
-    return [f for f in files if not any(f == w or fnmatch.fnmatch(f, w) for w in writes)]
+    from fractal_harness.regions import affects
+    return [f for f in files if not affects(writes, f)]
 
 
 # --- plan -----------------------------------------------------------------------

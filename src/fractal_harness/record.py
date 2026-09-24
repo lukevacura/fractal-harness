@@ -8,7 +8,6 @@ Its cost is investment, never charged to the task that triggered it.
 
 from __future__ import annotations
 
-import fnmatch
 import json
 import os
 import re
@@ -18,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .cache import STORE_DIR, ClaimCache
+from .regions import affects
 from .store import tokens
 
 QUEUE = "queue.jsonl"
@@ -54,7 +54,13 @@ questions WITHOUT exploring. Work like this:
      becomes false. If part of a claim cannot be probed, record that part separately without
      --probe (it is stored as trusted) or leave it out.
 4. At most {max_per_session} claims per session; prefer facts that took the session the most
-   exploration to find. Do not modify any files. Finish with a one-line summary.
+   exploration to find.
+5. If a session revealed a RULE the code follows and must keep following (a boundary, a
+   forbidden call, a required element), propose it with
+   `fractal propose "<rule>" --read <file> --probe '<json>'`, where the probe fails when the
+   rule is violated and passes now. Proposals are reviewed by a human; never run
+   `fractal accept` or `fractal reject`. Check existing rules first with `fractal invariants`.
+Do not modify any files. Finish with a one-line summary.
 
 Sessions:
 {sessions}
@@ -181,10 +187,6 @@ def _covered_files(cache: ClaimCache, session_id: str) -> set[str] | None:
     return set(reads)
 
 
-def _is_covered(path: str, reads: set[str]) -> bool:
-    return any(path == r or fnmatch.fnmatch(path, r) or path.startswith(r.rstrip("/") + "/") for r in reads)
-
-
 def triage(root: Path, sessions: list[Session], force: bool = False) -> tuple[list[Session], list[dict]]:
     """Split sessions into (worth recording, skipped with reasons)."""
     keep, skipped = [], []
@@ -196,7 +198,7 @@ def triage(root: Path, sessions: list[Session], force: bool = False) -> tuple[li
                 skipped.append({"source": s.source, "reason": "nothing explored"})
                 continue
             covered = _covered_files(cache, s.session_id) if s.session_id else None
-            new_files = [f for f in s.files if not (covered and _is_covered(f, covered))]
+            new_files = [f for f in s.files if not (covered and affects(list(covered), f))]
             heavy = s.exploration_calls >= MIN_EXPLORATION_CALLS
             if not force and len(new_files) < MIN_NEW_FILES and not heavy:
                 reason = "hit: cache covered the exploration" if covered else "explored too little"

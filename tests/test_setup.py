@@ -21,6 +21,8 @@ def test_init_default_leaves_misses_untouched(tmp_path: Path):
     assert s["permissions"]["deny"] == ["Bash(fractal accept:*)", "Bash(fractal reject:*)"]
     assert s["hooks"]["PostToolUse"][0] == {"matcher": "Edit|Write|MultiEdit|NotebookEdit",
                                             "hooks": [{"type": "command", "command": "fractal hook edit"}]}
+    assert s["hooks"]["PreToolUse"][0] == {"matcher": "Edit|Write|MultiEdit",
+                                           "hooks": [{"type": "command", "command": "fractal hook pre-edit"}]}
     assert s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "fractal hook prompt"
     assert s["hooks"]["Stop"][0]["hooks"][0]["command"] == "fractal hook stop"
     assert "enabledMcpjsonServers" not in s
@@ -33,10 +35,11 @@ def test_init_is_idempotent(tmp_path: Path):
     assert {p: p.read_bytes() for p in snapshot} == snapshot
 
 
-def test_init_mcp_opt_in_and_back_out(tmp_path: Path):
-    init(tmp_path, mcp=True)
-    assert SERVER in json.loads((tmp_path / ".mcp.json").read_text())["mcpServers"]
-    assert f"mcp__{SERVER}" in _settings(tmp_path)["permissions"]["allow"]
+def test_init_removes_legacy_mcp_registration(tmp_path: Path):
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {SERVER: {"command": "fractal"}}}))
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / "settings.json").write_text(json.dumps(
+        {"enabledMcpjsonServers": [SERVER], "permissions": {"allow": [f"mcp__{SERVER}"]}}))
     init(tmp_path)
     assert not (tmp_path / ".mcp.json").exists()
     s = _settings(tmp_path)

@@ -22,8 +22,8 @@ import subprocess
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from fractal_harness.planner import BUDGET, BudgetExceeded, git, plan, run_direct, run_parallel, run_sequential
-from fractal_harness.recursive import build
+from fractal_planner.planner import BUDGET, BudgetExceeded, git, plan, run_direct, run_parallel, run_sequential
+from fractal_planner.recursive import build
 
 TESTBEDS = Path(__file__).parent / "testbeds"
 TESTBED = TESTBEDS / "ledger"

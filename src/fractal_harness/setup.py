@@ -9,12 +9,14 @@ from pathlib import Path
 
 from .cache import STORE_DIR, ClaimCache
 
-SERVER = "fractal-claims"
+SERVER = "fractal-claims"   # the MCP server earlier versions registered; init removes it
 SKILL = "fractal-onboard"
 PROMPT_HOOK = "fractal hook prompt"
 STOP_HOOK = "fractal hook stop"
 EDIT_HOOK = "fractal hook edit"
 EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
+PRE_EDIT_HOOK = "fractal hook pre-edit"
+PRE_EDIT_MATCHER = "Edit|Write|MultiEdit"
 CLI_PERMISSION = "Bash(fractal:*)"
 # Accepting or rejecting a rule is a human decision: deny these to agents even though the
 # rest of the CLI is allowed (deny wins over allow).
@@ -47,11 +49,6 @@ def _add_unique(items: list, value: object) -> bool:
     return True
 
 
-def server_entry() -> dict:
-    # Root resolves from $CLAUDE_PROJECT_DIR, which Claude Code sets for MCP servers.
-    return {"type": "stdio", "command": "fractal", "args": ["mcp"], "env": {}}
-
-
 def _has_hook(settings: dict, event: str, command: str) -> bool:
     return any(h.get("command") == command
                for g in settings.get("hooks", {}).get(event, []) for h in g.get("hooks", []))
@@ -82,12 +79,12 @@ def _install_git_hook(root: Path) -> str | None:
     return f"git hook   {path} runs `fractal check`"
 
 
-def init(root: Path, settings: bool = True, mcp: bool = False, git_hook: bool = False) -> list[str]:
+def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]:
     """Set up `root`; returns a line per change made.
 
-    By default a session that misses the cache is identical to one without it: no CLAUDE.md
-    text, no MCP tools, and a skill that only runs when invoked. `mcp=True` opts into the
-    fractal-claims MCP server for harnesses that want to query or write claims directly.
+    A session that misses the cache is identical to one without it: no CLAUDE.md text, no MCP
+    tools, and a skill that only runs when invoked. Earlier versions' CLAUDE.md block and
+    fractal-claims MCP server are removed.
     """
     done: list[str] = []
 
@@ -106,11 +103,7 @@ def init(root: Path, settings: bool = True, mcp: bool = False, git_hook: bool = 
     mcp_path = root / ".mcp.json"
     m = _load_json(mcp_path)
     servers = m.get("mcpServers", {})
-    if mcp and servers.get(SERVER) != server_entry():
-        m.setdefault("mcpServers", {})[SERVER] = server_entry()
-        _write_json(mcp_path, m)
-        done.append(f".mcp.json  server {SERVER}")
-    elif not mcp and SERVER in servers:
+    if SERVER in servers:
         del servers[SERVER]
         if not servers and set(m) <= {"mcpServers"}:
             mcp_path.unlink()
@@ -136,17 +129,14 @@ def init(root: Path, settings: bool = True, mcp: bool = False, git_hook: bool = 
         for rule in HUMAN_ONLY:
             _add_unique(deny, rule)
         enabled = s.get("enabledMcpjsonServers", [])
-        if mcp:
-            _add_unique(s.setdefault("enabledMcpjsonServers", []), SERVER)
-            _add_unique(allow, f"mcp__{SERVER}")
-        else:
-            if SERVER in enabled:
-                enabled.remove(SERVER)
-                if not enabled:
-                    del s["enabledMcpjsonServers"]
-            if f"mcp__{SERVER}" in allow:
-                allow.remove(f"mcp__{SERVER}")
+        if SERVER in enabled:
+            enabled.remove(SERVER)
+            if not enabled:
+                del s["enabledMcpjsonServers"]
+        if f"mcp__{SERVER}" in allow:
+            allow.remove(f"mcp__{SERVER}")
         for event, command, matcher in (("UserPromptSubmit", PROMPT_HOOK, None), ("Stop", STOP_HOOK, None),
+                                        ("PreToolUse", PRE_EDIT_HOOK, PRE_EDIT_MATCHER),
                                         ("PostToolUse", EDIT_HOOK, EDIT_MATCHER)):
             if not _has_hook(s, event, command):
                 group = {"hooks": [{"type": "command", "command": command}]}
@@ -155,8 +145,9 @@ def init(root: Path, settings: bool = True, mcp: bool = False, git_hook: bool = 
                 s.setdefault("hooks", {}).setdefault(event, []).append(group)
         if json.dumps(s, sort_keys=True) != before:
             _write_json(settings_path, s)
-            done.append("settings   .claude/settings.json (prompt hook injects claims, edit hook enforces "
-                        "invariants, stop hook queues sessions, allow the fractal CLI except accept/reject)")
+            done.append("settings   .claude/settings.json (prompt hook injects rules and facts, pre/post-edit "
+                        "hooks enforce invariants, stop hook queues sessions, allow the fractal CLI except "
+                        "accept/reject)")
 
     claude_md = root / "CLAUDE.md"
     text = claude_md.read_text() if claude_md.exists() else ""
@@ -191,7 +182,8 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
         s = {}
     checks.append((_has_hook(s, "UserPromptSubmit", PROMPT_HOOK), "UserPromptSubmit hook injects claims"))
     checks.append((_has_hook(s, "Stop", STOP_HOOK), "Stop hook queues sessions for `fractal record`"))
-    checks.append((_has_hook(s, "PostToolUse", EDIT_HOOK), "PostToolUse hook enforces invariants on edits"))
+    checks.append((_has_hook(s, "PreToolUse", PRE_EDIT_HOOK), "PreToolUse hook blocks edits that would violate rules"))
+    checks.append((_has_hook(s, "PostToolUse", EDIT_HOOK), "PostToolUse hook re-checks rules after edits"))
     deny = s.get("permissions", {}).get("deny", [])
     checks.append((all(r in deny for r in HUMAN_ONLY), "agents are denied `fractal accept`/`reject`"))
     md = root / "CLAUDE.md"

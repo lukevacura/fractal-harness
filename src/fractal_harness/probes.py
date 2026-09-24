@@ -112,6 +112,9 @@ def _run_grep(probe: dict, root: Path, overlay: dict[str, str] | None = None) ->
     files: set[Path] = set()
     for glob in probe["paths"]:
         files.update(p for p in root.glob(glob) if p.is_file())
+    if overlay:  # in-memory files (e.g. a Write creating a new file) count if a glob covers them
+        from .regions import matches
+        files.update(root / rel for rel in overlay if any(matches(g, rel) for g in probe["paths"]))
     count = 0
     matches: list[tuple[str, int]] = []
     for path in sorted(files):

@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .regions import overlaps
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS edges (
     id          TEXT PRIMARY KEY,
@@ -24,8 +26,6 @@ CREATE TABLE IF NOT EXISTS edges (
     anchors     TEXT NOT NULL DEFAULT '[]',  -- json keyframe: lines the probe matched, with context
     repair      TEXT,                        -- json {kind, residuals} when a repair is needed
     delta_count INTEGER NOT NULL DEFAULT 0,  -- delta repairs since the last full verification
-    level       INTEGER,                     -- zoom level: 1 coarse (~10K lines) .. 3 fine (~100 lines)
-    region      TEXT NOT NULL DEFAULT '[]',  -- json globs of the code region this claim describes
     rule_state  TEXT,                        -- invariants only: proposed | enforced | rejected
     detail      TEXT NOT NULL DEFAULT '',
     parent_id   TEXT,
@@ -55,10 +55,10 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
-# pending: planned, not yet generated. verified: probe passed at fingerprint.
-# trusted: no probe (or depends on a trusted edge). stale: sources or upstream
-# changed since the verdict. failed: probe did not pass.
-STATUSES = ("pending", "verified", "trusted", "stale", "failed")
+# verified: probe passed at the current fingerprint. trusted: no probe (or depends on a
+# trusted claim). stale: sources or upstream changed since the verdict (or not yet
+# checked). failed: probe did not pass.
+STATUSES = ("verified", "trusted", "stale", "failed")
 GOOD = ("verified", "trusted")
 
 STOPWORDS = frozenset("""
@@ -100,8 +100,6 @@ class Edge:
     anchors: list[dict] = field(default_factory=list)
     repair: dict | None = None
     delta_count: int = 0
-    level: int | None = None
-    region: list[str] = field(default_factory=list)
     rule_state: str | None = None
 
     @property
@@ -123,8 +121,6 @@ class Edge:
             "depends_on": self.depends_on,
             "repair": self.repair,
             "delta_count": self.delta_count,
-            "level": self.level,
-            "region": self.region,
             "rule_state": self.rule_state,
         }
 
@@ -136,8 +132,7 @@ class Store:
         self.db.row_factory = sqlite3.Row
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(edges)")}
         for col, ddl in (("anchors", "TEXT NOT NULL DEFAULT '[]'"), ("repair", "TEXT"),
-                         ("delta_count", "INTEGER NOT NULL DEFAULT 0"), ("level", "INTEGER"),
-                         ("region", "TEXT NOT NULL DEFAULT '[]'"), ("rule_state", "TEXT")):
+                         ("delta_count", "INTEGER NOT NULL DEFAULT 0"), ("rule_state", "TEXT")):
             if cols and col not in cols:  # stores created before this column existed
                 self.db.execute(f"ALTER TABLE edges ADD COLUMN {col} {ddl}")
                 if col == "rule_state":   # invariants predating the lifecycle stay binding
@@ -182,8 +177,6 @@ class Store:
             anchors=json.loads(row["anchors"]),
             repair=json.loads(row["repair"]) if row["repair"] else None,
             delta_count=row["delta_count"],
-            level=row["level"],
-            region=json.loads(row["region"]),
             rule_state=row["rule_state"],
         )
 
@@ -200,8 +193,8 @@ class Store:
             self.db.execute(
                 """INSERT INTO edges (id, kind, pre, post, reads, writes, probe, status,
                                       fingerprint, hashes, detail, parent_id, created_at, updated_at,
-                                      anchors, repair, delta_count, level, region, rule_state)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      anchors, repair, delta_count, rule_state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      reads=excluded.reads, writes=excluded.writes, probe=excluded.probe,
                      status=excluded.status, fingerprint=excluded.fingerprint,
@@ -209,12 +202,12 @@ class Store:
                      detail=excluded.detail, parent_id=excluded.parent_id,
                      updated_at=excluded.updated_at, anchors=excluded.anchors,
                      repair=excluded.repair, delta_count=excluded.delta_count,
-                     level=excluded.level, region=excluded.region, rule_state=excluded.rule_state""",
+                     rule_state=excluded.rule_state""",
                 (e.id, e.kind, e.pre, e.post, json.dumps(e.reads), json.dumps(e.writes),
                  json.dumps(e.probe) if e.probe else None, e.status, e.fingerprint,
                  json.dumps(e.hashes), e.detail, e.parent_id, now, now,
                  json.dumps(e.anchors), json.dumps(e.repair) if e.repair else None, e.delta_count,
-                 e.level, json.dumps(e.region), e.rule_state),
+                 e.rule_state),
             )
             self.db.execute("DELETE FROM edges_fts WHERE id = ?", (e.id,))
             self.db.execute("INSERT INTO edges_fts (id, body) VALUES (?, ?)", (e.id, _body(e)))
@@ -300,7 +293,7 @@ class Store:
         """
         by_path: set[str] = set()
         if paths:
-            by_path = {e.id for e in self.all() if any(_overlaps(p, e.reads) for p in paths)}
+            by_path = {e.id for e in self.all() if any(overlaps(p, r) for p in paths for r in e.reads)}
         if tokens(text):
             ranked = [i for i, _, _ in self.ranked(text, min_matches)]
             ids = [i for i in ranked if i in by_path] + [i for i in ranked if i not in by_path] \
@@ -333,20 +326,3 @@ class Store:
             {"ts": r["ts"], "kind": r["kind"], "edge_id": r["edge_id"], **json.loads(r["data"])}
             for r in self.db.execute(sql + " ORDER BY id", args)
         ]
-
-
-def _overlaps(path: str, reads: list[str]) -> bool:
-    """A query path matches an edge if either is a prefix of the other (dirs or files).
-
-    A glob read is compared by its literal directory prefix (`app/lib/**/*.dart` -> `app/lib`).
-    """
-    path = path.rstrip("/")
-    for r in reads:
-        if any(c in r for c in "*?["):
-            r = "/".join(part for part in r.split("/")[: next(
-                i for i, part in enumerate(r.split("/")) if any(c in part for c in "*?["))])
-            if not r or path == r or path.startswith(r + "/") or r.startswith(path + "/"):
-                return True
-        elif r == path or r.startswith(path + "/") or path.startswith(r + "/"):
-            return True
-    return False

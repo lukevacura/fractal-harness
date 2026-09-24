@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from fractal_harness.planner import git
-from fractal_harness.recursive import (DecomposeError, Node, Stub, _json_block, _leaves, validate_split,
+from fractal_planner.planner import git
+from fractal_planner.recursive import (DecomposeError, Node, Stub, _json_block, _leaves, validate_split,
                                        write_skeleton)
 
 CONVERT = 'def convert(amount: Decimal, rate: Decimal) -> Decimal:\n    """Multiply."""\n    raise NotImplementedError\n'
@@ -95,7 +95,7 @@ def test_width_is_the_planners_call_with_optional_cost_limit():
 
 
 def test_rejected_split_is_retried_with_the_error(monkeypatch, tmp_path):
-    import fractal_harness.recursive as r
+    import fractal_planner.recursive as r
     replies = iter(['```json\n{"leaf": false, "children": []}\n```',
                     '```json\n' + __import__("json").dumps(_raw()) + '\n```'])
     prompts = []
@@ -111,7 +111,7 @@ def test_rejected_split_is_retried_with_the_error(monkeypatch, tmp_path):
 
 
 def test_two_rejections_fall_back_to_leaf(monkeypatch, tmp_path):
-    import fractal_harness.recursive as r
+    import fractal_planner.recursive as r
     monkeypatch.setattr(r, "_agent", lambda *a, **k: {"result": "no json", "cost_usd": 0.01})
     out = r.decompose(tmp_path, tmp_path, _parent(), "task", [], "x {test}", "m", max_depth=3, leaf_lines=150)
     assert out["leaf"] and out["error"] and len(out["runs"]) == 2
@@ -119,7 +119,7 @@ def test_two_rejections_fall_back_to_leaf(monkeypatch, tmp_path):
 
 def test_signature_mismatches_and_import_errors(tmp_path):
     import sys
-    from fractal_harness.recursive import import_errors, signature_mismatches
+    from fractal_planner.recursive import import_errors, signature_mismatches
     (tmp_path / "pkg").mkdir()
     (tmp_path / "pkg" / "__init__.py").write_text("")
     stub = Stub("pkg/fx.py", CONVERT)
@@ -135,7 +135,7 @@ def test_signature_mismatches_and_import_errors(tmp_path):
 
 
 def test_checked_nodes_are_internal_nodes_and_dependency_free_leaves():
-    from fractal_harness.recursive import _checked_nodes
+    from fractal_planner.recursive import _checked_nodes
     tree = Node("root", "task", ["**"])
     tree.children = validate_split(Node("root", "task", ["**"]), _raw())
     for k in tree.children:
@@ -144,7 +144,7 @@ def test_checked_nodes_are_internal_nodes_and_dependency_free_leaves():
 
 
 def test_corroborated_cuts():
-    from fractal_harness.recursive import corroborated_cuts
+    from fractal_planner.recursive import corroborated_cuts
     # a lone failing check (the root's) is not retried: it may be the test's fault
     assert corroborated_cuts(["root"], baseline_ok=True) == []
     # root + a child failing corroborate each other; retry at the deepest node

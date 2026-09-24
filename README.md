@@ -1,159 +1,50 @@
 # fractal-harness
 
-A contract-chunked agent harness. Work is a DAG of edges `{pre} ⟹ {post}`; each
-edge is tied to the source files it reads, checked by a deterministic probe, and
-cached. When a source file changes, the edges that read it go stale, and so do the
-edges downstream of them. Stale edges are re-checked the next time someone
-queries them.
+**Invariants as the tent-pole of agent alignment.** A coding agent is aligned with a codebase
+when it knows the rules that govern the code before it acts, is checked against them as it
+acts, and cannot commit a violation. fractal keeps those rules, and the verified facts agents
+need to work within them, in front of the right agent at the right moment, and keeps them
+true as the code changes.
 
-This first layer is the **claim cache**: a store of verified claims about a codebase
-that invalidates itself. It works against any repo and is exposed to agent harnesses
-over MCP.
+- **Rules (invariants)** are human-owned. Agents propose them; a human accepts them.
+- **Facts** (knowledge, workflows, interfaces) are machine-maintained: learned from sessions,
+  re-checked when their files change, repaired cheaply.
+- Every claim is tied to the files it depends on and checked by a deterministic **probe**.
 
-Design notes live in `context/`, which is gitignored.
+Design notes and the full experiment log live in `context/` (gitignored).
 
-## Quick start: onboard a repo
+## Quick start
 
 ```sh
-# once per machine: puts `fractal` on your PATH (editable, so harness edits apply immediately)
+# once per machine (editable: harness changes apply immediately)
 uv tool install --editable /path/to/fractal-harness
 
-# once per target repo
-cd /path/to/target-repo
-fractal init      # store, .gitignore, .mcp.json, /fractal-onboard skill, settings, CLAUDE.md block
-fractal doctor    # verify the setup
-claude            # approve the fractal-claims server when prompted (once per repo)
-> /fractal-onboard            # map the whole repo at coarse zoom
-> /fractal-onboard src/api    # or zoom into one area
+# once per repo
+cd /path/to/repo
+fractal init --git-hook     # hooks, skill, permissions, pre-commit gate
+fractal doctor
+claude
+> /fractal-onboard          # proposes rules and records facts
 ```
 
-`fractal init` is idempotent. It merges into an existing `.mcp.json`, `.claude/settings.json`, `.gitignore`
-and `CLAUDE.md` instead of overwriting them, and it only manages its own marked block in `CLAUDE.md`.
-Re-run it after upgrading the harness to refresh the skill. `--no-claude-md` and `--no-settings` skip
-those two files.
-
-What it writes into the target repo:
-
-| File | Purpose |
-|---|---|
-| `.fractal/edges.db` | The claim store (gitignored; claims are per-machine for now) |
-| `.mcp.json` | Registers the `fractal-claims` MCP server (`fractal mcp`) |
-| `.claude/skills/fractal-onboard/SKILL.md` | The `/fractal-onboard` procedure |
-| `.claude/settings.json` | Enables the server, allows its tools, and installs the prompt hook |
-| `CLAUDE.md` | Tells Claude to query claims before exploring and record them after tasks |
-
-Claude Code still asks you to approve a project's MCP server the first time. Project settings
-can't approve their own servers, which is intentional.
-
-## Develop
+Then review what the agent proposed and enforce the rules you agree with, in your own terminal:
 
 ```sh
-uv sync
+fractal invariants --audit  # proposed / enforced / rejected, with probe audit verdicts
+fractal accept <id>         # human only
 ```
 
-## Claims
+## The alignment loop
 
-A claim is text plus the files it reads plus an optional probe:
-
-| Status | Meaning |
-|---|---|
-| `verified` | Probe passed against the current source, and every dependency is verified |
-| `trusted` | No probe, or depends on a trusted claim. Treat as a hint. |
-| `stale` | Sources or upstream changed since the verdict. It is re-checked on query. |
-| `failed` | Probe did not pass |
-| `pending` | Planned but not generated yet |
-
-Probes:
-
-```json
-{"type": "grep", "pattern": "auth_middleware", "paths": ["src/**/*.py"], "expect": "present"}
-{"type": "command", "run": "pytest -q tests/test_auth.py", "expect_exit": 0}
-```
-
-A `grep` probe's `expect` is `"present"`, `"absent"`, `{"count": n}`, `{"min": n}` or `{"max": n}`.
-
-A trusted claim whose sources change stays `stale` until someone re-asserts it with
-`put`. Re-checking it automatically would launder the change.
-
-## Claim injection (hook)
-
-Waiting for the agent to query the cache didn't pay off in practice. The agent often
-skipped it, loading the MCP tools cost a turn, and keyword queries missed. So `fractal init`
-also installs a `UserPromptSubmit` hook, `fractal hook prompt`. It ranks verified and trusted
-claims against the prompt (BM25 over claim text and read paths) and injects the top 6 as
-context before the agent's first turn. In repos without a store, and on any error, it
-does nothing.
-
-Search is ranked: any query term can match, identifiers like `_gpsDistanceFilterM` are
-tokenized, and stopword-only queries return nothing.
-
-## Learning from sessions (`fractal record`)
-
-The `Stop` hook only appends the session's transcript path to `.fractal/queue.jsonl`. It
-makes no model call and adds no context. `fractal record` processes the queue later, in one
-headless session that verifies facts in the source and records them as claims with probes.
-That cost counts as investment, not as part of any task.
-
-Recording only pays off for sessions where the cache fell short, so `record` triages first:
-
-| Session | Recorded? |
-|---|---|
-| Explored ≥2 files no injected claim covered | yes, pointed at the uncovered files |
-| Made ≥6 exploration calls (even inside covered files) | yes: the injected claims fell short |
-| Hit: the cache covered what it explored, little searching | skipped |
-| Question ≥0.6 similar to one already recorded | skipped (`--force` overrides) |
-
-If nothing qualifies, no model call is made. On round-3 benchmark data, triage keeps 3 of 15
-sessions: the three most expensive questions.
-
-```sh
-fractal record              # process the queue
-fractal record --dry-run    # show the extraction prompt and what would be skipped
-```
-
-## Keeping claims current (`fractal update`, `fractal repair`)
-
-Updates borrow from video coding. When a probe passes, the lines it matched (plus context)
-are stored as the claim's anchors, its keyframe. A per-line snapshot of each file it reads
-is stored too. After edits, `fractal update` classifies every affected claim locally, with
-no model call and no git:
-
-| Class | Meaning | Cost |
+| When | What happens | Hook |
 |---|---|---|
-| `clean` / `moved` | probe passes; anchors unchanged or just moved (anchors rebased) | $0 |
-| `fresh` | probe passes; nothing to anchor (absent/command probes) | $0 |
-| `suspect` | probe passes but the anchored code changed substantially | delta repair |
-| `delta` | probe fails; anchors found with a small residual | delta repair |
-| `rewrite` | probe passes but ≥25% (and ≥20 lines) of a file the claim reads was rewritten | keyframe |
-| `scene_cut` | probe fails; anchors gone or heavily rewritten | keyframe |
-| `reassert` | claim has no probe and its files changed | keyframe |
+| **Before acting** | The prompt gets the enforced **RULES** governing the code the task likely touches (repo-wide rules, rules over files named in the prompt or read by matching facts), then matching **FACTS**, each with evidence (`✓ app/lib/main.dart:3607: …`). With no enforced rules and no matching facts, nothing is injected: the session is identical to one without fractal. | `UserPromptSubmit` → `fractal hook prompt` |
+| **While acting** | Every Edit/Write/MultiEdit is applied **in memory** and checked against the enforced rules that scan that file. A violating edit is blocked before it is written; the agent sees the rule and the offending lines. | `PreToolUse` → `fractal hook pre-edit` |
+| | After any edit, the same rules are re-checked on disk (a backstop that also runs command probes). | `PostToolUse` → `fractal hook edit` |
+| **At commit** | `fractal check` fails on any violated enforced rule. Proposed rules are reported, never blocking. | git pre-commit |
+| **After the session** | The session is queued; `fractal record` later learns facts and proposes rules from it (skipping sessions the cache already served). | `Stop` → `fractal hook stop` |
 
-`fractal repair` fixes broken claims in one batched headless session. A delta repair sees
-only the claim, its probe and the residual. A keyframe repair re-verifies from source, and
-so does every claim after 3 delta repairs in a row, so patches can't drift. By default only
-**demanded** claims are repaired: ones the prompt hook wanted to inject. Claims nobody asks
-about stay broken for free. A failing invariant is reported as a violation and left alone:
-the code may be what's wrong.
-
-## Auditing probes (`fractal audit`)
-
-A claim is only as good as its probe. `fractal audit` mutation-tests every grep probe *in
-memory*, without writing files or calling a model, in about a second for 40 claims:
-
-| Check | Mutation | Expected | Finding if not |
-|---|---|---|---|
-| removal | delete the lines the probe matched | probe fails | **weak**: the probe doesn't depend on its matches |
-| injection | (absent probes) add a line violating the rule | probe fails | **weak**: the rule can never fail (e.g. an over-broad `exclude`) |
-| values | change each number the claim states | probe fails | **partial**: the claim states a value the probe doesn't check |
-| identifiers | rename each identifier the claim mentions | probe fails | **partial**: the claim mentions something the probe doesn't check |
-
-File names and identifiers absent from the probed files are ignored. Exit code 1 if any
-probe is weak.
-
-## Invariants: the tent-pole of agent alignment
-
-An agent is aligned with a codebase when it knows the rules before it acts, is checked
-against them as it acts, and can't commit a violation. Invariants are human-owned:
+## The invariant lifecycle
 
 ```
 proposed (agent) ──human accepts──→ enforced ──code breaks it──→ violated
@@ -162,94 +53,74 @@ proposed (agent) ──human accepts──→ enforced ──code breaks it─�
 ```
 
 ```sh
-fractal propose "src never imports legacy" --read src/app.py \
-  --probe '{"type":"grep","pattern":"^import legacy\\b","paths":["src/**/*.py"],"expect":"absent"}'
-fractal invariants --audit       # proposed / enforced / rejected, with probe audit verdicts
-fractal accept <id>              # human only: needs an interactive terminal
+fractal propose "core never imports from cmds" --read core/io.py \
+  --probe '{"type":"grep","pattern":"^from cmds","paths":["core/**/*.py"],"expect":"absent"}'
+fractal accept <id>     # needs an interactive terminal; agents are denied it by init
 fractal reject <id>
 ```
 
-- `put --kind invariant` and `propose` always create a **proposal**. Re-asserting a rule
-  never changes the state a human gave it.
-- `fractal init` denies agents `fractal accept`/`reject` (`permissions.deny`, which beats
-  the allow on the rest of the CLI).
-- **While editing:** a `PostToolUse` hook (`fractal hook edit`) re-checks the enforced
-  rules whose probes scan the edited file, in milliseconds. On a violation it exits 2, so
-  Claude sees the rule and the offending lines and fixes them, or asks you if the request
-  conflicts with the rule. The edit itself isn't undone; the commit gate is the backstop.
-- **At commit:** `fractal check` fails on any violated enforced rule. Proposed rules are
-  reported but never block.
-- Repair never rewrites an enforced rule.
+- Re-asserting a rule never changes the state a human gave it.
+- Repair never rewrites an enforced rule: a violation means the code or the rule is wrong,
+  and a human decides which.
+- A rule is only as strong as its probe: `fractal invariants --audit` mutation-tests each one.
+
+## Claims and probes
+
+```sh
+fractal put "All handlers are registered via router.add() in api/routes.py" \
+  --read api/routes.py --probe '{"type":"grep","pattern":"router\\.add\\(","paths":["api/**/*.py"],"expect":{"min":1}}'
+fractal query auth                 # ranked search; stale matches are re-verified
+fractal manifest app/lib           # an owner's context for a region: rules first, then facts
+```
+
+| Status | Meaning |
+|---|---|
+| `verified` | the probe passed against the current source (and every dependency is verified) |
+| `trusted` | no probe; never injected, never a guarantee |
+| `stale` | sources or upstream changed since the verdict; re-checked on demand |
+| `failed` | the probe did not pass |
+
+Probes: `{"type":"grep","pattern":…,"paths":[globs],"expect":"present"|"absent"|{"count":n}|{"min":n}|{"max":n},"exclude":…}`
+(line-based), `{"type":"command","run":…}`, or `{"type":"all","probes":[…]}`. Every path a
+probe scans is a dependency. Globs follow `Path.glob` semantics.
+
+## Keeping claims true
+
+After edits, `fractal update` classifies every affected claim locally (no model, no git),
+borrowing from video coding: a passing probe's matched lines are the claim's keyframe.
+
+| Class | Meaning | Cost |
+|---|---|---|
+| `clean` / `moved` / `fresh` | probe passes; anchors unchanged, moved, or nothing to anchor | $0 |
+| `suspect` / `delta` | anchored code changed substantially / probe fails with a small residual | cheap repair |
+| `rewrite` / `scene_cut` / `reassert` | file largely rewritten / anchors gone / unprobed claim's files changed | full re-verify |
+
+`fractal repair` fixes **descriptive** claims in one batched session (by default only those a
+prompt wanted). On a 20-commit replay of a real repo, ~89% of re-checks were free.
+
+`fractal audit` mutation-tests probes in memory (delete what they matched, inject violations,
+change stated values, rename mentioned identifiers): `weak` probes don't depend on their
+code; `partial` claims say more than their probes check.
 
 ## Region tree
 
-Claims are placed on a capacity-bounded tree over the code's own address space
-(directories → files): each claim sits at the smallest region containing everything it
-depends on, and a rule placed at a region governs everything beneath it. `affects(deps, file)`
-decides which rules an edit re-checks. Glob matching follows `Path.glob` semantics
-(`**/` matches zero or more directories). The tree underlies the coming coverage map and
-rule-first injection.
+Claims live on a capacity-bounded tree over the code's own address space (directories →
+files): each claim sits at the smallest region containing everything it depends on, and a
+rule placed at a region governs everything beneath it. The tree answers "which rules govern
+this file?" for the hooks and places claims in manifests.
 
-## Invariants and the commit gate (`fractal check`)
+## Real-use metrics
 
-Record rules the code must follow with `--kind invariant`. `fractal check` re-checks every
-claim affected by the working tree (locally, no model call) and exits 1 if an invariant is
-violated. Other broken claims are reported as needing repair (they fail the check only
-with `--strict`). `fractal init --git-hook` installs it as a pre-commit hook. It never
-overwrites an existing hook; it tells you to add `fractal check` yourself instead.
+`fractal stats`: claims by status, prompts seen, hit rate, claims injected, sessions and
+claims recorded with cost, repairs with cost. These are the numbers that decide whether the
+cache pays for itself: hit rate × savings − maintenance − learning cost.
 
-Every path a probe scans counts as a dependency, alongside the declared `--read` files.
-A rule probed over `app/lib/**/*.dart` is re-checked when *any* of those files changes.
-
-## Probe-first pruning
-
-A step is redundant if its outcome already holds before any work is done (`P ⟹ Q`), like
-sorting an already-sorted list. `needed` / `claims_needed` takes the step's outcome and a
-probe that passes only once the outcome holds. It reports the step as redundant if the
-outcome is already a verified claim or the probe passes now. Otherwise the step is needed.
-Steps marked `deliberate` (e.g. re-validation at a trust boundary) are never pruned.
-`fractal stats` reports the **redundancy rate**. A weak probe can wrongly prune a step,
-so write probes that fail until the work is done.
-
-## CLI
-
-The target repo is `--root`, then `$FRACTAL_ROOT`, then the enclosing git repo.
-`fractal mcp` also checks `$CLAUDE_PROJECT_DIR` before the git repo.
-The store lives at `<root>/.fractal/edges.db`.
+## Develop
 
 ```sh
-fractal put "every handler is wrapped in auth_middleware" \
-  --read src/app.py --probe '{"type":"grep","pattern":"auth_middleware","paths":["src/*.py"]}'
-fractal put "tests pass" --read src/app.py --run "pytest -q"
-fractal query auth                 # re-verifies stale matches
-fractal query --path src/ --all    # include stale/failed
-fractal refresh                    # mark stale after edits (no probes run)
-fractal needed "config loader exists" --read src/config.py \
-  --probe '{"type":"grep","pattern":"def load_config","paths":["src/*.py"]}'
-                                   # REDUNDANT (exit 3) if the outcome already holds
-fractal verify                     # re-run every probe
-fractal stats
-```
-
-Run any of these as `uv run fractal ...` from this repo, or install the package elsewhere.
-
-## MCP
-
-`fractal init` registers the server. To register it by hand instead:
-
-```sh
-claude mcp add fractal-claims -- fractal mcp
-```
-
-The server resolves the target repo from `$CLAUDE_PROJECT_DIR`, which Claude Code sets.
-
-Tools: `claims_query`, `claims_put`, `claims_needed`, `claims_verify`, `claims_stats`.
-
-Command probes run shell commands in the target repo. Only point the server at
-repos whose claims you trust.
-
-## Tests
-
-```sh
+uv sync
 uv run pytest
 ```
+
+`experiments/` holds the benchmarks (claim injection A/B, goodput analysis, history replay)
+and the parked parallel/recursive planner (`experiments/fractal_planner/`), with their tests.

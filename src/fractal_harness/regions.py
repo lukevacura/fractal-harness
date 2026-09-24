@@ -79,6 +79,16 @@ def matches(pattern: str, rel: str) -> bool:
     return rel == pattern or rel.startswith(pattern + "/")
 
 
+def overlaps(a: str, b: str) -> bool:
+    """Do two paths/globs cover any common file? (either covers the other, or a glob's
+    literal directory prefix lies inside/above the other)."""
+    if matches(a, b) or matches(b, a):
+        return True
+    pa = _literal_prefix(a) if is_glob(a) else a.rstrip("/")
+    pb = _literal_prefix(b) if is_glob(b) else b.rstrip("/")
+    return (is_glob(a) or is_glob(b)) and (pa == "" or pb == "" or matches(pa, pb) or matches(pb, pa))
+
+
 def affects(deps: list[str], rel: str) -> bool:
     return any(matches(d, rel) for d in deps)
 

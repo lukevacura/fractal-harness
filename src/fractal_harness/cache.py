@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import CHECKER_VERSION, motion, probes
 from .hashing import edge_id, fingerprint, read_hashes
-from .store import GOOD, Edge, Store
+from .store import GOOD, STATUSES, Edge, Store
 
 STORE_DIR = ".fractal"
 
@@ -56,7 +56,7 @@ class ClaimCache:
     def put(self, post: str, reads: list[str], *, pre: str = "", kind: str = "knowledge",
             probe: dict | None = None, writes: list[str] | None = None,
             depends_on: list[str] | None = None, parent_id: str | None = None,
-            delta: bool = False, level: int | None = None, region: list[str] | None = None) -> Edge:
+            delta: bool = False) -> Edge:
         """Assert a claim and check it immediately. Re-putting an existing claim re-asserts it.
 
         `delta=True` marks this as a delta repair (counts toward the keyframe interval);
@@ -85,44 +85,13 @@ class ClaimCache:
         edge = Edge(
             id=eid, kind=kind, pre=pre.strip(), post=post.strip(), reads=reads,
             writes=sorted(set(_norm(w) for w in writes or [])), probe=probe,
-            status="pending", fingerprint=None, hashes={}, detail="",
+            status="stale", fingerprint=None, hashes={}, detail="not yet checked",
             parent_id=parent_id, created_at=0, updated_at=0, depends_on=depends_on,
-            delta_count=delta_count, level=level, rule_state=rule_state,
-            region=sorted(set(_norm(r) for r in region)) if region else [],
+            delta_count=delta_count, rule_state=rule_state,
         )
         self.store.upsert(edge)
         self.store.log("put", eid, edge_kind=kind, has_probe=probe is not None)
         return self.check(eid)
-
-    def needed(self, post: str, reads: list[str], *, pre: str = "", kind: str = "task",
-               probe: dict | None = None, deliberate: bool = False) -> dict:
-        """Probe-first pruning: is a step whose outcome is `post` actually needed?
-
-        Redundant when the postcondition already holds (P ⟹ Q before any work):
-        either the same claim is cached as verified, or its probe passes right now.
-        A passing probe also records the claim as verified. Deliberately redundant
-        steps (e.g. re-validation at a trust boundary) are never pruned.
-        """
-        eid = edge_id(kind, pre, post)
-        if deliberate:
-            verdict = {"needed": True, "reason": "deliberate: never pruned"}
-        else:
-            verdict = None
-            if self.store.get(eid):
-                self.refresh()
-                if self.resolve([eid])[0].status == "verified":
-                    verdict = {"needed": False, "reason": "cached: claim already verified"}
-            if verdict is None and probe is not None:
-                result = probes.run(probe, self.root)
-                if result.passed:
-                    self.put(post, reads, pre=pre, kind=kind, probe=probe)
-                    verdict = {"needed": False, "reason": f"already holds: {result.detail}"}
-                else:
-                    verdict = {"needed": True, "reason": f"probe fails: {result.detail}"}
-            if verdict is None:
-                verdict = {"needed": True, "reason": "no probe: cannot show it already holds"}
-        self.store.log("prune", eid, needed=verdict["needed"], reason=verdict["reason"].split(":")[0])
-        return {"id": eid, **verdict}
 
     def set_rule(self, eid: str, state: str) -> Edge:
         """Human step: accept (enforce) or reject a proposed invariant."""
@@ -308,13 +277,11 @@ class ClaimCache:
 
     def stats(self) -> dict:
         edges = self.store.all()
-        by_status = {s: 0 for s in ("pending", "verified", "trusted", "stale", "failed")}
+        by_status = {s: 0 for s in STATUSES}
         for e in edges:
             by_status[e.status] += 1
         queries = self.store.events("query")
         checks = self.store.events("check")
-        prunes = self.store.events("prune")
-        redundant = sum(1 for p in prunes if not p["needed"])
         return {
             "edges": len(edges),
             "by_status": by_status,
@@ -324,9 +291,6 @@ class ClaimCache:
             "checks_failed": sum(1 for c in checks if c["status"] == "failed"),
             "stale_events": len(self.store.events("stale")),
             **self._usage(),
-            "steps_checked": len(prunes),
-            "steps_redundant": redundant,
-            "redundancy_rate": round(redundant / len(prunes), 3) if prunes else None,
         }
 
     def _usage(self) -> dict:

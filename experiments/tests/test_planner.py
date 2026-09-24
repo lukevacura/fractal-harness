@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from fractal_harness.planner import EdgeSpec, Plan, PlanError, git, merge, outside, validate
+from fractal_planner.planner import EdgeSpec, Plan, PlanError, git, merge, outside, validate
 
 TEST_CMD = f"{sys.executable} -m pytest -q {{test}}"
 
@@ -80,14 +80,14 @@ def test_merge_composes_passing_edges_and_runs_integration(tmp_path):
 
 
 def test_leftover_stubs_found_outside_comments(tmp_path):
-    from fractal_harness.planner import leftover_stubs
+    from fractal_planner.planner import leftover_stubs
     (tmp_path / "cli.py").write_text("def main():\n    # raise NotImplementedError was here\n    raise NotImplementedError\n")
     (tmp_path / "done.py").write_text("def f():\n    return 1\n")
     assert leftover_stubs(tmp_path, ["cli.py", "done.py", "missing.py"]) == ["cli.py:3"]
 
 
 def test_budget_stops_agent_calls(monkeypatch, tmp_path):
-    import fractal_harness.planner as pl
+    import fractal_planner.planner as pl
     calls = []
 
     class Proc:
