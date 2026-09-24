@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -23,6 +23,7 @@ from pathlib import Path
 class ProbeResult:
     passed: bool
     detail: str
+    matches: list[tuple[str, int]] = field(default_factory=list)  # (repo-relative file, 0-based line)
 
 
 class ProbeError(ValueError):
@@ -65,10 +66,11 @@ def run(probe: dict, root: Path) -> ProbeResult:
         return _run_command(probe, root)
     if probe["type"] == "all":
         results = [run(sub, root) for sub in probe["probes"]]
+        matches = [m for r in results for m in r.matches]
         failed = [f"#{i}: {r.detail}" for i, r in enumerate(results) if not r.passed]
         if failed:
-            return ProbeResult(False, "; ".join(failed))
-        return ProbeResult(True, f"all {len(results)} probes passed")
+            return ProbeResult(False, "; ".join(failed), matches)
+        return ProbeResult(True, f"all {len(results)} probes passed", matches)
     return _run_grep(probe, root)
 
 
@@ -109,12 +111,18 @@ def _run_grep(probe: dict, root: Path) -> ProbeResult:
     for glob in probe["paths"]:
         files.update(p for p in root.glob(glob) if p.is_file())
     count = 0
+    matches: list[tuple[str, int]] = []
     for path in sorted(files):
         try:
             lines = path.read_text(errors="replace").splitlines()
         except OSError:
             continue
-        count += sum(1 for line in lines
-                     if pattern.search(line) and not (exclude and exclude.search(line)))
+        rel = path.relative_to(root).as_posix()
+        for i, line in enumerate(lines):
+            if pattern.search(line) and not (exclude and exclude.search(line)):
+                count += 1
+                if len(matches) < 20:
+                    matches.append((rel, i))
     ok = {"count": count == n, "min": count >= n, "max": count <= n}[op]
-    return ProbeResult(ok, f"{count} matching lines in {len(files)} files (expected {op} {n})")
+    # An "absent" probe has no positive matches to anchor on; its anchors come from violations.
+    return ProbeResult(ok, f"{count} matching lines in {len(files)} files (expected {op} {n})", matches)

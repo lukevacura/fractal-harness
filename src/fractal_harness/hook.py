@@ -54,7 +54,12 @@ def select(root: Path, prompt: str, session_id: str | None = None, log: bool = T
         if scored:
             best = scored[0][1]
             ids = [i for i, score, _ in scored if score <= best * RELATIVE_CUTOFF]  # bm25 is negative
-            hits = [e for e in cache.resolve(ids) if e.status == "verified"][:MAX_CLAIMS]
+            resolved = cache.resolve(ids)
+            hits = [e for e in resolved if e.status == "verified"][:MAX_CLAIMS]
+            # Claims this prompt wanted but that need repair: `fractal repair` fixes demanded ones.
+            wanted = [e.id for e in resolved if e.repair and e.status in ("failed", "stale")]
+            if log and wanted:
+                cache.store.log("demand", None, session_id=session_id, ids=wanted)
         if log:
             cache.store.log("inject", None, session_id=session_id, claims=len(hits),
                             ids=[e.id for e in hits])

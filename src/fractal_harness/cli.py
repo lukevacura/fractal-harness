@@ -62,6 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     put.add_argument("--parent", help="parent edge id (for zoomed sub-edges)")
     put.add_argument("--probe", help='json probe, e.g. \'{"type":"grep","pattern":"x","paths":["src/**/*.py"]}\'')
     put.add_argument("--run", help="shorthand for a command probe that must exit 0")
+    put.add_argument("--delta", action="store_true", help="this put is a delta repair (see `repair`)")
 
     nd = sub.add_parser("needed", help="is a step needed? (redundant if its outcome already holds)")
     nd.add_argument("claim", help="the step's outcome (postcondition)")
@@ -84,6 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     rm = sub.add_parser("rm", help="delete an edge")
     rm.add_argument("id")
     sub.add_parser("refresh", help="mark edges whose sources changed as stale (no probes run)")
+    sub.add_parser("update", help="after edits: re-check stale claims and classify how their code "
+                                  "moved (clean/moved/suspect/delta/scene_cut); no model call")
+    rp = sub.add_parser("repair", help="fix broken claims with minimal context (default: demanded ones)")
+    rp.add_argument("ids", nargs="*")
+    rp.add_argument("--all", action="store_true", help="every broken claim, not just demanded ones")
+    rp.add_argument("--model", default="sonnet")
+    rp.add_argument("--dry-run", action="store_true", help="print the repair prompt, don't run it")
     v = sub.add_parser("verify", help="re-run probes (default: all edges)")
     v.add_argument("ids", nargs="*")
     sub.add_parser("stats", help="counts and telemetry summary")
@@ -150,7 +158,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.run:
                 probe = {"type": "command", "run": args.run}
             _emit(args, [cache.put(args.claim, args.read, pre=args.pre, kind=args.kind, probe=probe,
-                                   writes=args.write, depends_on=args.dep, parent_id=args.parent)])
+                                   writes=args.write, depends_on=args.dep, parent_id=args.parent,
+                                   delta=args.delta)])
         elif args.cmd == "needed":
             probe = json.loads(args.probe) if args.probe else None
             if args.run:
@@ -178,6 +187,23 @@ def main(argv: list[str] | None = None) -> int:
             _emit(args, [cache.get(i) for i in stale])
             if not args.json:
                 print(f"{len(stale)} edges newly stale")
+        elif args.cmd == "update":
+            out = cache.update()
+            if args.json:
+                print(json.dumps(out, indent=2))
+            else:
+                for kind in ("clean", "moved", "fresh", "suspect", "delta", "scene_cut", "blocked"):
+                    if out.get(kind):
+                        print(f"{kind:10} {len(out[kind]):3}  {' '.join(out[kind][:8])}")
+                if not out:
+                    print("nothing changed")
+        elif args.cmd == "repair":
+            from .repair import repair
+            r = repair(root, args.ids or None, args.all, args.model, args.dry_run)
+            if args.dry_run and "prompt" in r:
+                print(r["prompt"])
+            else:
+                print(json.dumps(r, indent=2))
         elif args.cmd == "verify":
             _emit(args, cache.verify(args.ids or None))
         elif args.cmd == "stats":

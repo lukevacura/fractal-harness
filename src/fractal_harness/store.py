@@ -21,6 +21,9 @@ CREATE TABLE IF NOT EXISTS edges (
     status      TEXT NOT NULL,
     fingerprint TEXT,            -- fingerprint at the last verdict
     hashes      TEXT NOT NULL DEFAULT '{}',  -- json {path: sha} at the last verdict
+    anchors     TEXT NOT NULL DEFAULT '[]',  -- json keyframe: lines the probe matched, with context
+    repair      TEXT,                        -- json {kind, residuals} when a repair is needed
+    delta_count INTEGER NOT NULL DEFAULT 0,  -- delta repairs since the last full verification
     detail      TEXT NOT NULL DEFAULT '',
     parent_id   TEXT,
     created_at  REAL NOT NULL,
@@ -32,6 +35,12 @@ CREATE TABLE IF NOT EXISTS deps (
     PRIMARY KEY (edge_id, depends_on)
 );
 CREATE INDEX IF NOT EXISTS deps_by_target ON deps(depends_on);
+-- Per-line hashes of source files at verification time, keyed by file content hash and
+-- shared across claims. Used to measure how much of a file changed (scene-cut detection).
+CREATE TABLE IF NOT EXISTS snapshots (
+    sha   TEXT PRIMARY KEY,
+    lines TEXT NOT NULL
+);
 -- Ranked keyword search over claim text and read paths (porter: complete ~ completion).
 CREATE VIRTUAL TABLE IF NOT EXISTS edges_fts USING fts5(id UNINDEXED, body, tokenize='porter unicode61');
 CREATE TABLE IF NOT EXISTS events (
@@ -85,6 +94,9 @@ class Edge:
     created_at: float
     updated_at: float
     depends_on: list[str] = field(default_factory=list)
+    anchors: list[dict] = field(default_factory=list)
+    repair: dict | None = None
+    delta_count: int = 0
 
     def to_dict(self) -> dict:
         return {
@@ -99,6 +111,8 @@ class Edge:
             "detail": self.detail,
             "parent_id": self.parent_id,
             "depends_on": self.depends_on,
+            "repair": self.repair,
+            "delta_count": self.delta_count,
         }
 
 
@@ -107,6 +121,11 @@ class Store:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path, check_same_thread=False)  # callers serialize access
         self.db.row_factory = sqlite3.Row
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(edges)")}
+        for col, ddl in (("anchors", "TEXT NOT NULL DEFAULT '[]'"), ("repair", "TEXT"),
+                         ("delta_count", "INTEGER NOT NULL DEFAULT 0")):
+            if cols and col not in cols:  # stores created before motion estimation
+                self.db.execute(f"ALTER TABLE edges ADD COLUMN {col} {ddl}")
         fts_sql = self.db.execute("SELECT sql FROM sqlite_master WHERE name = 'edges_fts'").fetchone()
         if fts_sql and "porter" not in fts_sql[0]:  # index built before stemming: rebuild it
             self.db.execute("DROP TABLE edges_fts")
@@ -144,6 +163,9 @@ class Store:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             depends_on=deps,
+            anchors=json.loads(row["anchors"]),
+            repair=json.loads(row["repair"]) if row["repair"] else None,
+            delta_count=row["delta_count"],
         )
 
     def get(self, edge_id: str) -> Edge | None:
@@ -158,17 +180,20 @@ class Store:
         with self.db:
             self.db.execute(
                 """INSERT INTO edges (id, kind, pre, post, reads, writes, probe, status,
-                                      fingerprint, hashes, detail, parent_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      fingerprint, hashes, detail, parent_id, created_at, updated_at,
+                                      anchors, repair, delta_count)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                      reads=excluded.reads, writes=excluded.writes, probe=excluded.probe,
                      status=excluded.status, fingerprint=excluded.fingerprint,
                      hashes=excluded.hashes,
                      detail=excluded.detail, parent_id=excluded.parent_id,
-                     updated_at=excluded.updated_at""",
+                     updated_at=excluded.updated_at, anchors=excluded.anchors,
+                     repair=excluded.repair, delta_count=excluded.delta_count""",
                 (e.id, e.kind, e.pre, e.post, json.dumps(e.reads), json.dumps(e.writes),
                  json.dumps(e.probe) if e.probe else None, e.status, e.fingerprint,
-                 json.dumps(e.hashes), e.detail, e.parent_id, now, now),
+                 json.dumps(e.hashes), e.detail, e.parent_id, now, now,
+                 json.dumps(e.anchors), json.dumps(e.repair) if e.repair else None, e.delta_count),
             )
             self.db.execute("DELETE FROM edges_fts WHERE id = ?", (e.id,))
             self.db.execute("INSERT INTO edges_fts (id, body) VALUES (?, ?)", (e.id, _body(e)))
@@ -191,6 +216,23 @@ class Store:
                     "UPDATE edges SET status=?, detail=?, fingerprint=?, hashes=?, updated_at=? WHERE id=?",
                     (status, detail, fingerprint, json.dumps(hashes or {}), time.time(), edge_id),
                 )
+
+    def set_motion(self, edge_id: str, anchors: list[dict] | None, repair: dict | None) -> None:
+        """Store new anchors (None = keep) and the pending repair (None = clear)."""
+        with self.db:
+            if anchors is not None:
+                self.db.execute("UPDATE edges SET anchors=? WHERE id=?", (json.dumps(anchors), edge_id))
+            self.db.execute("UPDATE edges SET repair=? WHERE id=?",
+                            (json.dumps(repair) if repair else None, edge_id))
+
+    def put_snapshot(self, sha: str, line_hashes: list[str]) -> None:
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO snapshots (sha, lines) VALUES (?, ?)",
+                            (sha, json.dumps(line_hashes)))
+
+    def snapshot(self, sha: str) -> list[str] | None:
+        row = self.db.execute("SELECT lines FROM snapshots WHERE sha = ?", (sha,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def delete(self, edge_id: str) -> None:
         with self.db:

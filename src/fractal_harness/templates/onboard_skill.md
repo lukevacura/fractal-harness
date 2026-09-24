@@ -71,6 +71,9 @@ fractal put "<claim>" --read <file> [--read <file> ...] --probe '<json>'
   not at all.
 - **The probe must fail if the claim becomes false.** A probe that passes regardless (a
   word that appears everywhere) is worse than none.
+- **Make probes sturdy against harmless edits**: anchor on identifiers rather than exact
+  formatting (`GPS_FILTER_M\s*=\s*5\b`, not `^const GPS_FILTER_M = 5;$`), and prefer
+  `{"min": n}` over an exact count unless the count is the claim.
 - Probes must never read huge generated files (data dumps, build output, vendored deps);
   keep `paths` globs to source. Command probes must be read-only and fast.
 - Do not record what file names already say, or anything you did not confirm in the code.

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import CHECKER_VERSION, probes
+from . import CHECKER_VERSION, motion, probes
 from .hashing import edge_id, fingerprint, read_hashes
 from .store import GOOD, Edge, Store
 
@@ -29,6 +29,7 @@ class ClaimCache:
         self.root = Path(root).resolve()
         self.checker_version = checker_version
         self.store = Store(self.root / STORE_DIR / "edges.db")
+        self.last_motion: dict[str, str] = {}  # edge id -> motion class of its latest check
 
     def close(self) -> None:
         self.store.close()
@@ -37,8 +38,13 @@ class ClaimCache:
 
     def put(self, post: str, reads: list[str], *, pre: str = "", kind: str = "knowledge",
             probe: dict | None = None, writes: list[str] | None = None,
-            depends_on: list[str] | None = None, parent_id: str | None = None) -> Edge:
-        """Assert a claim and check it immediately. Re-putting an existing claim re-asserts it."""
+            depends_on: list[str] | None = None, parent_id: str | None = None,
+            delta: bool = False) -> Edge:
+        """Assert a claim and check it immediately. Re-putting an existing claim re-asserts it.
+
+        `delta=True` marks this as a delta repair (counts toward the keyframe interval);
+        otherwise the put is a full verification and resets the count.
+        """
         if not post.strip():
             raise CacheError("claim (post) must be non-empty")
         if probe is not None:
@@ -53,11 +59,14 @@ class ClaimCache:
                 raise CacheError(f"dependency {d} would create a cycle")
         if parent_id and self.store.get(parent_id) is None:
             raise CacheError(f"unknown parent: {parent_id}")
+        existing = self.store.get(eid)
+        delta_count = (existing.delta_count + 1) if (delta and existing) else 0
         edge = Edge(
             id=eid, kind=kind, pre=pre.strip(), post=post.strip(), reads=reads,
             writes=sorted(set(_norm(w) for w in writes or [])), probe=probe,
             status="pending", fingerprint=None, hashes={}, detail="",
             parent_id=parent_id, created_at=0, updated_at=0, depends_on=depends_on,
+            delta_count=delta_count,
         )
         self.store.upsert(edge)
         self.store.log("put", eid, edge_kind=kind, has_probe=probe is not None)
@@ -118,21 +127,46 @@ class ClaimCache:
             if e.probe is None:
                 if e.fingerprint and e.fingerprint != fp:
                     changed = _changed(e.hashes, hashes)
+                    self.last_motion[eid] = "reassert"
                     self.store.set_status(eid, "stale", "sources changed: " + ", ".join(changed)
                                           + "; trusted claim needs re-assertion")
+                    self.store.set_motion(eid, None, {"kind": "reassert", "residuals": []})
                 else:
                     self.store.set_status(eid, "trusted", "no probe", fp, hashes)
+                    self.store.set_motion(eid, None, None)
+                    self._snapshot(hashes)
             else:
                 result = probes.run(e.probe, self.root)
+                comps = motion.compare(self.root, e.anchors) if e.anchors else []
+                kind = motion.classify(result.passed, comps) if e.anchors else (
+                    "fresh" if result.passed else "scene_cut")
+                self.last_motion[eid] = kind
                 if not result.passed:
                     self.store.set_status(eid, "failed", result.detail, fp, hashes)
-                elif trusted_deps:
-                    self.store.set_status(eid, "trusted", "probe passed; depends on trusted: "
-                                          + ", ".join(trusted_deps), fp, hashes)
+                    self.store.set_motion(eid, None, {"kind": kind, "residuals": comps})
+                elif kind == "suspect":
+                    self.store.set_status(eid, "stale", "suspect: probe passes but the anchored code "
+                                          "changed substantially; the probe may no longer test the claim",
+                                          fp, hashes)
+                    self.store.set_motion(eid, None, {"kind": kind, "residuals": comps})
+                elif (rewritten := self._rewritten(e, hashes)) and kind in ("clean", "moved"):
+                    kind = self.last_motion[eid] = "rewrite"
+                    # Keep the old fingerprint/hashes: the flag must persist until a repair
+                    # re-asserts the claim, not clear itself on the next check.
+                    self.store.set_status(eid, "stale", "rewrite: probe passes but " + ", ".join(
+                        f"{f} ({pct:.0%} of lines changed)" for f, pct in rewritten)
+                        + "; behavior may have changed away from the probed lines")
+                    self.store.set_motion(eid, None, {"kind": "rewrite", "residuals": comps,
+                                                      "rewritten": [f for f, _ in rewritten]})
                 else:
-                    self.store.set_status(eid, "verified", result.detail, fp, hashes)
+                    status = "trusted" if trusted_deps else "verified"
+                    detail = ("probe passed; depends on trusted: " + ", ".join(trusted_deps)
+                              if trusted_deps else result.detail)
+                    self.store.set_status(eid, status, detail, fp, hashes)
+                    self.store.set_motion(eid, motion.capture(self.root, result.matches), None)
+                    self._snapshot(hashes)
         e = self._require(eid)
-        self.store.log("check", eid, status=e.status)
+        self.store.log("check", eid, status=e.status, motion=self.last_motion.get(eid))
         self._propagate()
         return self._require(eid)
 
@@ -150,6 +184,50 @@ class ClaimCache:
                 self.store.log("stale", e.id, reason="sources", changed=changed)
                 stale.append(e.id)
         return stale + self._propagate()
+
+    def _snapshot(self, hashes: dict[str, str]) -> None:
+        for rel, sha in hashes.items():
+            if sha != "missing" and "*" not in rel and self.store.snapshot(sha) is None:
+                lh = motion.line_hashes(self.root, rel)
+                if lh is not None:
+                    self.store.put_snapshot(sha, lh)
+
+    def _rewritten(self, e: Edge, hashes: dict[str, str]) -> list[tuple[str, float]]:
+        """Files this claim reads whose content was largely rewritten since the last verdict."""
+        out = []
+        for rel, sha in hashes.items():
+            old_sha = e.hashes.get(rel)
+            if not old_sha or old_sha == sha or "*" in rel:
+                continue
+            old = self.store.snapshot(old_sha)
+            new = motion.line_hashes(self.root, rel)
+            if old is None or new is None:
+                continue
+            rewritten, frac = motion.is_rewrite(old, new)
+            if rewritten:
+                out.append((rel, frac))
+        return out
+
+    def update(self) -> dict[str, list[str]]:
+        """After source edits: invalidate, re-check every stale claim, and classify the motion.
+
+        Returns {motion class: [edge ids]} for the claims that were re-checked. Local only:
+        no model call. `clean`/`moved` cost nothing; `suspect`/`delta` need a cheap repair;
+        `scene_cut` needs full re-verification.
+        """
+        self.last_motion.clear()
+        self.refresh()
+        stale = [e.id for e in self.store.all() if e.status == "stale"]
+        self.resolve(stale)
+        out: dict[str, list[str]] = {}
+        for eid, kind in self.last_motion.items():
+            out.setdefault(kind, []).append(eid)
+        blocked = [e.id for e in self.store.all() if e.status == "stale" and e.id not in self.last_motion
+                   and not (e.repair and e.repair.get("kind") == "reassert")]
+        if blocked:
+            out["blocked"] = blocked
+        self.store.log("update", None, **{k: len(v) for k, v in out.items()})
+        return out
 
     def resolve(self, ids: list[str]) -> list[Edge]:
         """Lazily re-verify: re-check stale/failed edges (and their deps), deps first."""

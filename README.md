@@ -111,6 +111,30 @@ fractal record              # process the queue
 fractal record --dry-run    # show the extraction prompt and what would be skipped
 ```
 
+## Keeping claims current (`fractal update`, `fractal repair`)
+
+Updates borrow from video coding. When a probe passes, the lines it matched (plus context)
+are stored as the claim's anchors, its keyframe. A per-line snapshot of each file it reads
+is stored too. After edits, `fractal update` classifies every affected claim locally, with
+no model call and no git:
+
+| Class | Meaning | Cost |
+|---|---|---|
+| `clean` / `moved` | probe passes; anchors unchanged or just moved (anchors rebased) | $0 |
+| `fresh` | probe passes; nothing to anchor (absent/command probes) | $0 |
+| `suspect` | probe passes but the anchored code changed substantially | delta repair |
+| `delta` | probe fails; anchors found with a small residual | delta repair |
+| `rewrite` | probe passes but ≥25% (and ≥20 lines) of a file the claim reads was rewritten | keyframe |
+| `scene_cut` | probe fails; anchors gone or heavily rewritten | keyframe |
+| `reassert` | claim has no probe and its files changed | keyframe |
+
+`fractal repair` fixes broken claims in one batched headless session. A delta repair sees
+only the claim, its probe and the residual. A keyframe repair re-verifies from source, and
+so does every claim after 3 delta repairs in a row, so patches can't drift. By default only
+**demanded** claims are repaired: ones the prompt hook wanted to inject. Claims nobody asks
+about stay broken for free. A failing invariant is reported as a violation and left alone:
+the code may be what's wrong.
+
 ## Probe-first pruning
 
 A step is redundant if its outcome already holds before any work is done (`P ⟹ Q`), like
