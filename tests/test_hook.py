@@ -106,3 +106,50 @@ def test_violated_rule_is_flagged(tmp_path):
     (root / "legacy_free.py").write_text("import legacy\n")
     ctx = _ctx(root, "anything about the build")
     assert "✗ VIOLATED NOW" in ctx
+
+
+def test_rules_are_framed_as_guarantees_and_context_fits_budget(tmp_path):
+    from fractal_harness.hook import render
+    root = _rules_repo(tmp_path)
+    ctx = _ctx(root, "what GPS distance filter do we use?")
+    assert "GUARANTEED" in ctx and "do not need to re-verify" in ctx
+    c = ClaimCache(root)
+    rules = c.invariants(("enforced",))
+    facts = [e for e in c.store.all() if e.kind != "invariant" and e.status == "verified"]
+    c.close()
+    small = render(rules, facts * 20, budget=900)
+    assert len(small) <= 900 or small.count("\n- ") <= len(rules) + 1
+    assert small.startswith("RULES")
+
+
+def test_blocked_edit_waste_and_rereads_are_measured(tmp_path):
+    import json as _json
+    from fractal_harness.hook import pre_edit_hook
+    from fractal_harness.record import measure, Session
+    root = _rules_repo(tmp_path)
+    code, _ = pre_edit_hook(_json.dumps({"tool_name": "Write", "cwd": str(root),
+                                         "tool_input": {"file_path": str(root / "bad.py"), "content": "import legacy\n"}}))
+    assert code == 2
+    _ctx_sid = prompt_hook(_json.dumps({"prompt": "what GPS distance filter do we use?", "cwd": str(root),
+                                        "session_id": "s9"}))
+    measure(root, [Session(source="t", session_id="s9", files=["app.py", "legacy_free.py", "other.txt"])])
+    c = ClaimCache(root)
+    s = c.stats()
+    c.close()
+    assert s["edits_blocked"] == 1 and s["blocked_chars"] == len("import legacy\n")
+    assert s["fact_rereads"] == 1 and s["rule_rereads"] == 2 and s["avg_context_chars"] > 0
+
+
+def test_rules_govern_new_files_named_in_the_prompt(tmp_path):
+    import subprocess
+    root = _repo(tmp_path)
+    (root / "pkg").mkdir()
+    (root / "pkg" / "core.py").write_text("x = 1\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    c = ClaimCache(root)
+    r = c.put("pkg never prints", ["pkg/*.py"], kind="invariant",
+              probe={"type": "grep", "pattern": r"\bprint\(", "paths": ["pkg/*.py"], "expect": "absent"})
+    c.set_rule(r.id, "enforced")
+    c.close()
+    assert "pkg never prints" in _ctx(root, "Add a new module pkg/alerts.py that formats alert lines")
+    assert _ctx(root, "Add a new module elsewhere/alerts.py that formats alert lines") == ""

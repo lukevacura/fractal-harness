@@ -42,7 +42,26 @@ fractal accept <id>         # human only
 | **While acting** | Every Edit/Write/MultiEdit is applied **in memory** and checked against the enforced rules that scan that file. A violating edit is blocked before it is written; the agent sees the rule and the offending lines. | `PreToolUse` → `fractal hook pre-edit` |
 | | After any edit, the same rules are re-checked on disk (a backstop that also runs command probes). | `PostToolUse` → `fractal hook edit` |
 | **At commit** | `fractal check` fails on any violated enforced rule. Proposed rules are reported, never blocking. | git pre-commit |
+| **End of turn** | The behavioral claims (tests) the uncommitted changes can break run in one batch; a regression blocks finishing. | `Stop` → `fractal hook stop` |
 | **After the session** | The session is queued; `fractal record` later learns facts and proposes rules from it (skipping sessions the cache already served). | `Stop` → `fractal hook stop` |
+
+## Behavioral contracts: the codebase as a graph
+
+Every test file is a behavioral claim about exactly the code it exercises (its transitive
+imports, plus files it reads by path), placed on the region tree:
+
+```sh
+fractal import-tests        # one claim per test file (flutter, dart or pytest); no tests run
+fractal behavior --all      # baseline: one batched run records every verdict
+fractal behavior            # run only the claims the uncommitted changes can break
+```
+
+At the end of every agent turn, the `Stop` hook runs the behavioral claims the uncommitted
+changes affect (batched per runner) and blocks on a **regression** (passed at the baseline,
+fails now) or a violated enforced invariant, so the agent fixes it before handing back.
+Already-failing tests never block; after two blocks in a session it reports instead. The
+commit gate runs the same set and promotes passing results to the new baseline. Tests that
+exercise no repo code are reported as vacuous.
 
 ## The invariant lifecycle
 

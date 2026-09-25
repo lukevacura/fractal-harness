@@ -78,6 +78,16 @@ def main(argv: list[str] | None = None) -> int:
     ck = sub.add_parser("check", help="pre-commit/CI gate: re-check claims; exit 1 if an enforced invariant is violated")
     ck.add_argument("--strict", action="store_true", help="also fail when other claims need repair")
 
+    # -- behavior: the codebase as a graph of behavioral contracts ------------------------------
+    it = sub.add_parser("import-tests", help="turn every test file into a behavioral claim over the code it imports")
+    it.add_argument("--runner", choices=["flutter", "dart", "pytest"], help="default: detected from the repo")
+    it.add_argument("--limit", type=int, help="import at most N test files")
+    mp = sub.add_parser("map", help="a task's footprint on the behavioral graph: regions, contracts, assumptions")
+    mp.add_argument("task")
+    bh = sub.add_parser("behavior", help="run behavioral claims: the ones current changes affect, or --all (baseline)")
+    bh.add_argument("--all", action="store_true", help="run every behavioral claim (establishes the baseline)")
+    bh.add_argument("--timeout", type=int, default=600)
+
     # -- claims: descriptive knowledge (machine-maintained) --------------------------------
     put = sub.add_parser("put", help="assert a claim and check it")
     put.add_argument("claim", help="the claim text")
@@ -144,8 +154,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(msg, file=sys.stderr)
             return code
         if args.event == "stop":
-            stop_hook(stdin)
-            return 0
+            code, msg = stop_hook(stdin)
+            if msg:
+                print(msg, file=sys.stderr)
+            return code
         out = prompt_hook(stdin)
         if out:
             print(out)
@@ -173,6 +185,28 @@ def main(argv: list[str] | None = None) -> int:
         for ok, msg in results:
             print(f"{'ok  ' if ok else 'FAIL'} {msg}")
         return 0 if all(ok for ok, _ in results) else 1
+    if args.cmd == "import-tests":
+        from .behavior import import_tests
+        print(json.dumps(import_tests(root, args.runner, args.limit), indent=2))
+        print("next: `fractal behavior --all` to record a baseline verdict for every behavioral claim", file=sys.stderr)
+        return 0
+    if args.cmd == "map":
+        from .taskmap import render as render_map, task_map
+        print(render_map(task_map(root, args.task), budget=20000) or "(no footprint: the task names nothing this "
+              "repo's graph knows; explore normally)")
+        return 0
+    if args.cmd == "behavior":
+        from .behavior import baseline, gate
+        if args.all:
+            print(json.dumps(baseline(root, args.timeout), indent=2))
+            return 0
+        r = gate(root, timeout=args.timeout)
+        for kind in ("violations", "regressions", "still_failing"):
+            for e in r[kind]:
+                print(f"{kind[:-1] if kind != 'still_failing' else 'failing':10} {e.id} {e.probe['file']}: "
+                      f"{r['results'][e.id].detail}")
+        print(f"changed files: {r['changed']}, behavioral claims checked: {r['checked']} in {r['seconds']}s")
+        return 1 if r["regressions"] or r["violations"] else 0
     if args.cmd == "check":
         from .check import check
         code, report = check(root, strict=args.strict)

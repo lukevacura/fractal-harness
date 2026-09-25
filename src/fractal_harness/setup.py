@@ -11,6 +11,7 @@ from .cache import STORE_DIR, ClaimCache
 
 SERVER = "fractal-claims"   # the MCP server earlier versions registered; init removes it
 SKILL = "fractal-onboard"
+WORK_SKILL = "fractal-work"
 PROMPT_HOOK = "fractal hook prompt"
 STOP_HOOK = "fractal hook stop"
 EDIT_HOOK = "fractal hook edit"
@@ -112,12 +113,13 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
             _write_json(mcp_path, m)
             done.append(f".mcp.json  -server {SERVER}")
 
-    skill_path = root / ".claude" / "skills" / SKILL / "SKILL.md"
-    skill = _template("onboard_skill.md")
-    if not skill_path.exists() or skill_path.read_text() != skill:
-        skill_path.parent.mkdir(parents=True, exist_ok=True)
-        skill_path.write_text(skill)
-        done.append(f"skill      .claude/skills/{SKILL}/SKILL.md (/{SKILL}, user-invoked only)")
+    for name, template in ((SKILL, "onboard_skill.md"), (WORK_SKILL, "work_skill.md")):
+        skill_path = root / ".claude" / "skills" / name / "SKILL.md"
+        skill = _template(template)
+        if not skill_path.exists() or skill_path.read_text() != skill:
+            skill_path.parent.mkdir(parents=True, exist_ok=True)
+            skill_path.write_text(skill)
+            done.append(f"skill      .claude/skills/{name}/SKILL.md (/{name}, user-invoked only)")
 
     if settings:
         settings_path = root / ".claude" / "settings.json"

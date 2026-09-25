@@ -183,3 +183,11 @@ def test_search_matches_identifiers_and_paths(cache):
 def test_search_stems_word_forms(cache):
     a = cache.put("Quest completion is detected by questIsComplete in quest.py", ["src/app.py"])
     assert [e.id for e in cache.query("how does a quest complete?", min_matches=2)] == [a.id]
+
+
+def test_grep_exclude_paths(cache, repo):
+    (repo / "src" / "legacy.py").write_text("eval(x)\n")
+    probe = {"type": "grep", "pattern": r"\beval\(", "paths": ["src/*.py"], "expect": "absent"}
+    assert cache.put("no eval anywhere", ["src/*.py"], probe=probe).status == "failed"
+    ok = {**probe, "exclude_paths": ["src/legacy.py"]}
+    assert cache.put("no eval outside legacy.py", ["src/*.py"], probe=ok).status == "verified"

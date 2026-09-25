@@ -53,8 +53,10 @@ questions WITHOUT exploring. Work like this:
    - The probe must cover every checkable statement in the claim and must fail if the claim
      becomes false. If part of a claim cannot be probed, record that part separately without
      --probe (it is stored as trusted) or leave it out.
-4. At most {max_per_session} claims per session; prefer facts that took the session the most
-   exploration to find.
+4. At most {max_per_session} claims per session. Rank by exploration saved: sessions are listed
+   most expensive first, and a property a session spent many calls establishing (searching
+   that something is never used, tracing which module owns a behavior) is the best
+   candidate, because recording it removes that exploration from every future session.
 5. If a session revealed a RULE the code follows and must keep following (a boundary, a
    forbidden call, a required element), propose it with
    `fractal propose "<rule>" --read <file> --probe '<json>'`, where the probe fails when the
@@ -187,6 +189,31 @@ def _covered_files(cache: ClaimCache, session_id: str) -> set[str] | None:
     return set(reads)
 
 
+def measure(root: Path, sessions: list[Session]) -> None:
+    """Log per-session waste metrics: re-reads of files the injected facts and rules covered.
+
+    A re-read of a file an injected verified fact covered, or that an injected enforced rule
+    guarantees, is badput the injection was meant to prevent.
+    """
+    from .cache import dependencies
+    cache = ClaimCache(root)
+    try:
+        for s in sessions:
+            if not s.session_id:
+                continue
+            events = [e for e in cache.store.events("inject") if e.get("session_id") == s.session_id]
+            fact_ids = {i for ev in events for i in ev.get("ids", [])}
+            rule_ids = {i for ev in events for i in ev.get("rules", [])}
+            fact_files = {r for i in fact_ids if (c := cache.get(i)) for r in c.reads}
+            rule_deps = [d for i in rule_ids if (c := cache.get(i)) for d in dependencies(c)]
+            cache.store.log("session_stats", None, session_id=s.session_id, files_explored=len(s.files),
+                            exploration_calls=s.exploration_calls,
+                            fact_rereads=sum(affects(list(fact_files), f) for f in s.files) if fact_files else 0,
+                            rule_rereads=sum(affects(rule_deps, f) for f in s.files) if rule_deps else 0)
+    finally:
+        cache.close()
+
+
 def triage(root: Path, sessions: list[Session], force: bool = False) -> tuple[list[Session], list[dict]]:
     """Split sessions into (worth recording, skipped with reasons)."""
     keep, skipped = [], []
@@ -228,6 +255,8 @@ def record(root: Path, transcripts: list[Path] | None = None, model: str = "sonn
     queued = [] if transcripts else pending(root)
     paths = transcripts or [Path(e["transcript"]) for e in queued]
     parsed = [parse_transcript(p, root) for p in paths if p.exists()]
+    if not dry_run:
+        measure(root, parsed)
     sessions, skipped = triage(root, parsed, force)
     queued_ids = [e["session_id"] for e in queued]
     if not sessions:
@@ -240,8 +269,10 @@ def record(root: Path, transcripts: list[Path] | None = None, model: str = "sonn
         return {"sessions": 0, "skipped": skipped, "claims_added": 0, "cost_usd": 0.0}
 
     blocks = []
+    sessions = sorted(sessions, key=lambda s: -s.exploration_calls)   # most exploration saved first
     for i, s in enumerate(sessions, 1):
         blocks.append(f"### Session {i}\nQuestion: {s.prompt.strip()[:1500] or '(not recorded)'}\n"
+                      f"Exploration calls: {s.exploration_calls}\n"
                       f"Files explored: {', '.join(s.files[:40])}\n"
                       f"Answer:\n{s.answer.strip()[:4000]}\n")
     prompt = PROMPT.replace("{max_per_session}", str(max_per_session)).replace("{sessions}", "\n".join(blocks))

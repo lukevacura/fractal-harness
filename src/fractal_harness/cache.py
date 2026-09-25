@@ -42,9 +42,12 @@ def dependencies(e: Edge) -> list[str]:
 
 
 class ClaimCache:
-    def __init__(self, root: Path | str, checker_version: str = CHECKER_VERSION):
+    def __init__(self, root: Path | str, checker_version: str = CHECKER_VERSION, run_slow: bool = True):
         self.root = Path(root).resolve()
         self.checker_version = checker_version
+        # Slow probes (tests, commands) take seconds; hooks on the millisecond path pass
+        # run_slow=False and leave those claims to the turn-end gate and the commit gate.
+        self.run_slow = run_slow
         self.store = Store(self.root / STORE_DIR / "edges.db")
         self.last_motion: dict[str, str] = {}  # edge id -> motion class of its latest check
 
@@ -56,7 +59,7 @@ class ClaimCache:
     def put(self, post: str, reads: list[str], *, pre: str = "", kind: str = "knowledge",
             probe: dict | None = None, writes: list[str] | None = None,
             depends_on: list[str] | None = None, parent_id: str | None = None,
-            delta: bool = False) -> Edge:
+            delta: bool = False, check: bool = True) -> Edge:
         """Assert a claim and check it immediately. Re-putting an existing claim re-asserts it.
 
         `delta=True` marks this as a delta repair (counts toward the keyframe interval);
@@ -89,9 +92,33 @@ class ClaimCache:
             parent_id=parent_id, created_at=0, updated_at=0, depends_on=depends_on,
             delta_count=delta_count, rule_state=rule_state,
         )
+        if existing and not check:   # keep the last verdict until the claim is re-run
+            edge.status, edge.fingerprint, edge.hashes, edge.detail = (
+                existing.status, existing.fingerprint, existing.hashes, existing.detail)
+            edge.anchors = existing.anchors
         self.store.upsert(edge)
         self.store.log("put", eid, edge_kind=kind, has_probe=probe is not None)
-        return self.check(eid)
+        return self.check(eid) if check else self._require(eid)
+
+    def get_by_probe_file(self, file: str) -> Edge | None:
+        """The behavioral claim whose test probe runs `file`, if any."""
+        for e in self.store.all():
+            if e.probe and e.probe.get("type") == "test" and e.probe.get("file") == file:
+                return e
+        return None
+
+    def set_verdict(self, eid: str, passed: bool, detail: str) -> Edge:
+        """Record an externally computed verdict (batched test runs) at the current fingerprint."""
+        e = self._require(eid)
+        hashes = read_hashes(self.root, dependencies(e))
+        fp = fingerprint(hashes, e.probe, self.checker_version)
+        self.store.set_status(eid, "verified" if passed else "failed", detail, fp, hashes)
+        self.store.set_motion(eid, None, None if passed else {"kind": "behavior", "residuals": []})
+        if passed:
+            self._snapshot(hashes)
+        self.store.log("check", eid, status="verified" if passed else "failed", motion="behavior")
+        self._propagate()
+        return self._require(eid)
 
     def set_rule(self, eid: str, state: str) -> Edge:
         """Human step: accept (enforce) or reject a proposed invariant."""
@@ -140,6 +167,8 @@ class ClaimCache:
                     self.store.set_status(eid, "trusted", "no probe", fp, hashes)
                     self.store.set_motion(eid, None, None)
                     self._snapshot(hashes)
+            elif probes.is_slow(e.probe) and not self.run_slow:
+                self.store.set_status(eid, "stale", "deferred: slow probe runs at turn end or commit")
             else:
                 result = probes.run(e.probe, self.root)
                 comps = motion.compare(self.root, e.anchors) if e.anchors else []
@@ -301,6 +330,10 @@ class ClaimCache:
         records = self.store.events("record")
         repairs = self.store.events("repair")
         updates = self.store.events("update")
+        pre = self.store.events("pre_edit_check")
+        post = self.store.events("edit_check")
+        contexts = self.store.events("context")
+        sessions = self.store.events("session_stats")
         return {
             "prompts_seen": len(prompts),
             "prompts_with_claims": len(hits),
@@ -312,6 +345,15 @@ class ClaimCache:
             "repairs": sum(e.get("entries", 0) for e in repairs),
             "repair_cost_usd": round(sum(e.get("cost_usd", 0.0) for e in repairs), 3),
             "update_runs": len(updates),
+            # rule-related waste (alignment goodput)
+            "edits_checked": len(pre),
+            "edits_blocked": sum(1 for e in pre if e.get("violations")),
+            "blocked_chars": sum(e.get("blocked_chars", 0) for e in pre),
+            "post_edit_violations": sum(1 for e in post if e.get("violations")),
+            "avg_context_chars": round(sum(e.get("chars", 0) for e in contexts) / len(contexts)) if contexts else None,
+            "sessions_measured": len(sessions),
+            "fact_rereads": sum(e.get("fact_rereads", 0) for e in sessions),
+            "rule_rereads": sum(e.get("rule_rereads", 0) for e in sessions),
         }
 
     # --- internals -----------------------------------------------------------

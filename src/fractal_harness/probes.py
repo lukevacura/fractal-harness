@@ -4,9 +4,13 @@ Probe shapes:
   {"type": "command", "run": "pytest -q tests/test_x.py", "expect_exit": 0, "timeout": 120}
   {"type": "grep", "pattern": "auth_middleware", "paths": ["src/**/*.py"],
    "exclude": "^\\s*(#|//)",  # optional: skip lines matching this (e.g. comments)
+   "exclude_paths": ["src/legacy/*.py"],  # optional: files the rule does not cover
    "expect": "present" | "absent" | {"count": 3} | {"min": 1}}
 
   {"type": "all", "probes": [<probe>, ...]}  # passes only if every sub-probe passes
+  {"type": "test", "runner": "flutter" | "dart" | "pytest", "file": "test/x_test.dart"}
+      # a behavioral probe: the test file passes. Slow (seconds): never run in the
+      # millisecond hooks; batched per runner at turn end and at commit (see behavior.py)
 
 grep is line-based: it counts matching lines, so `^`/`$` anchor to each line.
 """
@@ -30,6 +34,18 @@ class ProbeError(ValueError):
     pass
 
 
+RUNNERS = {"flutter", "dart", "pytest"}
+
+
+def is_slow(probe: dict | None) -> bool:
+    """Probes that take seconds (tests, commands): kept out of the millisecond hooks."""
+    if not probe:
+        return False
+    if probe.get("type") == "all":
+        return any(is_slow(p) for p in probe["probes"])
+    return probe.get("type") in ("test", "command")
+
+
 def validate(probe: dict) -> None:
     kind = probe.get("type")
     if kind == "command":
@@ -49,7 +65,14 @@ def validate(probe: dict) -> None:
                 raise ProbeError(f"invalid exclude regex: {e}") from e
         if not probe.get("paths"):
             raise ProbeError("grep probe needs 'paths' (list of globs)")
+        if not isinstance(probe.get("exclude_paths", []), list):
+            raise ProbeError("'exclude_paths' must be a list of globs")
         _expectation(probe.get("expect", "present"))
+    elif kind == "test":
+        if probe.get("runner") not in RUNNERS:
+            raise ProbeError(f"test probe runner must be one of {sorted(RUNNERS)}")
+        if not isinstance(probe.get("file"), str) or not probe["file"]:
+            raise ProbeError("test probe needs a 'file'")
     elif kind == "all":
         subs = probe.get("probes")
         if not isinstance(subs, list) or not subs:
@@ -66,6 +89,10 @@ def run(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> Probe
     validate(probe)
     if probe["type"] == "command":
         return _run_command(probe, root)
+    if probe["type"] == "test":
+        from .behavior import run_tests
+        result = run_tests(root, probe["runner"], [probe["file"]]).get(probe["file"])
+        return result or ProbeResult(False, "test runner produced no result")
     if probe["type"] == "all":
         results = [run(sub, root, overlay) for sub in probe["probes"]]
         matches = [m for r in results for m in r.matches]
@@ -112,9 +139,12 @@ def _run_grep(probe: dict, root: Path, overlay: dict[str, str] | None = None) ->
     files: set[Path] = set()
     for glob in probe["paths"]:
         files.update(p for p in root.glob(glob) if p.is_file())
+    from .regions import matches
     if overlay:  # in-memory files (e.g. a Write creating a new file) count if a glob covers them
-        from .regions import matches
         files.update(root / rel for rel in overlay if any(matches(g, rel) for g in probe["paths"]))
+    if probe.get("exclude_paths"):
+        files = {f for f in files if not any(matches(g, f.relative_to(root).as_posix())
+                                             for g in probe["exclude_paths"])}
     count = 0
     matches: list[tuple[str, int]] = []
     for path in sorted(files):
