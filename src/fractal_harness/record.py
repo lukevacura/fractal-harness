@@ -47,6 +47,8 @@ questions WITHOUT exploring. Work like this:
 3. Record with `fractal put "<claim>" --read <file> [--read <file>...] --probe '<json>'`.
    - One fact per claim, stated as a contract usable without opening the file.
    - `--read`: every file the claim depends on (globs allowed, e.g. 'app/lib/**/*.dart').
+   - `--dep <claim id>` (repeatable): when the claim only holds if another claim holds (a
+     decision it follows, an interface it calls), so it goes stale when that claim does.
    - Probe: {"type":"grep","pattern":"<regex>","paths":["<glob>"],"expect":"present"|"absent"|{"count":n}|{"min":n}}
      grep is line-based; add "exclude":"<regex>" to skip lines (e.g. comments).
      {"type":"all","probes":[...]} when a claim has several checkable parts.
