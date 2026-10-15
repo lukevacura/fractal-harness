@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .cache import CacheError, ClaimCache
 from .probes import ProbeError
+from .symbols import SymbolError
 from .store import Edge
 
 MOTION_CLASSES = ("clean", "moved", "fresh", "suspect", "delta", "rewrite", "scene_cut", "reassert", "blocked")
@@ -91,7 +92,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- claims: descriptive knowledge (machine-maintained) --------------------------------
     put = sub.add_parser("put", help="assert a claim and check it")
-    put.add_argument("claim", help="the claim text")
+    put.add_argument("claim", nargs="?", help="the claim text (omit with --section/--symbol)")
+    put.add_argument("--section", metavar="FILE::HEADING",
+                     help="claim carrying that markdown section's exact text, stale when the section changes")
+    put.add_argument("--symbol", metavar="FILE::ITEM",
+                     help="interface claim carrying that code item's signature and docs, stale when they change")
     put.add_argument("--pre", default="", help="precondition (workflows)")
     put.add_argument("--kind", default="knowledge", choices=["knowledge", "workflow", "interface", "invariant"],
                      help="invariant = a proposed rule (same as `propose`)")
@@ -109,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
     show.add_argument("id")
     rm = sub.add_parser("rm", help="delete a claim")
     rm.add_argument("id")
+    cx = sub.add_parser("context", help="one bounded bundle for a spec: its cited decisions, interfaces and rules")
+    cx.add_argument("spec", help="path to the spec (markdown)")
+    cx.add_argument("--id-pattern", help="regex for the IDs a spec cites (default: letters + digits, e.g. D16)")
     mf = sub.add_parser("manifest", help="an owner's context for a region: the rules and facts that govern it")
     mf.add_argument("region", nargs="?", default="", help="directory or file (default: whole repo)")
 
@@ -218,6 +226,14 @@ def main(argv: list[str] | None = None) -> int:
         if report:
             print(report, file=sys.stderr if code else sys.stdout)
         return code
+    if args.cmd == "context":
+        from .context import DEFAULT_ID_PATTERN, bundle
+        try:
+            print(bundle(root, args.spec, args.id_pattern or DEFAULT_ID_PATTERN), end="")
+        except SymbolError as e:
+            print(f"fractal: {e}", file=sys.stderr)
+            return 1
+        return 0
     if args.cmd == "manifest":
         from .manifest import manifest
         print(manifest(root, args.region), end="")
@@ -271,7 +287,13 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{'':20}{e.detail}")
                 print(" ".join(f"{s}={sum(e.rule_state == s for e in rules)}"
                                for s in ("enforced", "proposed", "rejected")))
+        elif args.cmd == "put" and (args.section or args.symbol):
+            from .context import put_extracted
+            _emit(args, [put_extracted(cache, root, section=args.section, symbol=args.symbol,
+                                       depends_on=args.dep)])
         elif args.cmd == "put":
+            if not args.claim:
+                raise CacheError("put needs a claim text, or --section / --symbol")
             _emit(args, [cache.put(args.claim, args.read, pre=args.pre, kind=args.kind, probe=_probe(args),
                                    depends_on=args.dep, parent_id=args.parent, delta=args.delta)])
         elif args.cmd == "query":
@@ -310,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(args, cache.verify(args.ids or None))
         elif args.cmd == "stats":
             print(json.dumps(cache.stats(), indent=2))
-    except (CacheError, ProbeError, json.JSONDecodeError) as e:
+    except (CacheError, ProbeError, SymbolError, json.JSONDecodeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     finally:

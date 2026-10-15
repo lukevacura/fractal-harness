@@ -19,6 +19,12 @@ Probe shapes:
       # a gate probe over the message being committed (comment lines stripped): fails if the
       # `forbid` regex matches or the `require` regex does not (multiline; either key optional)
 
+  {"type": "section", "ref": "docs/DECISIONS.md::D16", "sha": "<digest>"}
+  {"type": "symbol", "ref": "src/profile.rs::Profile::len", "sha": "<digest>"}
+      # the extracted markdown section / code interface still hashes to `sha` (see symbols.py);
+      # written by `fractal put --section/--symbol`, so a claim carrying that text goes stale
+      # (and fails) when the text changes
+
 Gate probes depend on the commit in flight, not on files, so they are never memoized: the cache
 records them as holding vacuously, and the commit gates (`fractal check`, `fractal check
 --message FILE`) evaluate them with the real staged paths / message (`ctx`).
@@ -104,6 +110,14 @@ def validate(probe: dict) -> None:
                     re.compile(probe[k])
                 except (re.error, TypeError) as e:
                     raise ProbeError(f"invalid {k} regex: {e}") from e
+    elif kind in ("section", "symbol"):
+        from .symbols import SymbolError, split_ref
+        try:
+            split_ref(probe.get("ref") or "")
+        except SymbolError as e:
+            raise ProbeError(str(e)) from e
+        if not isinstance(probe.get("sha"), str):
+            raise ProbeError(f"{kind} probe needs a 'sha' string")
     elif kind == "test":
         if probe.get("runner") not in RUNNERS:
             raise ProbeError(f"test probe runner must be one of {sorted(RUNNERS)}")
@@ -128,6 +142,8 @@ def run(probe: dict, root: Path, overlay: dict[str, str] | None = None,
     validate(probe)
     if probe["type"] in GATE_TYPES:
         return _run_gate(probe, ctx or {})
+    if probe["type"] in ("section", "symbol"):
+        return _run_extract(probe, root)
     if probe["type"] == "command":
         return _run_command(probe, root)
     if probe["type"] == "test":
@@ -227,3 +243,14 @@ def _run_gate(probe: dict, ctx: dict) -> ProbeResult:
     if probe.get("require") and not re.search(probe["require"], text, re.M):
         return ProbeResult(False, f"commit message lacks /{probe['require']}/")
     return ProbeResult(True, "commit message allowed")
+
+
+def _run_extract(probe: dict, root: Path) -> ProbeResult:
+    from .symbols import SymbolError, digest, section_of, symbol_of
+    try:
+        text = (section_of if probe["type"] == "section" else symbol_of)(root, probe["ref"])
+    except SymbolError as e:
+        return ProbeResult(False, str(e))
+    if digest(text) != probe["sha"]:
+        return ProbeResult(False, f"{probe['type']} {probe['ref']} changed since the claim was written")
+    return ProbeResult(True, f"{probe['type']} {probe['ref']} unchanged")

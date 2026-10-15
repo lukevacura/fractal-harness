@@ -310,6 +310,18 @@ def _agent_query(root: Path, prompt: str) -> str:
     return "\n".join([prompt, *extra])
 
 
+def _agent_cited(root: Path, prompt: str) -> str:
+    """Decisions/interfaces cited by the specs the prompt references (`fractal context`'s middle part)."""
+    import re
+    from .context import cited_sections
+    parts: list[str] = []
+    for m in re.findall(r"[\w.-]+(?:/[\w.-]+)*\.md\b", prompt):
+        f = root / m
+        if f.is_file() and f.stat().st_size <= 200_000:
+            parts += cited_sections(root, f.read_text(errors="replace"))
+    return "\n".join(parts).strip()
+
+
 def subagent_start_hook(stdin: str) -> str:
     """SubagentStart: returns the hook's stdout, the rules and facts for the paths the subagent's
     launch prompt names (repo-wide rules only when the prompt can't be recovered)."""
@@ -322,6 +334,10 @@ def subagent_start_hook(stdin: str) -> str:
             return ""
         prompt = _claim_launch(root, data.get("transcript_path"), data.get("agent_type") or "general-purpose")
         ctx = context_for(root, _agent_query(root, prompt), data.get("session_id"), MAX_AGENT_CONTEXT_CHARS)
+        cited = _agent_cited(root, prompt)
+        if cited:   # decisions and interfaces the referenced spec cites, within what the rules left
+            room = max(0, MAX_AGENT_CONTEXT_CHARS - len(ctx or ""))
+            ctx = "\n\n".join(p for p in (ctx, cited[:room]) if p) if room > 200 else ctx
     except Exception as e:  # a broken cache must never block a launch
         print(f"fractal hook: {e}", file=sys.stderr)
         return ""

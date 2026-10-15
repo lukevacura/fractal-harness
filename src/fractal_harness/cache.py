@@ -38,6 +38,8 @@ def dependencies(e: Edge) -> list[str]:
             stack.extend(p["probes"])
         elif p.get("type") == "grep":
             paths.update(p["paths"])
+        elif p.get("type") in ("section", "symbol"):
+            paths.add(p["ref"].partition("::")[0])
     return sorted(paths)
 
 
