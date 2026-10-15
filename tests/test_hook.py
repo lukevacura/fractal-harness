@@ -14,7 +14,7 @@ def _repo(tmp_path: Path) -> Path:
     (tmp_path / "app.py").write_text("GPS_FILTER = 5\ndef billing(): pass\n")
     c = ClaimCache(tmp_path)
     c.put("GPS distance filter is 5 metres (GPS_FILTER in app.py)", ["app.py"], probe=_grep("GPS_FILTER = 5"))
-    c.put("GPS distance filter rationale is battery life", ["app.py"])  # trusted: never injected
+    c.put("GPS distance filter rationale is battery life", ["app.py"])  # trusted: injected, labeled unverified
     c.put("Billing runs through billing() in app.py", ["app.py"], probe=_grep("def billing"))
     c.close()
     return tmp_path
@@ -29,7 +29,10 @@ def test_injects_only_strong_verified_matches(tmp_path: Path):
     root = _repo(tmp_path)
     ctx = _ctx(root, "what GPS distance filter do we use?")
     assert "GPS distance filter is 5 metres" in ctx
-    assert "battery" not in ctx and "Billing" not in ctx
+    assert "Billing" not in ctx
+    # the unprobed claim is injected too, but labeled as unverified and after the verified one
+    assert "UNVERIFIED FACTS" in ctx and ctx.index("battery") > ctx.index("5 metres")
+    assert "asserted without proof" in ctx
     assert "do not re-read" in ctx  # guidance travels with the claims
 
 
@@ -66,7 +69,7 @@ def test_stats_report_real_use_hit_rate(tmp_path: Path):
     c = ClaimCache(root)
     s = c.stats()
     c.close()
-    assert (s["prompts_seen"], s["prompts_with_claims"], s["hit_rate"], s["claims_injected"]) == (2, 1, 0.5, 1)
+    assert (s["prompts_seen"], s["prompts_with_claims"], s["hit_rate"], s["claims_injected"]) == (2, 1, 0.5, 2)
 
 
 # --- rules first, with evidence ---------------------------------------------------------------
@@ -192,3 +195,19 @@ def test_subagent_start_fails_open_and_respects_budget(tmp_path: Path, monkeypat
     monkeypatch.setattr(hook, "MAX_AGENT_CONTEXT_CHARS", 10)
     t = _transcript(tmp_path / "t.jsonl", ("a", "general-purpose", "what GPS distance filter do we use?"))
     assert "GPS distance filter is 5 metres" not in _start(root, t)
+
+
+def test_stale_fact_is_labeled_never_presented_as_verified(tmp_path: Path):
+    (tmp_path / "app.py").write_text("GPS_FILTER = 5\ndef billing(): pass\n")
+    c = ClaimCache(tmp_path)
+    up = c.put("GPS filter constant is defined in app.py", ["app.py"], probe=_grep("GPS_FILTER = 5"))
+    c.put("GPS distance filter is applied before upload", ["app.py"], probe=_grep("def billing"),
+          depends_on=[up.id])
+    c.close()
+    ctx = _ctx(tmp_path, "where is the GPS distance filter applied before upload?")
+    assert "applied before upload" in ctx and "STALE FACTS" not in ctx
+    (tmp_path / "app.py").write_text("GPS_RADIUS = 5\ndef billing(): pass\n")   # upstream claim now fails
+    ctx = _ctx(tmp_path, "where is the GPS distance filter applied before upload?")
+    assert "STALE FACTS" in ctx and "may be wrong" in ctx and "stale: blocked by upstream" in ctx
+    assert "FACTS: verified" not in ctx or "applied before upload" not in ctx.split("STALE FACTS")[0]
+    assert "defined in app.py" not in ctx   # the failed upstream claim is known false: left out

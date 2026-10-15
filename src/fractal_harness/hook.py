@@ -39,6 +39,7 @@ AGENT_TOOLS = {"Agent", "Task"}
 MAX_AGENT_CONTEXT_CHARS = int(os.environ.get("FRACTAL_AGENT_CONTEXT_CHARS") or 6000)   # ~2k tokens
 MAX_SPEC_CHARS = 4000        # how much of a referenced spec file is scanned for paths
 
+FACT_ORDER = ("verified", "trusted", "stale")
 RULES_HEADER = (
     "RULES: enforced by this project's owner. Every edit is checked against them before it is written "
     "and again at commit, so they are GUARANTEED to hold: you do not need to re-verify them (no "
@@ -50,6 +51,14 @@ FACTS_HEADER = (
     "FACTS: verified against the current source by a deterministic probe moments ago. Treat them as "
     "confirmed: do not re-read or re-search the cited lines to re-verify them; read those files only "
     "for details a fact does not state."
+)
+STALE_HEADER = (
+    "STALE FACTS: these described the code before it changed and could not be re-verified "
+    "automatically. They may be wrong: check the code before relying on them."
+)
+TRUSTED_HEADER = (
+    "UNVERIFIED FACTS: accepted by the project without a probe. Nothing checks them against the "
+    "code: treat them as notes, not as confirmed."
 )
 
 
@@ -120,8 +129,11 @@ def select_context(root: Path, prompt: str, session_id: str | None = None,
             if scored:
                 best = scored[0][1]
                 resolved = cache.resolve([i for i, score, _ in scored if score <= best * RELATIVE_CUTOFF])
-                facts = [e for e in resolved if e.status == "verified"
-                         and e.kind not in ("invariant", "behavior")][:MAX_FACTS]
+                # Verified first, then trusted and stale ones, which render with their own label: a
+                # claim that may be wrong is flagged, never presented as verified (and failed
+                # claims, known false, are left out).
+                eligible = [e for e in resolved if e.kind not in ("invariant", "behavior")]
+                facts = [e for status in FACT_ORDER for e in eligible if e.status == status][:MAX_FACTS]
                 # Claims the prompt wanted but that need repair: `fractal repair` fixes demanded ones.
                 wanted = [e.id for e in resolved if e.repair and e.status in ("failed", "stale")]
                 if log and wanted:
@@ -160,6 +172,10 @@ def _rule_line(e: Edge) -> str:
 
 def _fact_line(e: Edge) -> str:
     pre = f"{{{e.pre}}} ⟹ " if e.pre else ""
+    if e.status == "stale":
+        return f"- {pre}{e.post}\n  ⚠ stale: {(e.detail or 'sources changed')[:160]}"
+    if e.status == "trusted":
+        return f"- {pre}{e.post}\n  ? asserted without proof"
     return f"- {pre}{e.post}\n  ✓ {evidence(e)}"
 
 
@@ -167,8 +183,10 @@ def render(rules: list[Edge], facts: list[Edge], budget: int = MAX_CONTEXT_CHARS
     """Rules first, then facts, within a character budget (facts are dropped first)."""
     def build(rs: list[Edge], fs: list[Edge]) -> str:
         parts = [RULES_HEADER, *(_rule_line(e) for e in rs)] if rs else []
-        if fs:
-            parts += ([""] if parts else []) + [FACTS_HEADER, *(_fact_line(e) for e in fs)]
+        for status, header in (("verified", FACTS_HEADER), ("trusted", TRUSTED_HEADER), ("stale", STALE_HEADER)):
+            group = [e for e in fs if e.status == status]
+            if group:
+                parts += ([""] if parts else []) + [header, *(_fact_line(e) for e in group)]
         return "\n".join(parts)
     while facts and len(build(rules, facts)) > budget:
         facts = facts[:-1]
