@@ -23,7 +23,10 @@ code it imports, grouped into regions. Use it as your framework for the task in 
 4. **Done = contracts hold.** A region is done when its contracts pass. Then run
    `fractal behavior`: it runs exactly the contracts your changes can affect. Fix any that
    regress unless the task intends the behavior change (then update that test and say so).
-5. **Never** edit or work around enforced rules; if the task requires breaking one, stop and
+5. **Verify independently.** Hand the finished node to a fresh verifier subagent running
+   `/fractal-verify`: it re-runs only the mutants a change can have affected and records its
+   verdicts in the mutant ledger. Pass it the spec path, not your own reasoning.
+6. **Never** edit or work around enforced rules; if the task requires breaking one, stop and
    ask the user.
 
 Finish with: the regions you changed, the contracts you added or changed and why, and the

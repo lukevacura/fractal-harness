@@ -13,6 +13,7 @@ from .cache import STORE_DIR, ClaimCache
 SERVER = "fractal-claims"   # the MCP server earlier versions registered; init removes it
 SKILL = "fractal-onboard"
 WORK_SKILL = "fractal-work"
+VERIFY_SKILL = "fractal-verify"
 PROMPT_HOOK = "fractal hook prompt"
 STOP_HOOK = "fractal hook stop"
 EDIT_HOOK = "fractal hook edit"
@@ -49,7 +50,7 @@ LOCAL_SETTINGS = ".claude/settings.local.json"
 # Everything fractal puts in a repo's working tree, and so must never be committed: the store, the
 # per-user settings carrying its hooks, and (legacy) skills it used to install into the repo.
 KEEP_OUT = (f"{STORE_DIR}/", LOCAL_SETTINGS)
-LEGACY_SKILL_DIRS = (SKILL, WORK_SKILL)
+LEGACY_SKILL_DIRS = (SKILL, WORK_SKILL, VERIFY_SKILL)
 
 
 def config_dir() -> Path:
@@ -188,7 +189,8 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
             _write_json(mcp_path, m)
             done.append(f".mcp.json  -server {SERVER}")
 
-    for name, template in ((SKILL, "onboard_skill.md"), (WORK_SKILL, "work_skill.md")):
+    for name, template in ((SKILL, "onboard_skill.md"), (WORK_SKILL, "work_skill.md"),
+                           (VERIFY_SKILL, "verify_skill.md")):
         skill_path = config_dir() / "skills" / name / "SKILL.md"
         skill = _template(template)
         if not skill_path.exists() or skill_path.read_text() != skill:

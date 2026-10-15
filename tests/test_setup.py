@@ -121,3 +121,21 @@ def test_forbidden_staged_paths():
     assert forbidden_staged([".fractal/edges.db", ".claude/settings.local.json", "src/a.py",
                              f".claude/skills/{SKILL}/SKILL.md", ".claude/settings.json"]) == [
         ".fractal/edges.db", ".claude/settings.local.json", f".claude/skills/{SKILL}/SKILL.md"]
+
+
+def test_verify_skill_is_installed_and_its_example_records(tmp_path: Path):
+    import re
+    from fractal_harness.cli import main
+    from fractal_harness.setup import VERIFY_SKILL
+    _git(tmp_path, "init", "-q")
+    init(tmp_path)
+    text = _skill(VERIFY_SKILL).read_text()
+    assert "disable-model-invocation: true" in text and f"name: {VERIFY_SKILL}" in text
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "x.rs").write_text("".join(f"l{i}\n" for i in range(80)))
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c")
+    example = re.search(r"<<'JSON'\n(.*?)\n\s*JSON", text, re.S).group(1)
+    (tmp_path / "v.json").write_text(example)
+    assert main(["--root", str(tmp_path), "ledger", "record", "n", "--json", str(tmp_path / "v.json")]) == 0
+    assert main(["--root", str(tmp_path), "verify-plan", "n"]) == 0
