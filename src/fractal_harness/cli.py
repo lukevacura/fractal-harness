@@ -143,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # -- setup and hooks ---------------------------------------------------------------------
     ini = sub.add_parser("init", help="set up the target repo for Claude Code (idempotent)")
-    ini.add_argument("--no-settings", action="store_true", help="don't touch .claude/settings.json")
+    ini.add_argument("--no-settings", action="store_true", help="don't touch .claude settings (hooks live in the untracked .claude/settings.local.json)")
     ini.add_argument("--git-hook", action="store_true", help="install `fractal check` as a git pre-commit hook")
     sub.add_parser("doctor", help="check the target repo is ready")
     hk = sub.add_parser("hook", help="Claude Code hook entry points (read hook JSON on stdin)")

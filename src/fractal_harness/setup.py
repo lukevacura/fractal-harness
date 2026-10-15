@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from importlib import resources
 from pathlib import Path
@@ -42,6 +43,67 @@ def _load_json(path: Path) -> dict:
 def _write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+LOCAL_SETTINGS = ".claude/settings.local.json"
+# Everything fractal puts in a repo's working tree, and so must never be committed: the store, the
+# per-user settings carrying its hooks, and (legacy) skills it used to install into the repo.
+KEEP_OUT = (f"{STORE_DIR}/", LOCAL_SETTINGS)
+LEGACY_SKILL_DIRS = (SKILL, WORK_SKILL)
+
+
+def config_dir() -> Path:
+    """The user-level Claude config dir, where skills install (outside every repo)."""
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+
+
+def _git_path(root: Path, what: str) -> Path | None:
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "--git-path", what], cwd=root, capture_output=True,
+                             text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return (root / out).resolve()
+
+
+def forbidden_staged(paths: list[str]) -> list[str]:
+    """Staged paths that are fractal's own files: they must never be committed."""
+    return [p for p in paths if p.startswith(f"{STORE_DIR}/") or p == LOCAL_SETTINGS
+            or any(p.startswith(f".claude/skills/{d}/") for d in LEGACY_SKILL_DIRS)]
+
+
+def _is_ours(command: str) -> bool:
+    return command.startswith("fractal hook ")
+
+
+def _strip_ours(s: dict) -> bool:
+    """Remove fractal's hooks and permissions from a (shared) settings dict; True if anything went."""
+    changed = False
+    for event in list(s.get("hooks", {})):
+        groups = []
+        for g in s["hooks"][event]:
+            kept = [h for h in g.get("hooks", []) if not _is_ours(h.get("command", ""))]
+            changed |= len(kept) != len(g.get("hooks", []))
+            if kept:
+                groups.append({**g, "hooks": kept})
+        if groups:
+            s["hooks"][event] = groups
+        else:
+            del s["hooks"][event]
+    if not s.get("hooks", True):
+        del s["hooks"]
+    perms = s.get("permissions", {})
+    for key, ours in (("allow", [CLI_PERMISSION]), ("deny", HUMAN_ONLY)):
+        for rule in ours:
+            if rule in perms.get(key, []):
+                perms[key].remove(rule)
+                changed = True
+        if key in perms and not perms[key]:
+            del perms[key]
+    if "permissions" in s and not s["permissions"]:
+        del s["permissions"]
+    return changed
 
 
 def _add_unique(items: list, value: object) -> bool:
@@ -102,14 +164,17 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
     ClaimCache(root).close()
     done.append(f"store      {STORE_DIR}/edges.db")
 
-    gitignore = root / ".gitignore"
-    lines = gitignore.read_text().splitlines() if gitignore.exists() else []
-    if not any(l.strip().rstrip("/") == STORE_DIR for l in lines):
-        with gitignore.open("a") as f:
-            if lines and lines[-1].strip():
-                f.write("\n")
-            f.write(f"{STORE_DIR}/\n")
-        done.append(f".gitignore +{STORE_DIR}/")
+    exclude = _git_path(root, "info/exclude")   # local to this clone: no tracked file is edited
+    if exclude is not None:
+        have = exclude.read_text().splitlines() if exclude.exists() else []
+        missing = [k for k in KEEP_OUT if k not in {l.strip() for l in have}]
+        if missing:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with exclude.open("a") as f:
+                if have and have[-1].strip():
+                    f.write("\n")
+                f.writelines(f"{k}\n" for k in missing)
+            done.append(f"exclude    .git/info/exclude +{', '.join(missing)} (local; .gitignore untouched)")
 
     mcp_path = root / ".mcp.json"
     m = _load_json(mcp_path)
@@ -124,29 +189,43 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
             done.append(f".mcp.json  -server {SERVER}")
 
     for name, template in ((SKILL, "onboard_skill.md"), (WORK_SKILL, "work_skill.md")):
-        skill_path = root / ".claude" / "skills" / name / "SKILL.md"
+        skill_path = config_dir() / "skills" / name / "SKILL.md"
         skill = _template(template)
         if not skill_path.exists() or skill_path.read_text() != skill:
             skill_path.parent.mkdir(parents=True, exist_ok=True)
             skill_path.write_text(skill)
-            done.append(f"skill      .claude/skills/{name}/SKILL.md (/{name}, user-invoked only)")
+            done.append(f"skill      {skill_path} (/{name}, user-level, user-invoked only)")
+        legacy = root / ".claude" / "skills" / name
+        if legacy.is_dir():   # an earlier version installed it in the repo
+            shutil.rmtree(legacy)
+            done.append(f"skill      removed {legacy.relative_to(root)} from the repo (git sees a deletion)")
 
     if settings:
-        settings_path = root / ".claude" / "settings.json"
-        s = _load_json(settings_path)
+        shared_path = root / ".claude" / "settings.json"
+        shared = _load_json(shared_path)
+        before_shared = json.dumps(shared, sort_keys=True)
+        enabled = shared.get("enabledMcpjsonServers", [])
+        if SERVER in enabled:
+            enabled.remove(SERVER)
+            if not enabled:
+                del shared["enabledMcpjsonServers"]
+        legacy_allow = shared.get("permissions", {}).get("allow", [])
+        if f"mcp__{SERVER}" in legacy_allow:
+            legacy_allow.remove(f"mcp__{SERVER}")
+        had_ours = _strip_ours(shared)    # earlier versions wired the hooks into the shared file
+        if json.dumps(shared, sort_keys=True) != before_shared:
+            _write_json(shared_path, shared)
+            done.append("settings   .claude/settings.json" + (": fractal hooks and permissions moved out "
+                        "(commit this removal)" if had_ours else ": legacy MCP entries removed"))
+
+        local_path = root / LOCAL_SETTINGS
+        s = _load_json(local_path)
         before = json.dumps(s, sort_keys=True)
         allow = s.setdefault("permissions", {}).setdefault("allow", [])
         _add_unique(allow, CLI_PERMISSION)
         deny = s["permissions"].setdefault("deny", [])
         for rule in HUMAN_ONLY:
             _add_unique(deny, rule)
-        enabled = s.get("enabledMcpjsonServers", [])
-        if SERVER in enabled:
-            enabled.remove(SERVER)
-            if not enabled:
-                del s["enabledMcpjsonServers"]
-        if f"mcp__{SERVER}" in allow:
-            allow.remove(f"mcp__{SERVER}")
         for event, command, matcher in (("UserPromptSubmit", PROMPT_HOOK, None), ("Stop", STOP_HOOK, None),
                                         ("PreToolUse", PRE_EDIT_HOOK, PRE_EDIT_MATCHER),
                                         ("SubagentStart", AGENT_HOOK, None),
@@ -157,10 +236,10 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
                     group = {"matcher": matcher, **group}
                 s.setdefault("hooks", {}).setdefault(event, []).append(group)
         if json.dumps(s, sort_keys=True) != before:
-            _write_json(settings_path, s)
-            done.append("settings   .claude/settings.json (prompt hook injects rules and facts, pre/post-edit "
-                        "hooks enforce invariants, stop hook queues sessions, allow the fractal CLI except "
-                        "accept/reject)")
+            _write_json(local_path, s)
+            done.append(f"settings   {LOCAL_SETTINGS} (untracked: prompt/subagent hooks inject rules and facts, "
+                        "pre/post-edit hooks enforce invariants, stop hook queues sessions, allow the fractal "
+                        "CLI except accept/reject)")
 
     claude_md = root / "CLAUDE.md"
     text = claude_md.read_text() if claude_md.exists() else ""
@@ -183,14 +262,14 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
     exe = shutil.which("fractal")
     checks.append((exe is not None, f"`fractal` on PATH: {exe or 'not found (uv tool install <harness path>)'}"))
 
-    skill = root / ".claude" / "skills" / SKILL / "SKILL.md"
-    checks.append((skill.exists(), f"skill /{SKILL} installed"))
+    skill = config_dir() / "skills" / SKILL / "SKILL.md"
+    checks.append((skill.exists(), f"skill /{SKILL} installed (user-level)"))
     if skill.exists():
         checks.append((skill.read_text() == _template("onboard_skill.md"),
                        f"skill /{SKILL} up to date (re-run `fractal init` if not)"))
 
     try:
-        s = _load_json(root / ".claude" / "settings.json")
+        s = _load_json(root / LOCAL_SETTINGS)
     except json.JSONDecodeError:
         s = {}
     checks.append((_has_hook(s, "UserPromptSubmit", PROMPT_HOOK), "UserPromptSubmit hook injects claims"))
@@ -203,9 +282,21 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
     md = root / "CLAUDE.md"
     checks.append((not (md.exists() and BEGIN in md.read_text()), "CLAUDE.md has no fractal block"))
 
-    gi = root / ".gitignore"
-    ignored = gi.exists() and any(l.strip().rstrip("/") == STORE_DIR for l in gi.read_text().splitlines())
-    checks.append((ignored, f"{STORE_DIR}/ gitignored"))
+    import subprocess
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    if git("rev-parse", "--git-dir").returncode == 0:
+        for k in KEEP_OUT:
+            checks.append((git("check-ignore", "-q", k.rstrip("/") + ("/x" if k.endswith("/") else "")).returncode == 0,
+                           f"{k} excluded from git"))
+        tracked = [p for p in git("ls-files", "--", STORE_DIR, LOCAL_SETTINGS, *(
+            f".claude/skills/{d}" for d in LEGACY_SKILL_DIRS)).stdout.splitlines() if p]
+        checks.append((not tracked, "no fractal files tracked by git" + (f": {tracked[:3]}" if tracked else "")))
+        shared = _load_json(root / ".claude" / "settings.json") if (root / ".claude" / "settings.json").exists() else {}
+        checks.append((not any(_has_hook(shared, ev, c) for ev, c in (
+            ("UserPromptSubmit", PROMPT_HOOK), ("Stop", STOP_HOOK), ("PreToolUse", PRE_EDIT_HOOK),
+            ("SubagentStart", AGENT_HOOK), ("PostToolUse", EDIT_HOOK))),
+            "no fractal hooks in the shared .claude/settings.json (re-run `fractal init` to move them)"))
 
     cache = ClaimCache(root)
     try:

@@ -71,11 +71,17 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
                         and e.status == "failed"]
     needs_repair = [e for e in edges if e.kind not in ("invariant", "behavior") and e.status in ("failed", "stale")
                     and e.repair is not None]
-    gate_bad, gate_proposed = gate_violations(edges, root, {"staged": staged_paths(root)})
+    staged = staged_paths(root)
+    from .setup import forbidden_staged
+    own = forbidden_staged(staged or [])
+    gate_bad, gate_proposed = gate_violations(edges, root, {"staged": staged})
     lines = [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}" for e in proposed_failing]
     lines += [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}\n          probe: {d}"
               for e, d in gate_proposed]
     lines += [f"VIOLATION {e.id}: {e.post}\n          probe: {d}" for e, d in gate_bad]
+    if own:
+        lines.append("fractal: these are fractal's own files and must never be committed: " + ", ".join(own[:5])
+                     + "\n         unstage them (`git restore --staged <path>`); `fractal init` keeps them out of git")
     for e in violations:
         lines.append(f"VIOLATION {e.id}: {e.post}\n          probe: {e.detail}")
     if needs_repair:
@@ -94,7 +100,7 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
     if regressions:
         lines.append(f"fractal: {len(regressions)} behavioral regression(s). Fix the code, or update the test "
                      "if the behavior change is intended.")
-    code = 1 if violations or gate_bad or regressions or (strict and needs_repair) else 0
+    code = 1 if violations or gate_bad or own or regressions or (strict and needs_repair) else 0
     if code == 0 and behavioral["results"]:    # this state is about to be committed: new reference
         from .behavior import promote_baseline
         cache = ClaimCache(root)

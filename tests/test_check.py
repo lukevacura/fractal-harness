@@ -195,3 +195,12 @@ def test_init_installs_commit_msg_hook(tmp_path):
     _git(tmp_path, "init", "-q")
     init(tmp_path, settings=False, git_hook=True)
     assert "fractal check --message" in (tmp_path / ".git" / "hooks" / "commit-msg").read_text()
+
+
+def test_check_refuses_to_commit_fractal_files(tmp_path):
+    _git(tmp_path, "init", "-q")
+    _repo(tmp_path).close()
+    assert check(tmp_path)[0] == 0
+    _git(tmp_path, "add", "-f", ".fractal")
+    code, report = check(tmp_path)
+    assert code == 1 and "never be committed" in report and ".fractal/" in report
