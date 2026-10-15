@@ -56,6 +56,11 @@ def _has_hook(settings: dict, event: str, command: str) -> bool:
                for g in settings.get("hooks", {}).get(event, []) for h in g.get("hooks", []))
 
 
+COMMIT_MSG_HOOK = """#!/bin/sh
+# Installed by `fractal init --git-hook`: fail the commit when its message violates an enforced rule.
+command -v fractal >/dev/null 2>&1 || exit 0
+exec fractal check --message "$1"
+"""
 GIT_HOOK = """#!/bin/sh
 # Installed by `fractal init --git-hook`: fail the commit when a claimed invariant is violated.
 command -v fractal >/dev/null 2>&1 || exit 0
@@ -63,22 +68,26 @@ exec fractal check
 """
 
 
-def _install_git_hook(root: Path) -> str | None:
+def _install_git_hook(root: Path) -> list[str]:
     import subprocess
     try:
         hooks = subprocess.run(["git", "rev-parse", "--git-path", "hooks"], cwd=root,
                                capture_output=True, text=True, check=True).stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return "git hook   skipped (not a git repo)"
-    path = (root / hooks / "pre-commit").resolve()
-    if path.exists():
-        if "fractal check" in path.read_text():
-            return None
-        return f"git hook   skipped: {path} exists; add `fractal check` to it yourself"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(GIT_HOOK)
-    path.chmod(0o755)
-    return f"git hook   {path} runs `fractal check`"
+        return ["git hook   skipped (not a git repo)"]
+    done = []
+    for name, body, command in (("pre-commit", GIT_HOOK, "fractal check"),
+                                ("commit-msg", COMMIT_MSG_HOOK, "fractal check --message")):
+        path = (root / hooks / name).resolve()
+        if path.exists():
+            if command not in path.read_text():
+                done.append(f"git hook   skipped: {path} exists; add `{command}` to it yourself")
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+        path.chmod(0o755)
+        done.append(f"git hook   {path} runs `{command}`")
+    return done
 
 
 def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]:
@@ -162,8 +171,8 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
         claude_md.write_text(new + "\n" if new else "")
         done.append("CLAUDE.md  removed block from an earlier fractal version")
 
-    if git_hook and (msg := _install_git_hook(root)):
-        done.append(msg)
+    if git_hook:
+        done += _install_git_hook(root)
 
     return done
 

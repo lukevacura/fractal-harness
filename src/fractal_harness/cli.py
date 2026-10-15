@@ -76,6 +76,7 @@ def main(argv: list[str] | None = None) -> int:
         a.add_argument("ids", nargs="+")
         a.add_argument("--yes", action="store_true", help="allow a non-interactive terminal (scripts)")
     ck = sub.add_parser("check", help="pre-commit/CI gate: re-check claims; exit 1 if an enforced invariant is violated")
+    ck.add_argument("--message", metavar="FILE", help="commit-msg hook mode: check only the rules over this commit message file")
     ck.add_argument("--strict", action="store_true", help="also fail when other claims need repair")
 
     # -- behavior: the codebase as a graph of behavioral contracts ------------------------------
@@ -209,7 +210,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if r["regressions"] or r["violations"] else 0
     if args.cmd == "check":
         from .check import check
-        code, report = check(root, strict=args.strict)
+        if args.message:
+            from .check import check_message
+            code, report = check_message(root, args.message)
+        else:
+            code, report = check(root, strict=args.strict)
         if report:
             print(report, file=sys.stderr if code else sys.stdout)
         return code
