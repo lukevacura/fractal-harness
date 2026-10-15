@@ -153,3 +153,42 @@ def test_rules_govern_new_files_named_in_the_prompt(tmp_path):
     c.close()
     assert "pkg never prints" in _ctx(root, "Add a new module pkg/alerts.py that formats alert lines")
     assert _ctx(root, "Add a new module elsewhere/alerts.py that formats alert lines") == ""
+
+
+def _transcript(path: Path, *launches: tuple[str, str, str]) -> str:
+    rows = [{"message": {"content": [{"type": "tool_use", "id": i, "name": "Agent",
+                                      "input": {"subagent_type": k, "prompt": p}}]}} for i, k, p in launches]
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return str(path)
+
+
+def _start(root: Path, transcript: str, kind="general-purpose") -> str:
+    from fractal_harness import hook
+    hook.LAUNCH_WAIT = 0
+    from fractal_harness.hook import subagent_start_hook
+    out = subagent_start_hook(json.dumps({"cwd": str(root), "transcript_path": transcript, "agent_type": kind}))
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else ""
+
+
+def test_subagent_start_scopes_by_launch_prompt_fifo(tmp_path: Path):
+    root = _repo(tmp_path)
+    t = _transcript(tmp_path / "t.jsonl", ("a", "general-purpose", "how does fog of war reveal work?"),
+                    ("b", "general-purpose", "what GPS distance filter do we use?"))
+    assert "GPS" not in _start(root, t)                       # first start claims launch a
+    assert "GPS distance filter is 5 metres" in _start(root, t)   # second claims launch b
+
+
+def test_subagent_start_reads_may_touch_from_spec(tmp_path: Path):
+    root = _repo(tmp_path)
+    (root / "spec.md").write_text("# Node\n## May touch\nGPS distance filter in app.py\n## Other\nx\n")
+    t = _transcript(tmp_path / "t.jsonl", ("a", "general-purpose", "Implement spec.md"))
+    assert "GPS distance filter is 5 metres" in _start(root, t)
+
+
+def test_subagent_start_fails_open_and_respects_budget(tmp_path: Path, monkeypatch):
+    from fractal_harness import hook
+    root = _repo(tmp_path)
+    assert _start(root, str(tmp_path / "missing.jsonl")) == ""
+    monkeypatch.setattr(hook, "MAX_AGENT_CONTEXT_CHARS", 10)
+    t = _transcript(tmp_path / "t.jsonl", ("a", "general-purpose", "what GPS distance filter do we use?"))
+    assert "GPS distance filter is 5 metres" not in _start(root, t)

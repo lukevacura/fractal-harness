@@ -138,15 +138,15 @@ def main(argv: list[str] | None = None) -> int:
     ini.add_argument("--git-hook", action="store_true", help="install `fractal check` as a git pre-commit hook")
     sub.add_parser("doctor", help="check the target repo is ready")
     hk = sub.add_parser("hook", help="Claude Code hook entry points (read hook JSON on stdin)")
-    hk.add_argument("event", choices=["prompt", "pre-edit", "edit", "stop"],
-                    help="prompt: inject rules and facts; pre-edit: block an edit that would violate an "
+    hk.add_argument("event", choices=["prompt", "agent", "pre-edit", "edit", "stop"],
+                    help="prompt: inject rules and facts; agent: inject them into a launching subagent's prompt; pre-edit: block an edit that would violate an "
                          "enforced invariant; edit: re-check after an edit; stop: queue the session for `record`")
 
     args = p.parse_args(argv)
     root = resolve_root(args.root)
 
     if args.cmd == "hook":
-        from .hook import edit_hook, pre_edit_hook, prompt_hook, stop_hook
+        from .hook import subagent_start_hook, edit_hook, pre_edit_hook, prompt_hook, stop_hook
         stdin = sys.stdin.read()
         if args.event in ("edit", "pre-edit"):
             code, msg = (pre_edit_hook if args.event == "pre-edit" else edit_hook)(stdin)
@@ -158,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
             if msg:
                 print(msg, file=sys.stderr)
             return code
-        out = prompt_hook(stdin)
+        out = (subagent_start_hook if args.event == "agent" else prompt_hook)(stdin)
         if out:
             print(out)
         return 0

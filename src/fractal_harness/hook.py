@@ -8,6 +8,8 @@
              blocked before it is written.
   edit       (PostToolUse) backstop after any edit: re-check the rules that scan the file,
              including command probes the in-memory check cannot run.
+  agent      (SubagentStart) subagents never see the prompt hook's output: give them the same RULES
+             and FACTS, scoped to the paths their launch prompt names.
   stop       (Stop) queue the session for `fractal record`.
 
 A prompt with no governing rules and no matching facts injects nothing: without enforced
@@ -33,6 +35,9 @@ RELATIVE_CUTOFF = 0.5        # ...and score within this fraction of the best mat
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 MAX_VIOLATION_LINES = 5
 MAX_CONTEXT_CHARS = 3000     # injected text is overhead too: rules are kept first, facts trimmed
+AGENT_TOOLS = {"Agent", "Task"}
+MAX_AGENT_CONTEXT_CHARS = int(os.environ.get("FRACTAL_AGENT_CONTEXT_CHARS") or 6000)   # ~2k tokens
+MAX_SPEC_CHARS = 4000        # how much of a referenced spec file is scanned for paths
 
 RULES_HEADER = (
     "RULES: enforced by this project's owner. Every edit is checked against them before it is written "
@@ -180,7 +185,8 @@ def _has_graph(root: Path) -> bool:
         cache.close()
 
 
-def context_for(root: Path, prompt: str, session_id: str | None = None) -> str | None:
+def context_for(root: Path, prompt: str, session_id: str | None = None,
+                budget: int = MAX_CONTEXT_CHARS) -> str | None:
     """With a behavioral graph, the task map (regions, contracts, assumptions, rules); otherwise
     rules and facts. Either way, nothing on a miss."""
     if not _has_store(root):
@@ -191,7 +197,7 @@ def context_for(root: Path, prompt: str, session_id: str | None = None) -> str |
         rules, facts = [], []
     else:
         rules, facts = select_context(root, prompt, session_id)
-        text = render(rules, facts)
+        text = render(rules, facts, budget)
     if text and _has_store(root):
         cache = ClaimCache(root, run_slow=False)
         try:
@@ -215,6 +221,96 @@ def prompt_hook(stdin: str) -> str:
     if not ctx:
         return ""
     return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}})
+
+
+# --- subagents: the prompt hook never fires for them --------------------------------------
+# PreToolUse `updatedInput` is ignored for the Agent tool (verified headless), but SubagentStart's
+# additionalContext reaches the subagent. SubagentStart carries no prompt, so the launch prompt is
+# recovered from the parent transcript: launches are claimed first-in-first-out per agent type.
+
+AGENT_INTRO = ("The project owner's enforced rules and verified facts for the paths this task touches "
+               "follow. Anything under RULES is guaranteed: do not re-check it.")
+TRANSCRIPT_TAIL = 2_000_000
+CLAIMS_FILE = "agent_claims.json"
+LAUNCH_WAIT = float(os.environ.get("FRACTAL_LAUNCH_WAIT") or 3)   # seconds to wait for the launch to be logged
+
+
+def _agent_launches(transcript: str | None) -> list[tuple[str, str, str]]:
+    """(tool_use_id, subagent_type, prompt) for each Agent launch in the transcript tail, oldest first."""
+    if not transcript or not Path(transcript).is_file():
+        return []
+    with open(transcript, "rb") as f:
+        f.seek(0, 2)
+        start = max(0, f.tell() - TRANSCRIPT_TAIL)
+        f.seek(start)
+        lines = f.read().decode(errors="replace").splitlines()[1 if start else 0:]   # first line may be cut
+    out = []
+    for line in lines:
+        try:
+            content = json.loads(line).get("message", {}).get("content")
+        except ValueError:
+            continue
+        for b in content if isinstance(content, list) else []:
+            if b.get("type") == "tool_use" and b.get("name") in AGENT_TOOLS:
+                i = b.get("input") or {}
+                out.append((b["id"], i.get("subagent_type") or "general-purpose", i.get("prompt") or ""))
+    return out
+
+
+def _claim_launch(root: Path, transcript: str | None, agent_type: str, wait: float | None = None) -> str:
+    """The prompt of the oldest not-yet-claimed launch of this agent type ('' if none). The harness
+    writes the launch to the transcript asynchronously, so the hook may start before it appears."""
+    import time
+    path = root / STORE_DIR / CLAIMS_FILE
+    deadline = time.monotonic() + (LAUNCH_WAIT if wait is None else wait)
+    while True:
+        try:
+            claimed = set(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            claimed = set()
+        for tid, kind, prompt in _agent_launches(transcript):
+            if kind == agent_type and tid not in claimed:
+                path.write_text(json.dumps(sorted(claimed | {tid})[-500:]))
+                return prompt
+        if time.monotonic() >= deadline:
+            return ""
+        time.sleep(0.2)
+
+
+def _agent_query(root: Path, prompt: str) -> str:
+    """The prompt plus the path hints it points at: a referenced spec file contributes its
+    'May touch' section (or its head when it has none)."""
+    import re
+    extra: list[str] = []
+    for m in re.findall(r"[\w.-]+(?:/[\w.-]+)*\.md\b", prompt):
+        f = root / m
+        if not f.is_file() or f.stat().st_size > 200_000:
+            continue
+        text = f.read_text(errors="replace")
+        sec = re.search(r"^#+\s*May touch\b.*?(?=^#+\s|\Z)", text, re.S | re.M | re.I)
+        extra.append(sec.group(0) if sec else text[:MAX_SPEC_CHARS])
+    return "\n".join([prompt, *extra])
+
+
+def subagent_start_hook(stdin: str) -> str:
+    """SubagentStart: returns the hook's stdout, the rules and facts for the paths the subagent's
+    launch prompt names (repo-wide rules only when the prompt can't be recovered)."""
+    if _disabled():
+        return ""
+    try:
+        data = json.loads(stdin or "{}")
+        root = _root(data)
+        if not _has_store(root):
+            return ""
+        prompt = _claim_launch(root, data.get("transcript_path"), data.get("agent_type") or "general-purpose")
+        ctx = context_for(root, _agent_query(root, prompt), data.get("session_id"), MAX_AGENT_CONTEXT_CHARS)
+    except Exception as e:  # a broken cache must never block a launch
+        print(f"fractal hook: {e}", file=sys.stderr)
+        return ""
+    if not ctx:
+        return ""
+    return json.dumps({"hookSpecificOutput": {"hookEventName": "SubagentStart",
+                                              "additionalContext": f"{AGENT_INTRO}\n\n{ctx}"}})
 
 
 # --- edits: checked before they are written, and after ------------------------------------
