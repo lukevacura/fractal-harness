@@ -114,6 +114,27 @@ def main(argv: list[str] | None = None) -> int:
     show.add_argument("id")
     rm = sub.add_parser("rm", help="delete a claim")
     rm.add_argument("id")
+    lg = sub.add_parser("ledger", help="the mutant ledger: record verification verdicts per node")
+    lsub = lg.add_subparsers(dest="ledger_cmd", required=True)
+    ln = lsub.add_parser("node", help="register a node's spec; the decisions/interfaces it cites become its premises")
+    ln.add_argument("node")
+    ln.add_argument("--spec", required=True)
+    ln.add_argument("--id-pattern")
+    lr = lsub.add_parser("record", help="record a mutant's verdict at a commit")
+    lr.add_argument("node")
+    lr.add_argument("--json", metavar="FILE", help="a JSON list of verdicts ('-' for stdin) instead of flags: "
+                    "[{file, span, mutant, result, tests, argument, commit}]")
+    lr.add_argument("--file")
+    lr.add_argument("--span", help="N or N-M: 1-based lines in the commit's numbering")
+    lr.add_argument("--mutant", help="what was changed")
+    lr.add_argument("--result", choices=["killed", "survived", "equivalent"])
+    lr.add_argument("--tests", default="", help="comma-separated names of the tests that kill it")
+    lr.add_argument("--argument", default="", help="why an equivalent mutant is equivalent")
+    lr.add_argument("--commit", default="HEAD", help="the commit verified (default HEAD)")
+    vp = sub.add_parser("verify-plan", help="which recorded verdicts are stale for a node, and the diff to re-verify")
+    vp.add_argument("node")
+    vp.add_argument("--with-arguments", action="store_true", help="include prior equivalence arguments")
+    vp.add_argument("--no-diff", action="store_true")
     cx = sub.add_parser("context", help="one bounded bundle for a spec: its cited decisions, interfaces and rules")
     cx.add_argument("spec", help="path to the spec (markdown)")
     cx.add_argument("--id-pattern", help="regex for the IDs a spec cites (default: letters + digits, e.g. D16)")
@@ -287,6 +308,33 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{'':20}{e.detail}")
                 print(" ".join(f"{s}={sum(e.rule_state == s for e in rules)}"
                                for s in ("enforced", "proposed", "rejected")))
+        elif args.cmd == "ledger":
+            from . import ledger
+            if args.ledger_cmd == "node":
+                from .context import DEFAULT_ID_PATTERN
+                r = ledger.register_node(cache, root, args.node, args.spec, args.id_pattern or DEFAULT_ID_PATTERN)
+                print(f"{args.node}: spec {r['spec']}, {len(r['premises'])} premise claim(s)"
+                      + (f"; cited with no claim: {', '.join(r['uncited'])}" if r["uncited"] else ""))
+            else:
+                if args.json:
+                    items = json.loads(sys.stdin.read() if args.json == "-" else Path(args.json).read_text())
+                else:
+                    items = [{"file": args.file, "span": args.span, "mutant": args.mutant, "result": args.result,
+                              "tests": args.tests, "argument": args.argument, "commit": args.commit}]
+                for it in items:
+                    tests = it.get("tests") or []
+                    if isinstance(tests, str):
+                        tests = [t.strip() for t in tests.split(",") if t.strip()]
+                    if not (it.get("file") and it.get("span") and it.get("mutant") and it.get("result")):
+                        raise CacheError("a verdict needs file, span, mutant and result")
+                    ledger.record(cache, root, args.node, file=it["file"], span=str(it["span"]),
+                                  mutant=it["mutant"], result=it["result"], commit=it.get("commit") or "HEAD",
+                                  tests=tests, argument=it.get("argument") or "")
+                print(f"recorded {len(items)} verdict(s) for {args.node}")
+        elif args.cmd == "verify-plan":
+            from . import ledger
+            print(ledger.render(ledger.plan(cache, root, args.node), args.with_arguments,
+                                not args.no_diff, root), end="")
         elif args.cmd == "put" and (args.section or args.symbol):
             from .context import put_extracted
             _emit(args, [put_extracted(cache, root, section=args.section, symbol=args.symbol,

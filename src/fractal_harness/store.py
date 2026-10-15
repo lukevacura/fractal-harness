@@ -46,6 +46,27 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 -- Ranked keyword search over claim text and read paths (porter: complete ~ completion).
 CREATE VIRTUAL TABLE IF NOT EXISTS edges_fts USING fts5(id UNINDEXED, body, tokenize='porter unicode61');
+-- The mutant ledger (see ledger.py): verification verdicts per node, memoized by commit and span.
+CREATE TABLE IF NOT EXISTS ledger_nodes (
+    node     TEXT PRIMARY KEY,
+    spec     TEXT NOT NULL,
+    spec_sha TEXT NOT NULL,
+    premises TEXT NOT NULL,      -- json [claim ids the spec cites: decisions, interfaces]
+    ts       REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mutants (
+    node      TEXT NOT NULL,
+    file      TEXT NOT NULL,
+    start     INTEGER NOT NULL,  -- 1-based, inclusive, in the numbering of `commit_sha`
+    end       INTEGER NOT NULL,
+    mutant    TEXT NOT NULL,
+    result    TEXT NOT NULL,     -- killed | survived | equivalent
+    commit_sha TEXT NOT NULL,
+    tests     TEXT NOT NULL,     -- json [names of the tests that kill it]
+    argument  TEXT NOT NULL DEFAULT '',
+    ts        REAL NOT NULL,
+    PRIMARY KEY (node, file, start, end, mutant)
+);
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts      REAL NOT NULL,
@@ -258,6 +279,28 @@ class Store:
             self.db.execute("DELETE FROM edges WHERE id = ?", (edge_id,))
             self.db.execute("DELETE FROM edges_fts WHERE id = ?", (edge_id,))
             self.db.execute("DELETE FROM deps WHERE edge_id = ? OR depends_on = ?", (edge_id, edge_id))
+
+    def put_node(self, node: str, spec: str, spec_sha: str, premises: list[str]) -> None:
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO ledger_nodes VALUES (?, ?, ?, ?, ?)",
+                            (node, spec, spec_sha, json.dumps(premises), time.time()))
+
+    def get_node(self, node: str) -> dict | None:
+        r = self.db.execute("SELECT spec, spec_sha, premises FROM ledger_nodes WHERE node = ?", (node,)).fetchone()
+        return {"spec": r[0], "spec_sha": r[1], "premises": json.loads(r[2])} if r else None
+
+    def put_mutant(self, node: str, file: str, start: int, end: int, mutant: str, result: str,
+                   commit_sha: str, tests: list[str], argument: str) -> None:
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO mutants VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (node, file, start, end, mutant, result, commit_sha, json.dumps(tests), argument,
+                             time.time()))
+
+    def mutants(self, node: str) -> list[dict]:
+        cols = ("file", "start", "end", "mutant", "result", "commit", "tests", "argument", "ts")
+        rows = self.db.execute("SELECT file, start, end, mutant, result, commit_sha, tests, argument, ts "
+                               "FROM mutants WHERE node = ? ORDER BY ts, file, start", (node,))
+        return [{**dict(zip(cols, r)), "tests": json.loads(r[6])} for r in rows]
 
     def dependents(self, edge_id: str) -> list[str]:
         return [r[0] for r in self.db.execute(
