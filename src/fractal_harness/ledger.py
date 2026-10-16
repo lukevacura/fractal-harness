@@ -26,7 +26,7 @@ from pathlib import Path
 
 from .cache import ClaimCache
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
-from .nodes import contract_digest, lint, parse_header, repo_lint
+from .nodes import contract_change, contract_parts, lint, parse_header, repo_lint
 from .store import GOOD
 from .symbols import SymbolError, digest
 
@@ -94,7 +94,7 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
             edges = cache.store.all()
             found, missing = section_claims(edges, h.implements)
         premises = {"decisions": sorted(e.id for e in found),
-                    "parents": {n: contract_digest(root, nodes[n]["spec"]) for n in h.parents}}
+                    "parents": {n: contract_parts(root, nodes[n]["spec"]) for n in h.parents}}
     prev = cache.store.get_node(node)
     keep = premises_of(prev).get("branch") if prev else None
     if branch or keep:
@@ -127,14 +127,24 @@ def record(cache: ClaimCache, root: Path, node: str, *, file: str, span: str, mu
                            tests or [], argument.strip())
 
 
+def deregister(cache: ClaimCache, node: str, forget_verdicts: bool = False) -> list[str]:
+    """Remove a node's registration (it stops counting as a child, and a parent's plan stops listing it).
+    Its verdicts stay unless `forget_verdicts`. Returns the nodes that still declare it as a parent."""
+    if cache.store.get_node(node) is None:
+        raise SymbolError(f"no such node: {node}")
+    orphans = sorted(n for n, i in cache.store.all_nodes().items() if node in premises_of(i)["parents"])
+    cache.store.delete_node(node, forget_verdicts)
+    return orphans
+
+
 # --- diffs --------------------------------------------------------------------------------
 
-def hunks_since(root: Path, commit: str) -> dict[str, list[tuple[int, int]]]:
+def hunks_since(root: Path, commit: str, against: str | None = None) -> dict[str, list[tuple[int, int]]]:
     """{file: [(old_start, old_count)]} for changes from `commit` to the working tree (0 count =
     pure insertion after old_start). A deleted or added file is {file: [(1, 10**9)]}."""
     out: dict[str, list[tuple[int, int]]] = {}
     cur = None
-    for line in _git(root, "diff", "-U0", "--no-color", "--no-renames", commit, "--").splitlines():
+    for line in _git(root, "diff", "-U0", "--no-color", "--no-renames", commit, *([against] if against else []), "--").splitlines():
         if line.startswith("--- "):
             old = line[4:]
             cur = None if old == "/dev/null" else old.removeprefix("a/")
@@ -167,7 +177,7 @@ def _word_in(name: str, text: str) -> bool:
 
 # --- the plan -----------------------------------------------------------------------------
 
-def plan(cache: ClaimCache, root: Path, node: str) -> dict:
+def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -> dict:
     """Classify every recorded mutant of `node`: {valid, stale: [(mutant, reason)], open, base,
     changed, node_reason}."""
     rows = cache.store.mutants(node)
@@ -195,20 +205,21 @@ def plan(cache: ClaimCache, root: Path, node: str) -> dict:
                 if node_reason:
                     break
                 pinfo = cache.store.get_node(name)
+                if pinfo is None:
+                    node_reason = f"parent {name} is no longer registered"
+                    continue
                 try:
-                    now = contract_digest(root, pinfo["spec"]) if pinfo else None
+                    why = contract_change(old, root, pinfo["spec"])
                 except SymbolError as e:
                     node_reason = f"parent {name}'s contract is unreadable: {e}"
                     continue
-                if now is None:
-                    node_reason = f"parent {name} is no longer registered"
-                elif now != old:
-                    node_reason = f"parent {name}'s contract changed"
+                if why:
+                    node_reason = f"parent {name}'s contract changed: {why}"
         children = sorted(n for n, i in cache.store.all_nodes().items() if node in premises_of(i)["parents"])
     by_commit: dict[str, dict[str, list[tuple[int, int]]] | str] = {}
     for c in {r["commit"] for r in rows}:
         try:
-            by_commit[c] = hunks_since(root, c)
+            by_commit[c] = hunks_since(root, c, against)
         except SymbolError as e:
             by_commit[c] = str(e)
     stale, valid = [], []
@@ -235,7 +246,7 @@ def plan(cache: ClaimCache, root: Path, node: str) -> dict:
     return {"node": node, "base": base, "stale": [(r, why) for r, why in stale],
             "valid": [r for r, _ in valid], "node_reason": node_reason,
             "open": [r for r, _ in valid if r["result"] == "survived"],
-            "children": children, "changed": sorted(changed_files), "test_files": sorted(test_files), "files": sorted({r["file"] for r in rows})}
+            "children": children, "against": against, "changed": sorted(changed_files), "test_files": sorted(test_files), "files": sorted({r["file"] for r in rows})}
 
 
 def _file_defines(root: Path, rel: str, commit: str, test: str, hunks: list) -> bool:
@@ -249,11 +260,27 @@ def _file_defines(root: Path, rel: str, commit: str, test: str, hunks: list) -> 
     return _word_in(test, now) or _word_in(test, before)
 
 
+def _compared_with(root: Path, against: str | None) -> str:
+    """Say what the staleness was judged against, so a surprising 'changed' can be traced."""
+    if against:
+        return f"Compared with commit {resolve_commit(root, against)[:10]} ({against})."
+    try:
+        head = resolve_commit(root, "HEAD")[:10]
+        dirty = [l[3:] for l in _git(root, "status", "--porcelain", "--untracked-files=no").splitlines()]
+    except SymbolError:
+        return "Compared with this checkout's working tree."
+    return (f"Compared with the working tree of {root} (HEAD {head})"
+            + (f", which has uncommitted changes in {len(dirty)} file(s): {', '.join(dirty[:5])}" if dirty else "")
+            + ". Pass --against REV to compare with a commit instead.")
+
+
 def render(p: dict, with_arguments: bool = False, diff: bool = True, root: Path | None = None) -> str:
     total = len(p["stale"]) + len(p["valid"])
     out = [f"# Verification plan for {p['node']}", "",
            f"{len(p['valid'])} of {total} recorded verdicts still hold; {len(p['stale'])} need re-running. "
            f"Last verified commit: {p['base'][:10]}."]
+    if root is not None:
+        out += ["", _compared_with(root, p.get("against"))]
     if p["children"]:
         out += ["", f"Nodes that assume this one's contract: {', '.join(p['children'])}. Changing its guarantee, "
                     "condition or exports stales them."]
@@ -278,7 +305,7 @@ def render(p: dict, with_arguments: bool = False, diff: bool = True, root: Path 
     if diff and root is not None and not p["node_reason"]:
         files = sorted({r["file"] for r, _ in p["stale"]} | set(p["test_files"]) | (set(p["changed"]) & set(p["files"])))
         if files:
-            text = _git(root, "diff", "--no-color", p["base"], "--", *files)
+            text = _git(root, "diff", "--no-color", p["base"], *([p["against"]] if p.get("against") else []), "--", *files)
             if len(text) > MAX_DIFF_CHARS:
                 text = text[:MAX_DIFF_CHARS] + "\n... (diff truncated)"
             out += ["", f"## Diff since {p['base'][:10]}", "", "```diff", text.rstrip(), "```"]

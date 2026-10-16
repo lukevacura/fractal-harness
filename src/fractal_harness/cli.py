@@ -121,6 +121,9 @@ def main(argv: list[str] | None = None) -> int:
     ln.add_argument("--spec", required=True)
     ln.add_argument("--id-pattern")
     ln.add_argument("--branch", help="the node's branch: verdicts default to its tip (else `node-<name>`, else HEAD)")
+    lx = lsub.add_parser("rm", help="deregister a node that left the DAG (it stops counting as a child)")
+    lx.add_argument("node")
+    lx.add_argument("--forget-verdicts", action="store_true", help="also delete its recorded verdicts")
     lr = lsub.add_parser("record", help="record a mutant's verdict at a commit")
     lr.add_argument("node")
     lr.add_argument("--json", metavar="FILE", help="a JSON list of verdicts ('-' for stdin) instead of flags: "
@@ -135,6 +138,7 @@ def main(argv: list[str] | None = None) -> int:
                     "(default: the node's branch tip, else this checkout's HEAD)")
     vp = sub.add_parser("verify-plan", help="which recorded verdicts are stale for a node, and the diff to re-verify")
     vp.add_argument("node")
+    vp.add_argument("--against", metavar="REV", help="judge staleness against this commit instead of the working tree")
     vp.add_argument("--with-arguments", action="store_true", help="include prior equivalence arguments")
     vp.add_argument("--no-diff", action="store_true")
     cx = sub.add_parser("context", help="one bounded bundle for a spec: its cited decisions, interfaces and rules")
@@ -324,6 +328,11 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  registered claims for: {', '.join(r['autoregistered'])}")
                 for note in r["lint"]:
                     print(f"  note: {note}")
+            elif args.ledger_cmd == "rm":
+                orphans = ledger.deregister(cache, args.node, args.forget_verdicts)
+                print(f"deregistered {args.node}" + (" and forgot its verdicts" if args.forget_verdicts else ""))
+                if orphans:
+                    print(f"  still declared as a parent by: {', '.join(orphans)} (their verdicts now read as stale)")
             else:
                 if args.json:
                     items = json.loads(sys.stdin.read() if args.json == "-" else Path(args.json).read_text())
@@ -343,7 +352,7 @@ def main(argv: list[str] | None = None) -> int:
                       f"{ledger.node_commit(cache, root, args.node, args.commit)[:10]}")
         elif args.cmd == "verify-plan":
             from . import ledger
-            print(ledger.render(ledger.plan(cache, root, args.node), args.with_arguments,
+            print(ledger.render(ledger.plan(cache, root, args.node, args.against), args.with_arguments,
                                 not args.no_diff, root), end="")
         elif args.cmd == "put" and (args.section or args.symbol):
             from .context import put_extracted

@@ -286,6 +286,12 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO ledger_nodes VALUES (?, ?, ?, ?, ?)",
                             (node, spec, spec_sha, json.dumps(premises), time.time()))
 
+    def delete_node(self, node: str, forget_verdicts: bool = False) -> None:
+        with self.db:
+            self.db.execute("DELETE FROM ledger_nodes WHERE node = ?", (node,))
+            if forget_verdicts:
+                self.db.execute("DELETE FROM mutants WHERE node = ?", (node,))
+
     def get_node(self, node: str) -> dict | None:
         r = self.db.execute("SELECT spec, spec_sha, premises FROM ledger_nodes WHERE node = ?", (node,)).fetchone()
         return {"spec": r[0], "spec_sha": r[1], "premises": json.loads(r[2])} if r else None

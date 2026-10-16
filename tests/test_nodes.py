@@ -95,20 +95,21 @@ def test_child_stales_on_parent_contract_not_on_grandparent_or_parent_prose(tmp_
     assert p()["node_reason"] is None
     (tmp_path / "gp.md").write_text(_spec(guarantee="Grandparent changed."))
     assert p()["node_reason"] is None                                   # a grandparent is not child's premise...
-    assert p("stats")["node_reason"] == "parent gp's contract changed"  # ...but it is stats's
+    assert p("stats")["node_reason"] == "parent gp's contract changed: its guarantee or condition changed"  # ...but it is stats's
     (tmp_path / "stats.md").write_text((tmp_path / "stats.md").read_text().replace("prose", "other prose"))
     assert p()["node_reason"] is None                                   # parent's own spec changed, contract didn't
     assert p("stats")["node_reason"] == "spec stats.md changed"   # (spec check precedes parents)
     (tmp_path / "stats.md").write_text(_spec(parents="gp", guarantee="Exact windowed mean.",
                                              condition="For every window.", exports="lib.rs::update"))
-    assert p()["node_reason"] == "parent stats's contract changed"       # condition is part of the contract
+    assert p()["node_reason"] == "parent stats's contract changed: its guarantee or condition changed"   # condition is part of the contract
 
 
 def test_child_stales_on_parent_export_signature(tmp_path):
     c = _repo(tmp_path)
     _record(c, tmp_path, "child")
     (tmp_path / "lib.rs").write_text(LIB.replace("x: f64", "x: f32"))
-    assert ledger.plan(c, tmp_path, "child")["node_reason"] == "parent stats's contract changed"
+    assert ledger.plan(c, tmp_path, "child")["node_reason"] == (
+        "parent stats's contract changed: export lib.rs::update changed")
     (tmp_path / "lib.rs").write_text(LIB.replace("secret_impl(x)", "other_impl(x)"))   # body only
     assert ledger.plan(c, tmp_path, "child")["node_reason"] is None
 
@@ -232,3 +233,55 @@ impl Anchor {
 """
     assert find(src, "Anchor::offset")[1].splitlines()[-1].strip().startswith("pub fn offset")
     assert "let" not in find(src, "offset")[1]       # unqualified: the method, not the local
+
+
+def test_adding_exports_does_not_stale_children_but_removing_one_does(tmp_path):
+    c = _repo(tmp_path)
+    _record(c, tmp_path, "child")
+    (tmp_path / "lib.rs").write_text(LIB + "pub fn extra() {}\n")
+    spec = _spec(parents="gp", guarantee="Exact windowed mean.", condition="Only for windows with V < 2^63.",
+                 exports="lib.rs::update, lib.rs::extra")
+    (tmp_path / "stats.md").write_text(spec)
+    assert ledger.plan(c, tmp_path, "child")["node_reason"] is None
+    (tmp_path / "stats.md").write_text(spec.replace("lib.rs::update, ", ""))
+    assert "export lib.rs::update was removed" in ledger.plan(c, tmp_path, "child")["node_reason"]
+
+
+def test_a_contract_recorded_as_one_digest_still_tolerates_appended_exports(tmp_path):
+    from fractal_harness.nodes import contract_digest
+    c = _repo(tmp_path)
+    _record(c, tmp_path, "child")
+    info = c.store.get_node("child")
+    pre = dict(info["premises"], parents={"stats": contract_digest(tmp_path, "stats.md")})   # the old shape
+    c.store.put_node("child", info["spec"], info["spec_sha"], pre)
+    (tmp_path / "lib.rs").write_text(LIB + "pub fn extra() {}\n")
+    (tmp_path / "stats.md").write_text(_spec(parents="gp", guarantee="Exact windowed mean.",
+                                             condition="Only for windows with V < 2^63.",
+                                             exports="lib.rs::update, lib.rs::extra"))
+    assert ledger.plan(c, tmp_path, "child")["node_reason"] is None
+
+
+def test_same_content_under_a_different_commit_is_not_a_change(tmp_path):
+    c = _repo(tmp_path)
+    _git(tmp_path, "checkout", "-q", "-b", "side")
+    (tmp_path / "other.txt").write_text("x")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "side")
+    _record(c, tmp_path, "stats")                       # verified on `side`
+    side = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
+    _git(tmp_path, "checkout", "-q", "-", )
+    _git(tmp_path, "cherry-pick", side)                 # same content, new hash, side is not an ancestor
+    p = ledger.plan(c, tmp_path, "stats")
+    assert p["stale"] == [] and "Compared with the working tree" in ledger.render(p, root=tmp_path)
+    assert "Compared with commit" in ledger.render(ledger.plan(c, tmp_path, "stats", "HEAD"), root=tmp_path)
+
+
+def test_deregistering_a_node_removes_it_from_the_children(tmp_path):
+    c = _repo(tmp_path)
+    _record(c, tmp_path, "stats")
+    assert ledger.deregister(c, "child") == []
+    assert ledger.plan(c, tmp_path, "stats")["children"] == []
+    assert ledger.deregister(c, "stats", forget_verdicts=True) == []
+    with pytest.raises(SymbolError):
+        ledger.plan(c, tmp_path, "stats")
+    c.close()

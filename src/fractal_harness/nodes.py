@@ -78,8 +78,9 @@ def lint(h: Header) -> list[str]:
     return notes
 
 
-def contract(root: Path, spec_path: str) -> str:
-    """The text a child may rely on: guarantee, condition, and the exports' current signatures."""
+def contract(root: Path, spec_path: str, exports: int | None = None) -> str:
+    """The text a child may rely on: guarantee, condition, and the exports' current signatures
+    (only the first `exports` of them when given)."""
     f = root / spec_path
     if not f.is_file():
         raise SymbolError(f"no such spec: {spec_path}")
@@ -89,7 +90,7 @@ def contract(root: Path, spec_path: str) -> str:
     out = [f"guarantee: {h.guarantee}"]
     if h.condition:
         out.append(f"condition: {h.condition}")
-    for ref in h.exports:
+    for ref in h.exports[:exports]:
         split_ref(ref)
         out += [f"interface {ref}:", symbol_of(root, ref)]
     return "\n".join(out)
@@ -97,6 +98,38 @@ def contract(root: Path, spec_path: str) -> str:
 
 def contract_digest(root: Path, spec_path: str) -> str:
     return digest(contract(root, spec_path))
+
+
+def contract_parts(root: Path, spec_path: str) -> dict:
+    """What a child's verdicts rest on, piece by piece: {claim: digest of guarantee+condition,
+    exports: {ref: digest of its signature}}."""
+    h = parse_header((root / spec_path).read_text(errors="replace")) if (root / spec_path).is_file() else None
+    if h is None or not h.guarantee:
+        raise SymbolError(f"{spec_path} declares no `guarantee:`: nothing for a child to rely on")
+    for ref in h.exports:
+        split_ref(ref)
+    return {"claim": digest(f"{h.guarantee}\n{h.condition}"),
+            "exports": {ref: digest(symbol_of(root, ref)) for ref in h.exports}}
+
+
+def contract_change(old, root: Path, spec_path: str) -> str | None:
+    """Why a parent's contract no longer matches what was recorded, or None. Adding exports never
+    changes it (no child relied on them); changing the guarantee or condition, or removing or
+    altering an export that was there, does."""
+    if isinstance(old, str):          # recorded as one digest: unchanged, or only exports appended
+        n = len(parse_header((root / spec_path).read_text(errors="replace")).exports)
+        if any(digest(contract(root, spec_path, k)) == old for k in range(n, -1, -1)):
+            return None
+        return "its contract changed"
+    now = contract_parts(root, spec_path)
+    if now["claim"] != old["claim"]:
+        return "its guarantee or condition changed"
+    for ref, sig in old["exports"].items():
+        if ref not in now["exports"]:
+            return f"export {ref} was removed"
+        if now["exports"][ref] != sig:
+            return f"export {ref} changed"
+    return None
 
 
 # --- lints that need the repository -------------------------------------------------------
