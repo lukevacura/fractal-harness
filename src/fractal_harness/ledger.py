@@ -25,8 +25,8 @@ import subprocess
 from pathlib import Path
 
 from .cache import ClaimCache
-from .context import DEFAULT_ID_PATTERN, _cited, premises_of, section_claims
-from .nodes import contract_digest, lint, parse_header
+from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
+from .nodes import contract_digest, lint, parse_header, repo_lint
 from .store import GOOD
 from .symbols import SymbolError, digest
 
@@ -47,8 +47,24 @@ def resolve_commit(root: Path, rev: str = "HEAD") -> str:
 
 # --- recording ----------------------------------------------------------------------------
 
+def node_commit(cache: ClaimCache, root: Path, node: str, commit: str | None = None) -> str:
+    """The commit a node's verdicts attach to: the one named, else the tip of the branch registered with
+    the node (or `node-<name>`), else this checkout's HEAD (correct inside the node's worktree)."""
+    if commit:
+        return resolve_commit(root, commit)
+    info = cache.store.get_node(node)
+    branch = (info or {}).get("premises", {}).get("branch") if isinstance((info or {}).get("premises"), dict) else None
+    for b in [x for x in (branch, f"node-{node}") if x]:
+        try:
+            return resolve_commit(root, f"refs/heads/{b}")
+        except SymbolError:
+            if b == branch:
+                raise SymbolError(f"node {node}'s registered branch {b!r} does not exist")
+    return resolve_commit(root, "HEAD")
+
+
 def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
-                  id_pattern: str = DEFAULT_ID_PATTERN) -> dict:
+                  id_pattern: str = DEFAULT_ID_PATTERN, branch: str | None = None) -> dict:
     """Record which spec and which premises the node's verdicts rest on. With a spec header the
     premises are exactly its declared `implements` decisions and `parents` contracts; without one
     (legacy) they are whatever the text cites. Re-run after the spec changes and the node has been
@@ -59,6 +75,8 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
     text = f.read_text(errors="replace")
     h = parse_header(text)
     edges = cache.store.all()
+    registered: list[str] = []
+    failed: dict[str, str] = {}
     if h is None:
         found, missing, interfaces = _cited(edges, text, id_pattern)
         premises = {"decisions": sorted({e.id for e in found + interfaces}), "parents": {}}
@@ -71,15 +89,28 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
         if node in h.parents:
             raise SymbolError(f"{node} cannot be its own parent")
         found, missing = section_claims(edges, h.implements)
+        if missing:
+            registered, failed = autoregister(cache, root, missing)
+            edges = cache.store.all()
+            found, missing = section_claims(edges, h.implements)
         premises = {"decisions": sorted(e.id for e in found),
                     "parents": {n: contract_digest(root, nodes[n]["spec"]) for n in h.parents}}
+    prev = cache.store.get_node(node)
+    keep = premises_of(prev).get("branch") if prev else None
+    if branch or keep:
+        premises["branch"] = branch or keep
     cache.store.put_node(node, spec, digest(text), premises)
-    return {"spec": spec, "premises": premises, "uncited": missing, "declared": h is not None,
-            "lint": lint(h) if h else []}
+    notes = []
+    if h:
+        notes = lint(h) + repo_lint(root, h, cache.store.all_nodes(), text)
+        notes += [f"{i} has no claim ({failed.get(i, 'not found')}); `fractal put --section DECISIONS.md::{i}`"
+                  for i in missing]
+    return {"spec": spec, "premises": premises, "uncited": [] if h else missing, "declared": h is not None,
+            "lint": notes, "autoregistered": registered}
 
 
 def record(cache: ClaimCache, root: Path, node: str, *, file: str, span: str, mutant: str, result: str,
-           commit: str = "HEAD", tests: list[str] | None = None, argument: str = "") -> None:
+           commit: str | None = None, tests: list[str] | None = None, argument: str = "") -> None:
     if result not in RESULTS:
         raise SymbolError(f"result must be one of {RESULTS}")
     m = re.fullmatch(r"(\d+)(?:-(\d+))?", span.strip())
@@ -92,7 +123,7 @@ def record(cache: ClaimCache, root: Path, node: str, *, file: str, span: str, mu
         raise SymbolError("a killed mutant needs the tests that kill it (--tests)")
     if result == "equivalent" and not argument.strip():
         raise SymbolError("an equivalent mutant needs its argument (--argument)")
-    cache.store.put_mutant(node, file, start, end, mutant, result, resolve_commit(root, commit),
+    cache.store.put_mutant(node, file, start, end, mutant, result, node_commit(cache, root, node, commit),
                            tests or [], argument.strip())
 
 

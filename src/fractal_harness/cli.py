@@ -120,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     ln.add_argument("node")
     ln.add_argument("--spec", required=True)
     ln.add_argument("--id-pattern")
+    ln.add_argument("--branch", help="the node's branch: verdicts default to its tip (else `node-<name>`, else HEAD)")
     lr = lsub.add_parser("record", help="record a mutant's verdict at a commit")
     lr.add_argument("node")
     lr.add_argument("--json", metavar="FILE", help="a JSON list of verdicts ('-' for stdin) instead of flags: "
@@ -130,7 +131,8 @@ def main(argv: list[str] | None = None) -> int:
     lr.add_argument("--result", choices=["killed", "survived", "equivalent"])
     lr.add_argument("--tests", default="", help="comma-separated names of the tests that kill it")
     lr.add_argument("--argument", default="", help="why an equivalent mutant is equivalent")
-    lr.add_argument("--commit", default="HEAD", help="the commit verified (default HEAD)")
+    lr.add_argument("--commit", help="the commit verified; applies to every verdict that names none "
+                    "(default: the node's branch tip, else this checkout's HEAD)")
     vp = sub.add_parser("verify-plan", help="which recorded verdicts are stale for a node, and the diff to re-verify")
     vp.add_argument("node")
     vp.add_argument("--with-arguments", action="store_true", help="include prior equivalence arguments")
@@ -312,11 +314,14 @@ def main(argv: list[str] | None = None) -> int:
             from . import ledger
             if args.ledger_cmd == "node":
                 from .context import DEFAULT_ID_PATTERN
-                r = ledger.register_node(cache, root, args.node, args.spec, args.id_pattern or DEFAULT_ID_PATTERN)
+                r = ledger.register_node(cache, root, args.node, args.spec, args.id_pattern or DEFAULT_ID_PATTERN,
+                                      args.branch)
                 pre = r["premises"]
                 print(f"{args.node}: spec {r['spec']}, " + (f"{len(pre['parents'])} parent(s), " if r["declared"]
                       else "premises inferred from the text, ") + f"{len(pre['decisions'])} decision claim(s)"
                       + (f"; no claim for: {', '.join(r['uncited'])}" if r["uncited"] else ""))
+                if r["autoregistered"]:
+                    print(f"  registered claims for: {', '.join(r['autoregistered'])}")
                 for note in r["lint"]:
                     print(f"  note: {note}")
             else:
@@ -332,9 +337,10 @@ def main(argv: list[str] | None = None) -> int:
                     if not (it.get("file") and it.get("span") and it.get("mutant") and it.get("result")):
                         raise CacheError("a verdict needs file, span, mutant and result")
                     ledger.record(cache, root, args.node, file=it["file"], span=str(it["span"]),
-                                  mutant=it["mutant"], result=it["result"], commit=it.get("commit") or "HEAD",
+                                  mutant=it["mutant"], result=it["result"], commit=it.get("commit") or args.commit,
                                   tests=tests, argument=it.get("argument") or "")
-                print(f"recorded {len(items)} verdict(s) for {args.node}")
+                print(f"recorded {len(items)} verdict(s) for {args.node} at "
+                      f"{ledger.node_commit(cache, root, args.node, args.commit)[:10]}")
         elif args.cmd == "verify-plan":
             from . import ledger
             print(ledger.render(ledger.plan(cache, root, args.node), args.with_arguments,

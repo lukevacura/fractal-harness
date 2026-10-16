@@ -97,3 +97,103 @@ def contract(root: Path, spec_path: str) -> str:
 
 def contract_digest(root: Path, spec_path: str) -> str:
     return digest(contract(root, spec_path))
+
+
+# --- lints that need the repository -------------------------------------------------------
+
+SOURCE_GLOBS = (".rs", ".py")
+TYPE_RE = re.compile(r"\b(struct|enum|class|trait)\b")
+MAX_NAMES = 8
+
+
+def _files(root: Path) -> list[str]:
+    import subprocess
+    try:
+        out = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    return [l for l in out.splitlines() if l.endswith(SOURCE_GLOBS)]
+
+
+def _imported_modules(text: str) -> dict[str, list[str]]:
+    """{module: candidate file suffixes} for the crate-internal (Rust `crate::m`) and dotted-module
+    (Python `a.b`) imports in `text`."""
+    mods: dict[str, list[str]] = {}
+    for m in re.finditer(r"\bcrate::(\w+)", text):
+        n = m.group(1)
+        mods[n] = [f"/{n}.rs", f"/{n}/mod.rs"]
+    for m in re.finditer(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.]+))", text, re.M):
+        dotted = (m.group(1) or m.group(2)).lstrip(".")
+        if dotted:
+            path = dotted.replace(".", "/")
+            mods[dotted] = [f"/{path}.py", f"/{path}/__init__.py"]
+    return mods
+
+
+def _methods(text: str, type_name: str) -> list[str]:
+    """Public methods of `type_name` found in `text`: Rust `pub fn` inside its impl blocks, Python
+    non-underscore `def` inside its class."""
+    lines, names = text.splitlines(), []
+    for i, l in enumerate(lines):
+        head = re.match(rf"^(\s*)(?:impl\b[^{{]*?\b{re.escape(type_name)}\b[^{{]*\{{|class\s+{re.escape(type_name)}\b.*:)\s*$", l)
+        if not head:
+            continue
+        ind = len(head.group(1))
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= ind:
+                break
+            if m := re.match(r"^\s*(?:pub(?:\([^)]*\))?\s+(?:const\s+|async\s+|unsafe\s+)*fn|def)\s+([A-Za-z]\w*)", nxt):
+                if "pub" in nxt.split("fn")[0] or nxt.lstrip().startswith("def"):
+                    names.append(m.group(1))
+    return list(dict.fromkeys(names))
+
+
+def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str) -> list[str]:
+    """Header problems that are visible in the repository and would starve a node's context bundle,
+    each with the fix."""
+    notes: list[str] = []
+    own_files: set[str] = set()
+    exported: set[str] = set(h.exports)
+    for ref in h.exports:
+        if "::" not in ref:
+            notes.append(f"export `{ref}` names a whole file; children cannot resolve it. Export items: "
+                         f"`{ref}::<Type>` and `{ref}::<Type>::<method>`")
+            continue
+        path, name = split_ref(ref)
+        own_files.add(path)
+        f = root / path
+        if not f.is_file() or "::" in name:
+            continue
+        try:
+            sig = symbol_of(root, ref)
+        except SymbolError:
+            continue
+        first = next((l for l in sig.splitlines() if l.strip() and not l.lstrip().startswith(("//", "#", "*", "/*", "@"))), "")
+        if TYPE_RE.search(first):
+            missing = [m for m in _methods(f.read_text(errors="replace"), name) if f"{ref}::{m}" not in exported]
+            if missing:
+                shown = ", ".join(missing[:MAX_NAMES]) + (f", +{len(missing) - MAX_NAMES} more" if len(missing) > MAX_NAMES else "")
+                notes.append(f"export `{ref}` is a type but its public methods are not exported ({shown}); "
+                             f"children would see the definition and not how to call it. Add `{ref}::<method>`")
+    # parents: modules the node imports that no parent (or the node itself) exports
+    parent_files: set[str] = set()
+    for p in h.parents:
+        info = nodes.get(p)
+        if info and (spec := root / info["spec"]).is_file():
+            ph = parse_header(spec.read_text(errors="replace"))
+            parent_files |= {r.partition("::")[0] for r in (ph.exports if ph else [])}
+    code = own_spec_text + "\n" + "\n".join((root / f).read_text(errors="replace") for f in own_files if (root / f).is_file())
+    repo = _files(root)
+    owner = {}
+    for n, info in nodes.items():
+        if (s := root / info["spec"]).is_file() and (ph := parse_header(s.read_text(errors="replace"))):
+            for r in ph.exports:
+                owner.setdefault(r.partition("::")[0], n)
+    for mod, suffixes in sorted(_imported_modules(code).items()):
+        files = [f for f in repo if any(("/" + f).endswith(s) for s in suffixes)]
+        if not files or any(f in parent_files or f in own_files for f in files):
+            continue
+        who = next((owner[f] for f in files if f in owner), None)
+        notes.append(f"the node uses module `{mod}` ({files[0]}) that no parent exports: "
+                     + (f"add parent `{who}`" if who else "no registered node exports it, so declare the node that owns it"))
+    return notes

@@ -43,6 +43,31 @@ def put_extracted(cache: ClaimCache, root: Path, *, section: str | None = None, 
     return edge
 
 
+DECISION_DOCS = ("DECISIONS.md", "INVARIANTS.md", "docs/DECISIONS.md", "docs/INVARIANTS.md")
+
+
+def autoregister(cache: ClaimCache, root: Path, ids: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Create the `--section` claim for each ID that has a heading in a decisions/invariants doc and
+    no claim yet. (the IDs registered, {id: why not} for the rest)"""
+    done, failed = [], {}
+    for i in ids:
+        reasons = []
+        for doc in DECISION_DOCS:
+            if not (root / doc).is_file():
+                continue
+            try:
+                put_extracted(cache, root, section=f"{doc}::{i}")
+                done.append(i)
+                break
+            except SymbolError as e:
+                reasons.append(str(e))
+        else:
+            failed[i] = next((r for r in reasons if "no heading" not in r), "no heading in " + ", ".join(
+                d for d in DECISION_DOCS if (root / d).is_file()) if any((root / d).is_file() for d in DECISION_DOCS)
+                else "no DECISIONS.md or INVARIANTS.md")
+    return done, failed
+
+
 def _cited(edges: list[Edge], spec: str, id_pattern: str) -> tuple[list[Edge], list[str], list[Edge]]:
     """(section claims for cited IDs, IDs with no claim, interface claims the spec names)."""
     ids = list(dict.fromkeys(re.findall(id_pattern, spec)))
@@ -108,6 +133,10 @@ def _declared_sections(cache: ClaimCache, root: Path, spec: str, h: Header, id_p
     out: list[str] = []
     if h.implements:
         found, missing = section_claims(edges, h.implements)
+        if missing:
+            autoregister(cache, root, missing)
+            edges = cache.store.all()
+            found, missing = section_claims(edges, h.implements)
         out += ["## Decisions you implement (in full)", ""] + [t for e in found for t in (_show(e), "")]
         if missing:
             out += [f"Declared but not in the claim store: {', '.join(missing)}", ""]

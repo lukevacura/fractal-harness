@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .cache import STORE_DIR, ClaimCache
+from .cache import STORE_DIR, ClaimCache, store_root
 
 
 def staged_paths(root: Path) -> list[str] | None:
@@ -39,7 +39,7 @@ def gate_violations(edges: list, root: Path, ctx: dict) -> tuple[list, list]:
 
 def check_message(root: Path, message_file: str) -> tuple[int, str]:
     """`fractal check --message FILE` (a commit-msg hook): rules over the message being committed."""
-    if not (root / STORE_DIR / "edges.db").exists():
+    if not (store_root(root) / STORE_DIR / "edges.db").exists():
         return 0, ""
     cache = ClaimCache(root, run_slow=False)
     try:
@@ -55,7 +55,7 @@ def check_message(root: Path, message_file: str) -> tuple[int, str]:
 
 def check(root: Path, strict: bool = False) -> tuple[int, str]:
     """(exit code, report). Exit 0 when the repo has no claim store."""
-    if not (root / STORE_DIR / "edges.db").exists():
+    if not (store_root(root) / STORE_DIR / "edges.db").exists():
         return 0, ""
     from .behavior import gate
     behavioral = gate(root)            # tests affected by the changes, batched per runner

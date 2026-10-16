@@ -27,6 +27,7 @@ def _git(root: Path, *a: str) -> None:
 
 def _repo(tmp_path: Path) -> ClaimCache:
     _git(tmp_path, "init", "-q")
+    (tmp_path / ".git" / "info" / "exclude").write_text(".fractal/\n")
     (tmp_path / "lib.rs").write_text(LIB)
     (tmp_path / "DECISIONS.md").write_text(DECISIONS)
     (tmp_path / "gp.md").write_text(_spec(guarantee="Grandparent promise."))
@@ -120,3 +121,96 @@ def test_plan_lists_children_and_context_labels_verification(tmp_path):
     assert "### stats (verified)" in bundle(tmp_path, "child.md")
     (tmp_path / "lib.rs").write_text(LIB.replace("secret_impl(x)", "other_impl(x)"))   # touches the mutant's span
     assert "### stats (UNVERIFIED: 1 of 1 verdicts stale)" in bundle(tmp_path, "child.md")
+
+
+# --- worktrees and header lint ------------------------------------------------------------
+
+def _worktree(tmp_path: Path, branch: str) -> Path:
+    wt = tmp_path.parent / f"{tmp_path.name}-{branch}"
+    _git(tmp_path, "worktree", "add", "-q", "-b", branch, str(wt))
+    return wt
+
+
+def test_worktree_shares_the_main_store_and_ledger_defaults_to_the_node_branch(tmp_path):
+    from fractal_harness.cache import store_root
+    from fractal_harness.cli import main
+    _repo(tmp_path).close()
+    wt = _worktree(tmp_path, "node-child")
+    (wt / "lib.rs").write_text(LIB + "// work\n")
+    _git(wt, "commit", "-qam", "node work")
+    tip = subprocess.run(["git", "rev-parse", "node-child"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
+    assert store_root(wt) == tmp_path.resolve() and not (wt / ".fractal").exists()
+    one = '[{"file":"lib.rs","span":"1-3","mutant":"m","result":"killed","tests":["t"]}]'
+    (tmp_path / "v.json").write_text(one)
+    # from the MAIN checkout: no --commit still lands on the node branch's tip
+    assert main(["--root", str(tmp_path), "ledger", "record", "child", "--json", str(tmp_path / "v.json")]) == 0
+    # from the worktree: the same store, and --commit applies to --json items without their own
+    (tmp_path / "v.json").write_text(one.replace('"m"', '"m2"'))
+    first = subprocess.run(["git", "rev-parse", "HEAD~1"], cwd=wt, capture_output=True, text=True).stdout.strip()
+    assert main(["--root", str(wt), "ledger", "record", "child", "--json", str(tmp_path / "v.json"),
+                 "--commit", first]) == 0
+    c = ClaimCache(tmp_path)
+    try:
+        assert {r["commit"] for r in c.store.mutants("child")} == {tip, first}
+    finally:
+        c.close()
+
+
+def test_worktree_commit_is_checked_against_the_canonical_rules(tmp_path):
+    from fractal_harness.check import check
+    c = _repo(tmp_path)
+    c.put("no FMA spelled anywhere", ["lib.rs"], kind="invariant",
+          probe={"type": "grep", "pattern": "fused_mul_add", "paths": ["*.rs"], "expect": "absent"})
+    for e in c.store.all():
+        if e.kind == "invariant":
+            c.set_rule(e.id, "enforced")
+    c.close()
+    wt = _worktree(tmp_path, "node-x")
+    (wt / "lib.rs").write_text(LIB + "// uses fused_mul_add\n")
+    _git(wt, "add", "-A")
+    code, report = check(wt)
+    assert code == 1 and "VIOLATION" in report
+
+
+def test_decision_claims_are_registered_automatically(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "DECISIONS.md").write_text(DECISIONS)
+    (tmp_path / "n.md").write_text(_spec(implements="D17, D99", guarantee="g"))
+    r = ledger.register_node(c, tmp_path, "n", "n.md")
+    assert r["autoregistered"] == ["D17"] and len(r["premises"]["decisions"]) == 1
+    assert any("D99" in n and "fractal put --section DECISIONS.md::D99" in n for n in r["lint"])
+    c.close()
+
+
+STATS_RS = """pub struct WindowStats {
+    n: u64,
+}
+
+impl WindowStats {
+    pub fn push(&mut self, x: f64) {}
+    pub fn mean(&self) -> f64 { 0.0 }
+    fn private(&self) {}
+}
+"""
+
+
+def test_repo_lint_flags_missing_parent_type_without_methods_and_file_export(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "stats.rs").write_text(STATS_RS)
+    (tmp_path / "src" / "znorm.rs").write_text("pub fn z() {}\n")
+    (tmp_path / "src" / "grow.rs").write_text("use crate::stats::WindowStats;\nuse crate::znorm::z;\npub fn grow() {}\n")
+    (tmp_path / "stats.md").write_text(_spec(guarantee="g", exports="src/stats.rs::WindowStats"))
+    (tmp_path / "znorm.md").write_text(_spec(guarantee="g", exports="src/znorm.rs"))
+    (tmp_path / "grow.md").write_text(_spec(parents="stats", guarantee="g", exports="src/grow.rs::grow"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "znorm", "znorm.md")
+    notes = ledger.register_node(c, tmp_path, "stats", "stats.md")["lint"]
+    assert any("WindowStats" in n and "push" in n and "mean" in n and "private" not in n for n in notes)
+    assert any("whole file" in n for n in ledger.register_node(c, tmp_path, "znorm", "znorm.md")["lint"])
+    notes = ledger.register_node(c, tmp_path, "grow", "grow.md")["lint"]
+    assert not any("stats" in n and "no parent" in n for n in notes)       # declared
+    assert any("`znorm`" in n and "add parent `znorm`" in n for n in notes)
+    c.close()

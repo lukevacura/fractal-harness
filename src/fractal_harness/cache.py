@@ -43,6 +43,20 @@ def dependencies(e: Edge) -> list[str]:
     return sorted(paths)
 
 
+def store_root(root: Path | str) -> Path:
+    """Where the claim store lives for the checkout at `root`: the main checkout when `root` is a linked
+    git worktree (so every worktree shares one store, one rule set and one ledger), else `root` itself."""
+    import subprocess
+    root = Path(root).resolve()
+    try:
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=root,
+                                capture_output=True, text=True, check=True).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return root
+    main = Path(common).parent if Path(common).name == ".git" else root
+    return main if (main / STORE_DIR / "edges.db").exists() else root
+
+
 class ClaimCache:
     def __init__(self, root: Path | str, checker_version: str = CHECKER_VERSION, run_slow: bool = True):
         self.root = Path(root).resolve()
@@ -50,7 +64,7 @@ class ClaimCache:
         # Slow probes (tests, commands) take seconds; hooks on the millisecond path pass
         # run_slow=False and leave those claims to the turn-end gate and the commit gate.
         self.run_slow = run_slow
-        self.store = Store(self.root / STORE_DIR / "edges.db")
+        self.store = Store(store_root(self.root) / STORE_DIR / "edges.db")
         self.last_motion: dict[str, str] = {}  # edge id -> motion class of its latest check
 
     def close(self) -> None:

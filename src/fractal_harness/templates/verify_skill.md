@@ -33,7 +33,9 @@ Do not rely on the implementer's reasoning, and do not read it if it was left in
    ```
    - `span` is 1-based lines in the verified commit, covering exactly the code you changed.
    - A killed mutant needs `tests` (the names of the tests that fail); an equivalent one needs `argument`.
-   - Verify a committed state (the default `commit` is `HEAD`); commit or stash first.
+   - Verify a committed state; commit or stash first. With no `commit`, verdicts attach to the tip of the node's
+     branch (`ledger node --branch`, else `node-<name>`), else to this checkout's HEAD. `--commit X` applies to every
+     `--json` verdict that names none. It works from any checkout or worktree: they all share one store.
    - Re-recording a mutant replaces its old verdict; do that for every one you re-ran.
 4. First time for a node, or after its spec changed: register what it rests on with
    `fractal ledger node <node> --spec <spec.md>`, then record. The spec's front matter declares

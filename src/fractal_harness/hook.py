@@ -24,7 +24,7 @@ import os
 import sys
 from pathlib import Path
 
-from .cache import STORE_DIR, ClaimCache, dependencies
+from .cache import STORE_DIR, ClaimCache, dependencies, store_root
 from .store import Edge, tokens
 
 MAX_FACTS = 6
@@ -75,7 +75,7 @@ def _root(data: dict) -> Path:
 
 
 def _has_store(root: Path) -> bool:
-    return (root / STORE_DIR / "edges.db").exists()   # never create a store from a hook
+    return (store_root(root) / STORE_DIR / "edges.db").exists()   # never create a store from a hook
 
 
 def _rel_in_repo(root: Path, path: str | None) -> str | None:
