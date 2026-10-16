@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS ledger_nodes (
     node     TEXT PRIMARY KEY,
     spec     TEXT NOT NULL,
     spec_sha TEXT NOT NULL,
-    premises TEXT NOT NULL,      -- json [claim ids the spec cites: decisions, interfaces]
+    premises TEXT NOT NULL,      -- json {decisions: [claim ids], parents: {node: contract digest}}
+                                 -- (older: a bare list of claim ids)
     ts       REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS mutants (
@@ -288,6 +289,10 @@ class Store:
     def get_node(self, node: str) -> dict | None:
         r = self.db.execute("SELECT spec, spec_sha, premises FROM ledger_nodes WHERE node = ?", (node,)).fetchone()
         return {"spec": r[0], "spec_sha": r[1], "premises": json.loads(r[2])} if r else None
+
+    def all_nodes(self) -> dict[str, dict]:
+        return {r[0]: {"spec": r[1], "spec_sha": r[2], "premises": json.loads(r[3])}
+                for r in self.db.execute("SELECT node, spec, spec_sha, premises FROM ledger_nodes")}
 
     def put_mutant(self, node: str, file: str, start: int, end: int, mutant: str, result: str,
                    commit_sha: str, tests: list[str], argument: str) -> None:

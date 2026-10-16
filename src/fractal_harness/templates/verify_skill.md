@@ -36,7 +36,11 @@ Do not rely on the implementer's reasoning, and do not read it if it was left in
    - Verify a committed state (the default `commit` is `HEAD`); commit or stash first.
    - Re-recording a mutant replaces its old verdict; do that for every one you re-ran.
 4. First time for a node, or after its spec changed: register what it rests on with
-   `fractal ledger node <node> --spec <spec.md>`, then record.
+   `fractal ledger node <node> --spec <spec.md>`, then record. The spec's front matter declares
+   the node's premises (`parents:` nodes, `implements:` decisions; register parents first). Verdicts
+   go stale only when the spec, an implemented decision, or a direct parent's contract (its
+   `guarantee:`, `condition:` and `exports:` signatures) changes; if the header is missing, ask the
+   orchestrator to add it.
 5. Report PASS only if no mutant survived unresolved and every verdict is recorded. List the
    survivors and any weak tests otherwise.
 

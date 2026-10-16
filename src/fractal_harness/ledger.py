@@ -25,7 +25,8 @@ import subprocess
 from pathlib import Path
 
 from .cache import ClaimCache
-from .context import DEFAULT_ID_PATTERN, _cited
+from .context import DEFAULT_ID_PATTERN, _cited, premises_of, section_claims
+from .nodes import contract_digest, lint, parse_header
 from .store import GOOD
 from .symbols import SymbolError, digest
 
@@ -48,16 +49,33 @@ def resolve_commit(root: Path, rev: str = "HEAD") -> str:
 
 def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
                   id_pattern: str = DEFAULT_ID_PATTERN) -> dict:
-    """Record which spec and which premise claims (cited decisions, named interfaces) the node's
-    verdicts rest on. Re-run after the spec changes and the node has been re-verified."""
+    """Record which spec and which premises the node's verdicts rest on. With a spec header the
+    premises are exactly its declared `implements` decisions and `parents` contracts; without one
+    (legacy) they are whatever the text cites. Re-run after the spec changes and the node has been
+    re-verified. Parents must be registered first, so their contracts can be watched."""
     f = root / spec
     if not f.is_file():
         raise SymbolError(f"no such spec: {spec}")
     text = f.read_text(errors="replace")
-    found, missing, interfaces = _cited(cache.store.all(), text, id_pattern)
-    premises = sorted({e.id for e in found + interfaces})
+    h = parse_header(text)
+    edges = cache.store.all()
+    if h is None:
+        found, missing, interfaces = _cited(edges, text, id_pattern)
+        premises = {"decisions": sorted({e.id for e in found + interfaces}), "parents": {}}
+    else:
+        nodes = cache.store.all_nodes()
+        unregistered = [n for n in h.parents if n not in nodes]
+        if unregistered:
+            raise SymbolError(f"parents not registered yet: {', '.join(unregistered)} "
+                              "(`fractal ledger node <parent> --spec <its spec>` first)")
+        if node in h.parents:
+            raise SymbolError(f"{node} cannot be its own parent")
+        found, missing = section_claims(edges, h.implements)
+        premises = {"decisions": sorted(e.id for e in found),
+                    "parents": {n: contract_digest(root, nodes[n]["spec"]) for n in h.parents}}
     cache.store.put_node(node, spec, digest(text), premises)
-    return {"spec": spec, "premises": premises, "uncited": missing}
+    return {"spec": spec, "premises": premises, "uncited": missing, "declared": h is not None,
+            "lint": lint(h) if h else []}
 
 
 def record(cache: ClaimCache, root: Path, node: str, *, file: str, span: str, mutant: str, result: str,
@@ -127,19 +145,35 @@ def plan(cache: ClaimCache, root: Path, node: str) -> dict:
     cache.update()
     node_reason = None
     info = cache.store.get_node(node)
+    children: list[str] = []
     if info:
         spec = root / info["spec"]
         if not spec.is_file() or digest(spec.read_text(errors="replace")) != info["spec_sha"]:
             node_reason = f"spec {info['spec']} changed"
         else:
-            for pid in info["premises"]:
+            pre = premises_of(info)
+            for pid in pre["decisions"]:
                 e = cache.store.get(pid)
                 if e is None:
-                    node_reason = f"premise {pid} changed or was removed"
+                    node_reason = f"decision claim {pid} changed or was removed"
                 elif e.status not in GOOD:
-                    node_reason = f"premise {pid} is {e.status}: {e.detail}"
+                    node_reason = f"decision claim {pid} is {e.status}: {e.detail}"
                 if node_reason:
                     break
+            for name, old in pre["parents"].items():
+                if node_reason:
+                    break
+                pinfo = cache.store.get_node(name)
+                try:
+                    now = contract_digest(root, pinfo["spec"]) if pinfo else None
+                except SymbolError as e:
+                    node_reason = f"parent {name}'s contract is unreadable: {e}"
+                    continue
+                if now is None:
+                    node_reason = f"parent {name} is no longer registered"
+                elif now != old:
+                    node_reason = f"parent {name}'s contract changed"
+        children = sorted(n for n, i in cache.store.all_nodes().items() if node in premises_of(i)["parents"])
     by_commit: dict[str, dict[str, list[tuple[int, int]]] | str] = {}
     for c in {r["commit"] for r in rows}:
         try:
@@ -170,7 +204,7 @@ def plan(cache: ClaimCache, root: Path, node: str) -> dict:
     return {"node": node, "base": base, "stale": [(r, why) for r, why in stale],
             "valid": [r for r, _ in valid], "node_reason": node_reason,
             "open": [r for r, _ in valid if r["result"] == "survived"],
-            "changed": sorted(changed_files), "test_files": sorted(test_files), "files": sorted({r["file"] for r in rows})}
+            "children": children, "changed": sorted(changed_files), "test_files": sorted(test_files), "files": sorted({r["file"] for r in rows})}
 
 
 def _file_defines(root: Path, rel: str, commit: str, test: str, hunks: list) -> bool:
@@ -189,6 +223,9 @@ def render(p: dict, with_arguments: bool = False, diff: bool = True, root: Path 
     out = [f"# Verification plan for {p['node']}", "",
            f"{len(p['valid'])} of {total} recorded verdicts still hold; {len(p['stale'])} need re-running. "
            f"Last verified commit: {p['base'][:10]}."]
+    if p["children"]:
+        out += ["", f"Nodes that assume this one's contract: {', '.join(p['children'])}. Changing its guarantee, "
+                    "condition or exports stales them."]
     if p["node_reason"]:
         out += ["", f"Everything is stale: {p['node_reason']}. Re-verify the node in full."]
     if p["stale"]:

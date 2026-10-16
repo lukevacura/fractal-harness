@@ -97,7 +97,7 @@ def test_changed_decision_stales_every_citing_node(tmp_path):
     (tmp_path / "DECISIONS.md").write_text("## D17 — No FMA\nFMA is fine in cold paths.\n")
     put_extracted(c, tmp_path, section="DECISIONS.md::D17")   # re-assert: the old claim is replaced
     r = _plan(c, tmp_path)
-    assert len(r["stale"]) == 4 and "premise" in r["stale"]["drop branch"]
+    assert len(r["stale"]) == 4 and "decision claim" in r["stale"]["drop branch"]
 
 
 def test_unknown_commit_is_stale_and_arguments_are_opt_in(tmp_path):

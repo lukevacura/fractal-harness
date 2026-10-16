@@ -313,8 +313,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.ledger_cmd == "node":
                 from .context import DEFAULT_ID_PATTERN
                 r = ledger.register_node(cache, root, args.node, args.spec, args.id_pattern or DEFAULT_ID_PATTERN)
-                print(f"{args.node}: spec {r['spec']}, {len(r['premises'])} premise claim(s)"
-                      + (f"; cited with no claim: {', '.join(r['uncited'])}" if r["uncited"] else ""))
+                pre = r["premises"]
+                print(f"{args.node}: spec {r['spec']}, " + (f"{len(pre['parents'])} parent(s), " if r["declared"]
+                      else "premises inferred from the text, ") + f"{len(pre['decisions'])} decision claim(s)"
+                      + (f"; no claim for: {', '.join(r['uncited'])}" if r["uncited"] else ""))
+                for note in r["lint"]:
+                    print(f"  note: {note}")
             else:
                 if args.json:
                     items = json.loads(sys.stdin.read() if args.json == "-" else Path(args.json).read_text())
