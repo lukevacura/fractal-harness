@@ -214,3 +214,21 @@ def test_repo_lint_flags_missing_parent_type_without_methods_and_file_export(tmp
     assert not any("stats" in n and "no parent" in n for n in notes)       # declared
     assert any("`znorm`" in n and "add parent `znorm`" in n for n in notes)
     c.close()
+
+
+def test_a_local_named_like_a_method_is_not_a_second_definition():
+    from fractal_harness.symbols import find
+    src = """pub struct Anchor {
+    tick: u64,
+}
+
+impl Anchor {
+    /// Ticks since the anchor.
+    pub fn offset(&self, tick: u64) -> u64 {
+        let offset = tick - self.tick;
+        offset
+    }
+}
+"""
+    assert find(src, "Anchor::offset")[1].splitlines()[-1].strip().startswith("pub fn offset")
+    assert "let" not in find(src, "offset")[1]       # unqualified: the method, not the local

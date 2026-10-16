@@ -16,6 +16,7 @@ MAX_SECTION_CHARS = 2000
 MAX_BODY_LINES = 40
 TYPE_KW = ("struct", "enum", "trait", "interface", "impl", "protocol", "class", "object")
 DEF_KW = ("fn", "def", "func", "function", "type", "const", "static", "mod", "val", "var", "let") + TYPE_KW
+LOCAL_KW = ("let", "var", "val")
 NOT_DEFS = ("return", "new", "throw", "else", "if", "while", "for", "await", "yield", "assert")
 DOC_PREFIXES = ("///", "//!", "//", "#", "*", "/**", "*/", "@")
 
@@ -101,12 +102,15 @@ def find(text: str, name: str) -> tuple[int, str]:
         q = qual.rpartition("::")[2]
         scoped = []
         for i, kw in hits:
-            for j in range(i - 1, -1, -1):
-                if _indent(lines[j]) < _indent(lines[i]) and lines[j].strip() and re.search(
-                        rf"\b({'|'.join(TYPE_KW)})\b.*\b{re.escape(q)}\b", lines[j]):
-                    scoped.append((i, kw))
-                    break
+            # the item's immediately enclosing block must be the qualifying type, so a local of the
+            # same name inside a method (`let offset = ...`) is not a second definition
+            enclosing = next((lines[j] for j in range(i - 1, -1, -1)
+                              if lines[j].strip() and _indent(lines[j]) < _indent(lines[i])), "")
+            if re.search(rf"\b({'|'.join(TYPE_KW)})\b.*\b{re.escape(q)}\b", enclosing):
+                scoped.append((i, kw))
         hits = scoped
+    if len(hits) > 1 and any(kw not in LOCAL_KW for _, kw in hits):
+        hits = [h for h in hits if h[1] not in LOCAL_KW]    # a method or item, not a local binding of its name
     if len(hits) > 1 and any(kw != "impl" for _, kw in hits):
         hits = [h for h in hits if h[1] != "impl"]     # the type itself, not its impl blocks
     if not hits:
