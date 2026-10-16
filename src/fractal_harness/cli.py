@@ -124,6 +124,14 @@ def main(argv: list[str] | None = None) -> int:
     lx = lsub.add_parser("rm", help="deregister a node that left the DAG (it stops counting as a child)")
     lx.add_argument("node")
     lx.add_argument("--forget-verdicts", action="store_true", help="also delete its recorded verdicts")
+    la = lsub.add_parser("reattribute", help="correct the commit a node's verdicts were verified at (audited)")
+    la.add_argument("node")
+    la.add_argument("--from", dest="old", required=True, help="the wrong commit (a prefix is enough)")
+    la.add_argument("--to", required=True, help="the commit the verifiers actually checked")
+    la.add_argument("--reason", required=True)
+    la.add_argument("--force", action="store_true", help="even if a verdict's file or span is absent at --to")
+    lg_log = lsub.add_parser("log", help="the audit trail of corrections to recorded verdicts")
+    lg_log.add_argument("node", nargs="?")
     lr = lsub.add_parser("record", help="record a mutant's verdict at a commit")
     lr.add_argument("node")
     lr.add_argument("--json", metavar="FILE", help="a JSON list of verdicts ('-' for stdin) instead of flags: "
@@ -328,6 +336,14 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  registered claims for: {', '.join(r['autoregistered'])}")
                 for note in r["lint"]:
                     print(f"  note: {note}")
+            elif args.ledger_cmd == "reattribute":
+                n = ledger.reattribute(cache, root, args.node, args.old, args.to, args.reason, args.force)
+                print(f"re-attributed {n} verdict(s) of {args.node}: {args.old} -> "
+                      f"{ledger.resolve_commit(root, args.to)[:10]} (logged; see `fractal ledger log`)")
+            elif args.ledger_cmd == "log":
+                import time
+                for a in cache.store.audit(args.node):
+                    print(f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(a['ts']))}  {a['node']}  {a['action']}: {a['detail']}")
             elif args.ledger_cmd == "rm":
                 orphans = ledger.deregister(cache, args.node, args.forget_verdicts)
                 print(f"deregistered {args.node}" + (" and forgot its verdicts" if args.forget_verdicts else ""))

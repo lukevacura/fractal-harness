@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS mutants (
     ts        REAL NOT NULL,
     PRIMARY KEY (node, file, start, end, mutant)
 );
+CREATE TABLE IF NOT EXISTS ledger_audit (   -- every change to recorded verdicts that is not a plain `record`
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     REAL NOT NULL,
+    node   TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts      REAL NOT NULL,
@@ -291,6 +298,21 @@ class Store:
             self.db.execute("DELETE FROM ledger_nodes WHERE node = ?", (node,))
             if forget_verdicts:
                 self.db.execute("DELETE FROM mutants WHERE node = ?", (node,))
+
+    def reattribute(self, node: str, old_prefix: str, new_sha: str, why: str) -> int:
+        """Move a node's verdicts recorded at a commit starting with `old_prefix` to `new_sha`, auditing it."""
+        with self.db:
+            n = self.db.execute("UPDATE mutants SET commit_sha = ? WHERE node = ? AND commit_sha LIKE ?",
+                                (new_sha, node, old_prefix + "%")).rowcount
+            self.db.execute("INSERT INTO ledger_audit (ts, node, action, detail) VALUES (?, ?, 'reattribute', ?)",
+                            (time.time(), node, f"{n} verdict(s) {old_prefix} -> {new_sha}: {why}"))
+        return n
+
+    def audit(self, node: str | None = None) -> list[dict]:
+        q, a = "SELECT ts, node, action, detail FROM ledger_audit", ()
+        if node:
+            q, a = q + " WHERE node = ?", (node,)
+        return [dict(zip(("ts", "node", "action", "detail"), r)) for r in self.db.execute(q + " ORDER BY id", a)]
 
     def get_node(self, node: str) -> dict | None:
         r = self.db.execute("SELECT spec, spec_sha, premises FROM ledger_nodes WHERE node = ?", (node,)).fetchone()

@@ -285,3 +285,29 @@ def test_deregistering_a_node_removes_it_from_the_children(tmp_path):
     with pytest.raises(SymbolError):
         ledger.plan(c, tmp_path, "stats")
     c.close()
+
+
+def test_reattribute_corrects_the_commit_and_is_audited(tmp_path):
+    c = _repo(tmp_path)
+    wrong = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
+    _record(c, tmp_path, "stats")
+    (tmp_path / "lib.rs").write_text("// moved\n" + LIB)
+    _git(tmp_path, "commit", "-qam", "c2")
+    right = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
+    with pytest.raises(SymbolError):
+        ledger.reattribute(c, tmp_path, "stats", wrong[:7], right, "")                  # a reason is required
+    with pytest.raises(SymbolError):
+        ledger.reattribute(c, tmp_path, "stats", "deadbee", right, "x")                 # nothing there
+    assert ledger.reattribute(c, tmp_path, "stats", wrong[:7], right, "recorded from main by mistake") == 1
+    assert c.store.mutants("stats")[0]["commit"] == right
+    assert "recorded from main by mistake" in c.store.audit("stats")[0]["detail"]
+    _record(c, tmp_path, "child")
+    tiny = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tmp_path, capture_output=True, text=True).stdout.strip()
+    (tmp_path / "short.txt").write_text("a\n")
+    _git(tmp_path, "add", "short.txt")
+    _git(tmp_path, "commit", "-qm", "c3")
+    c.store.reattribute("child", tiny[:7], tiny, "noop")                                # (setup for the span check below)
+    c.store.put_mutant("child", "short.txt", 1, 50, "m9", "killed", tiny, ["t"], "")
+    with pytest.raises(SymbolError, match="do not fit"):
+        ledger.reattribute(c, tmp_path, "child", tiny[:7], tiny, "why")
+    c.close()

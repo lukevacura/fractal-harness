@@ -127,6 +127,34 @@ def record(cache: ClaimCache, root: Path, node: str, *, file: str, span: str, mu
                            tests or [], argument.strip())
 
 
+def reattribute(cache: ClaimCache, root: Path, node: str, old: str, new: str, reason: str,
+                force: bool = False) -> int:
+    """Correct which commit a node's verdicts were verified at (they were recorded against the wrong one).
+    Refuses when a verdict's file or span does not exist at the new commit, unless `force`. The change is
+    written to the ledger's audit log with the reason."""
+    if not reason.strip():
+        raise SymbolError("say why (--reason): the correction is part of the audit trail")
+    rows = [r for r in cache.store.mutants(node) if r["commit"].startswith(old)]
+    if not rows:
+        raise SymbolError(f"{node} has no verdicts recorded at a commit starting {old!r}")
+    if len({r["commit"] for r in rows}) > 1:
+        raise SymbolError(f"{old!r} matches several commits ({', '.join(sorted({r['commit'][:10] for r in rows}))}); "
+                          "give a longer prefix")
+    target = resolve_commit(root, new)
+    bad = []
+    for f in sorted({r["file"] for r in rows}):
+        try:
+            n = len(_git(root, "show", f"{target}:{f}").splitlines())
+        except SymbolError:
+            bad += [f"{f}: not in {target[:10]}"]
+            continue
+        bad += [f"{f}:{r['start']}-{r['end']}: file has {n} lines at {target[:10]}"
+                for r in rows if r["file"] == f and r["end"] > n]
+    if bad and not force:
+        raise SymbolError("these verdicts do not fit the new commit (use --force to override):\n  " + "\n  ".join(bad[:10]))
+    return cache.store.reattribute(node, rows[0]["commit"], target, reason.strip() + (" [forced]" if bad else ""))
+
+
 def deregister(cache: ClaimCache, node: str, forget_verdicts: bool = False) -> list[str]:
     """Remove a node's registration (it stops counting as a child, and a parent's plan stops listing it).
     Its verdicts stay unless `forget_verdicts`. Returns the nodes that still declare it as a parent."""
