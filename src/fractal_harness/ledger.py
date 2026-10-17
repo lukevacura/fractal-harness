@@ -26,7 +26,7 @@ from pathlib import Path
 
 from .cache import ClaimCache
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
-from .nodes import contract_change, contract_parts, lint, parse_header, repo_lint
+from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint
 from .store import GOOD
 from .symbols import SymbolError, digest
 
@@ -102,7 +102,7 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
     cache.store.put_node(node, spec, digest(text), premises)
     notes = []
     if h:
-        notes = lint(h) + repo_lint(root, h, cache.store.all_nodes(), text)
+        notes = lint(h) + repo_lint(root, h, cache.store.all_nodes(), text, node)
         notes += [f"{i} has no claim ({failed.get(i, 'not found')}); `fractal put --section DECISIONS.md::{i}`"
                   for i in missing]
     return {"spec": spec, "premises": premises, "uncited": [] if h else missing, "declared": h is not None,
@@ -215,7 +215,11 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
     node_reason = None
     info = cache.store.get_node(node)
     children: list[str] = []
+    oracle = ""
     if info:
+        if (sp := root / info["spec"]).is_file():
+            oh = parse_header(sp.read_text(errors="replace"))
+            oracle = oh.oracle if oh else ""
         spec = root / info["spec"]
         if not spec.is_file() or digest(spec.read_text(errors="replace")) != info["spec_sha"]:
             node_reason = f"spec {info['spec']} changed"
@@ -270,10 +274,14 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
                         reason = f"killing test {t} is in changed file {hit}"
                         break
         (stale if reason else valid).append((r, reason))
+    required = []
+    if oracle.strip().lower() == "equality" and not any(
+            r["mutant"] == DEGENERATE_MUTANT and r["result"] == "killed" for r, _ in valid):
+        required.append(DEGENERATE_MUTANT)
     base = max(rows, key=lambda r: r["ts"])["commit"]
     return {"node": node, "base": base, "stale": [(r, why) for r, why in stale],
             "valid": [r for r, _ in valid], "node_reason": node_reason,
-            "open": [r for r, _ in valid if r["result"] == "survived"],
+            "open": [r for r, _ in valid if r["result"] == "survived"], "required": required,
             "children": children, "against": against, "changed": sorted(changed_files), "test_files": sorted(test_files), "files": sorted({r["file"] for r in rows})}
 
 
@@ -318,6 +326,10 @@ def render(p: dict, with_arguments: bool = False, diff: bool = True, root: Path 
         out += ["", "## Re-run these mutants"]
         out += [f"- {r['file']}:{r['start']}-{r['end']}  {r['mutant']}  (was {r['result']}) — {why}"
                 for r, why in p["stale"]]
+    if p["required"]:
+        out += ["", "## Required standard mutants (the node declares an equality oracle)"]
+        out += [f"- {m}: make the output trivially empty; the equality tests must fail. "
+                f"Record it with --mutant '{m}' (killed, with its tests) or the node fails." for m in p["required"]]
     if p["open"]:
         out += ["", "## Survived and still unresolved"]
         out += [f"- {r['file']}:{r['start']}-{r['end']}  {r['mutant']}" for r in p["open"]]

@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from fractal_harness import ledger
+from fractal_harness.nodes import DEGENERATE_MUTANT
 from fractal_harness.cache import ClaimCache
 from fractal_harness.context import put_extracted
 from fractal_harness.symbols import SymbolError
@@ -139,3 +140,13 @@ def test_cli_roundtrip(tmp_path, capsys, monkeypatch):
     assert main(["--root", str(tmp_path), "ledger", "record", "n", "--json", str(f)]) == 0
     assert main(["--root", str(tmp_path), "verify-plan", "n"]) == 0
     assert "1 of 1 recorded verdicts still hold" in capsys.readouterr().out
+
+
+def test_equality_oracle_requires_the_degenerate_mutant(tmp_path):
+    c = _repo(tmp_path)
+    (tmp_path / "spec.md").write_text("---\noracle: equality\n---\n# Node\nImplements D17.\n")
+    ledger.register_node(c, tmp_path, "n1", "spec.md")
+    p = ledger.plan(c, tmp_path, "n1")
+    assert p["required"] == [DEGENERATE_MUTANT] and "Required standard mutants" in ledger.render(p)
+    ledger.record(c, tmp_path, "n1", file="lib.rs", span="3", mutant=DEGENERATE_MUTANT, result="killed", tests=["test_a"])
+    assert ledger.plan(c, tmp_path, "n1")["required"] == []

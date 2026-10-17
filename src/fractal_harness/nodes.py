@@ -7,6 +7,7 @@
     guarantee: Windowed mean and variance, exact for N.
     condition: Only for windows with V < 2^63; stats flags the rest.
     exports: src/stats.rs::Stats::update, src/stats.rs::Stats
+    oracle: equality               # optional: tests compare two engines; adds the degenerate-output mutant
     ---
 
 A child may rely on a parent's *contract*: its `guarantee`, its `condition` (a conditional guarantee
@@ -24,7 +25,7 @@ from pathlib import Path
 from .symbols import SymbolError, digest, split_ref, symbol_of
 
 LIST_FIELDS = ("parents", "implements", "see", "exports")
-STR_FIELDS = ("guarantee", "condition")
+STR_FIELDS = ("guarantee", "condition", "oracle")
 CONDITIONAL_WORDS = re.compile(r"\b(only (?:when|if|for)|provided|unless|assuming|as long as|given that)\b", re.I)
 
 
@@ -36,6 +37,7 @@ class Header:
     exports: list[str] = field(default_factory=list)
     guarantee: str = ""
     condition: str = ""
+    oracle: str = ""          # "equality": the tests compare two implementations; verify-plan then requires DEGENERATE_MUTANT
 
 
 def parse_header(text: str) -> Header | None:
@@ -181,10 +183,38 @@ def _methods(text: str, type_name: str) -> list[str]:
     return list(dict.fromkeys(names))
 
 
-def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str) -> list[str]:
+DEGENERATE_MUTANT = "every output entry is NONE/empty"
+
+
+def _symbol_keys(refs: list[str]) -> set[str]:
+    """Top-level symbols of export refs: `f.rs::T::m` and `f.rs::T` are both `f.rs::T`."""
+    return {r.partition("::")[0] + "::" + r.partition("::")[2].split("::")[0] for r in refs if "::" in r}
+
+
+def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> list[str]:
+    """A decision already implemented by another node's exported symbol should be extended, not
+    shadowed: warn when this node exports a *new* top-level symbol for an ID others already own."""
+    notes: list[str] = []
+    mine = _symbol_keys(h.exports)
+    for decision in h.implements:
+        for other, info in sorted(nodes.items()):
+            if other == node or not (s := root / info["spec"]).is_file():
+                continue
+            oh = parse_header(s.read_text(errors="replace"))
+            if not oh or decision not in oh.implements:
+                continue
+            theirs = _symbol_keys(oh.exports)
+            new = sorted(mine - theirs)
+            if theirs and new:
+                notes.append(f"{decision} is already owned by {', '.join(sorted(theirs))} (node {other}); this node "
+                             f"exports new {', '.join(new)}. Extend the existing symbol rather than adding a parallel one?")
+    return notes
+
+
+def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str, node: str = "") -> list[str]:
     """Header problems that are visible in the repository and would starve a node's context bundle,
     each with the fix."""
-    notes: list[str] = []
+    notes: list[str] = ownership_lint(h, node, nodes, root) if node else []
     own_files: set[str] = set()
     exported: set[str] = set(h.exports)
     for ref in h.exports:

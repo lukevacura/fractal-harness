@@ -311,3 +311,17 @@ def test_reattribute_corrects_the_commit_and_is_audited(tmp_path):
     with pytest.raises(SymbolError, match="do not fit"):
         ledger.reattribute(c, tmp_path, "child", tiny[:7], tiny, "why")
     c.close()
+
+
+def test_ownership_lint_warns_on_a_parallel_symbol_for_an_owned_decision(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
+    (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Nearest"))
+    (tmp_path / "b.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Nearest::k, n.rs::Nearest"))
+    (tmp_path / "c.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::NearestK"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "a", "a.md")
+    assert not any("owned" in n for n in ledger.register_node(c, tmp_path, "b", "b.md")["lint"])   # refines it
+    notes = ledger.register_node(c, tmp_path, "c", "c.md")["lint"]
+    assert any("S5" in n and "NearestK" in n and "Extend" in n for n in notes)

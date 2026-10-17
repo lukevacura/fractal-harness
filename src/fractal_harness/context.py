@@ -122,6 +122,8 @@ def verification_label(cache: ClaimCache, root: Path, node: str) -> str:
         return "NO VERIFICATION RECORDED"
     if p["node_reason"] or p["stale"]:
         return f"UNVERIFIED: {len(p['stale'])} of {len(p['stale']) + len(p['valid'])} verdicts stale"
+    if p.get("required"):
+        return f"UNVERIFIED: required mutant missing ({p['required'][0]})"
     if p["open"]:
         return f"{len(p['open'])} surviving mutant(s) unresolved"
     return "verified"
