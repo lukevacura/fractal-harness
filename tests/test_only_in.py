@@ -82,3 +82,17 @@ def test_kind_name_with_anchors_matches_the_whole_identifier_and_a_failing_rule_
     assert main(base + ["only-in", "bias", "--kind", "fn", "--name", "r_bias", "--in", "src/nearest.rs",
                         "--paths", "src/**/*.rs"]) == 1
     assert "created failing" in capsys.readouterr().err
+
+
+def test_only_in_decision_flag_is_stored_and_listed_in_the_registry(tmp_path, capsys):
+    from fractal_harness.concepts import decision_ids
+    _repo(tmp_path)
+    base = ["--root", str(tmp_path)]
+    assert main(base + ["only-in", "nearest order", "--pattern", "fn rank_key", "--in", "src/nearest.rs",
+                        "--paths", "src/**/*.rs", "--decision", "S5", "--decision", "S6"]) == 0
+    capsys.readouterr()
+    c = ClaimCache(tmp_path)
+    assert decision_ids(c) == {"S5": ["nearest order"], "S6": ["nearest order"]}
+    c.close()
+    main(base + ["concepts"])
+    assert "S5, S6" in capsys.readouterr().out

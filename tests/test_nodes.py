@@ -314,8 +314,16 @@ def test_reattribute_corrects_the_commit_and_is_audited(tmp_path):
     c.close()
 
 
+def _concept(c, decision="S5", name="nearest order"):
+    """A single-ownership claim naming a decision: ownership lints apply to IDs like this one only."""
+    return c.put(f"{name} is defined only in n.rs", ["n.rs"], kind="invariant",
+                 probe={"type": "only_in", "pattern": "struct Nearest", "paths": ["*.rs"], "files": ["n.rs"],
+                        "concept": name, "decision": decision})
+
+
 def test_ownership_lint_warns_on_a_parallel_symbol_for_an_owned_decision(tmp_path):
     c = ClaimCache(tmp_path)
+    _concept(c)
     _git(tmp_path, "init", "-q")
     (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
     (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Nearest"))
@@ -346,6 +354,7 @@ def test_after_edges_are_not_premises_and_do_not_satisfy_a_used_module(tmp_path)
 
 def test_refines_and_distinct_declarations_silence_the_ownership_lint(tmp_path):
     c = ClaimCache(tmp_path)
+    _concept(c)
     _git(tmp_path, "init", "-q")
     (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
     (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Nearest"))
@@ -381,6 +390,7 @@ def test_changed_parent_export_suggests_a_narrow_order_but_keeps_everything_stal
 
 def test_refines_target_must_be_exported_by_another_node(tmp_path):
     c = ClaimCache(tmp_path)
+    _concept(c)
     _git(tmp_path, "init", "-q")
     (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
     (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Nearest"))
@@ -397,6 +407,7 @@ def test_refines_target_must_be_exported_by_another_node(tmp_path):
 
 def test_ownership_lint_frictions_moved_owner_and_symbol_forms(tmp_path):
     c = ClaimCache(tmp_path)
+    _concept(c)
     _git(tmp_path, "init", "-q")
     (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
     (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="src/n.rs::Nearest"))
@@ -496,3 +507,24 @@ impl Reducer for Nearest {
 """
     assert "-> bool" in find(src, "Nearest::offer")[1]                  # was "ambiguous"
     assert find(src, "Reducer::offer")[0] == 1                          # the trait's own declaration, by the trait's name
+
+
+def test_ownership_lint_ignores_cross_cutting_decisions_no_concept_claim_names(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "DECISIONS.md").write_text("# D\n\n## D20 shared\nEveryone follows this.\n")
+    for i in range(8):
+        (tmp_path / f"n{i}.md").write_text(_spec(implements="D20", guarantee="g", exports=f"f{i}.rs::Thing{i}"))
+    _git(tmp_path, "add", "-A")
+    notes = [n for i in range(8) for n in ledger.register_node(c, tmp_path, f"n{i}", f"n{i}.md")["lint"]]
+    assert not any("owned" in n for n in notes)                         # D20 is implemented by eight nodes, legitimately
+    _concept(c, decision="D20", name="the thing")                       # name it as a concept and the lint applies
+    again = ledger.register_node(c, tmp_path, "n7", "n7.md")["lint"]
+    assert any("D20 (the thing) is already owned" in n for n in again)
+
+
+def test_an_id_in_the_concept_name_counts_and_only_in_takes_a_decision_flag():
+    from fractal_harness.concepts import decisions_of
+    assert decisions_of({}, "S5 nearest order") == ["S5"]
+    assert decisions_of({"decision": ["D1", "S5"]}, "S5 order") == ["D1", "S5"]
+    assert decisions_of({"decision": "D3"}, "order") == ["D3"]

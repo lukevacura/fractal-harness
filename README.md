@@ -145,7 +145,9 @@ oracle: equality        # tests compare two implementations: verify-plan require
 - Under a "Design" heading, mark each list item `[binding]` (reproduce it) or `[advisory]` (override it with
   evidence, and say so). `ledger node` warns about unmarked ones.
 - `ledger node` also warns when a node exports a new symbol for a decision another node's symbol already
-  implements, and when code uses a module that is only declared `after:`.
+  implements, but only for decisions a concept claim names (`fractal only-in ... --decision S5`, or an ID in the
+  concept's name): ownership belongs to a concept, and a cross-cutting decision many nodes implement is not checked.
+  It also warns when code uses a module that is only declared `after:`.
 - `fractal update` lists `unchecked` decisions: registered, but no `Check:` line, citing claim or test names them.
 - When one parent export changes, `verify-plan` suggests starting with the mutants whose code names it.
   Every verdict still counts as stale.

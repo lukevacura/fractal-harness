@@ -26,6 +26,7 @@ import difflib
 from pathlib import Path
 
 from .cache import ClaimCache
+from .concepts import decision_ids
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
 from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint, spec_key, spec_lint, edit_header
 from .store import GOOD
@@ -79,7 +80,7 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
     diff = ""
     if fix and h is not None:
         fixes: dict = {}
-        repo_lint(root, h, cache.store.all_nodes(), text, node, fixes)
+        repo_lint(root, h, cache.store.all_nodes(), text, node, fixes, decision_ids(cache))
         if any(fixes["add"].values()) or any(fixes["remove"].values()):
             new = edit_header(text, fixes["add"], fixes["remove"])
             diff = "".join(difflib.unified_diff(text.splitlines(True), new.splitlines(True), f"a/{spec}", f"b/{spec}"))
@@ -117,7 +118,7 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
     cache.store.put_node(node, spec, digest(spec_key(text)), premises)
     notes = []
     if h:
-        notes = lint(h) + spec_lint(text) + repo_lint(root, h, cache.store.all_nodes(), text, node)
+        notes = lint(h) + spec_lint(text) + repo_lint(root, h, cache.store.all_nodes(), text, node, concepts=decision_ids(cache))
         notes += [f"{i} has no claim ({failed.get(i, 'not found')}); `fractal put --section DECISIONS.md::{i}`"
                   for i in missing]
     return {"spec": spec, "premises": premises, "uncited": [] if h else missing, "declared": h is not None,

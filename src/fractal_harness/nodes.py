@@ -295,10 +295,14 @@ def _forms(refs: list[str]) -> dict[str, str]:
     return out
 
 
-def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> list[str]:
+def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path,
+                   concepts: dict[str, list[str]] | None = None) -> list[str]:
     """A decision already implemented by another node's exported symbol should be extended, not
     shadowed: warn when this node exports a *new* top-level symbol for an ID others already own.
-    A symbol counts as already owned by name, wherever it lives now (a moved owner is still the owner)."""
+    A symbol counts as already owned by name, wherever it lives now (a moved owner is still the owner).
+    Ownership belongs to a concept, not to every decision: only IDs a concept claim names (`concepts`,
+    {decision ID: [concept names]}, see concepts.py) are checked. A cross-cutting decision that eight nodes
+    implement is not a smell, so without a concept claim the ID is not checked at all."""
     notes: list[str] = []
     mine = _symbol_keys(h.exports)
     mine_forms, other_forms = _forms(h.exports), {}
@@ -319,6 +323,8 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> 
             declared.add(mine_forms[left])
     mine = {k for k in mine if k not in declared}
     for decision in h.implements:
+        if decision not in (concepts or {}):
+            continue
         for other, info in sorted(nodes.items()):
             if other == node or not (s := root / info["spec"]).is_file():
                 continue
@@ -330,7 +336,7 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> 
             new = sorted(k for k in mine - theirs if k.rpartition("::")[2] not in owned_names)
             if theirs and new:
                 beside = sorted({t for t in theirs for k in new if t.partition("::")[0] == k.partition("::")[0]})
-                notes.append(f"{decision} is already owned by {', '.join(sorted(theirs))} (node {other}); this node "
+                notes.append(f"{decision} ({', '.join(concepts[decision])}) is already owned by {', '.join(sorted(theirs))} (node {other}); this node "
                              f"exports new {', '.join(new)}. Extend the existing symbol rather than adding a parallel one"
                              + (f" (if this node modifies {', '.join(beside)}, export that or its methods instead)" if beside else "")
                              + "? If deliberate, declare `refines: New=Existing` or `distinct: New=Existing`.")
@@ -338,14 +344,14 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> 
 
 
 def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str, node: str = "",
-              fixes: dict | None = None) -> list[str]:
+              fixes: dict | None = None, concepts: dict[str, list[str]] | None = None) -> list[str]:
     """Header problems that are visible in the repository and would starve a node's context bundle,
     each with the fix. When `fixes` is given, the mechanical ones are also collected in it:
     {"add": {field: [items]}, "remove": {field: [items]}}."""
     if fixes is not None:
         fixes.setdefault("add", {})
         fixes.setdefault("remove", {})
-    notes: list[str] = ownership_lint(h, node, nodes, root) if node else []
+    notes: list[str] = ownership_lint(h, node, nodes, root, concepts) if node else []
     own_files: set[str] = set()
     exported: set[str] = set(h.exports)
     for ref in h.exports:

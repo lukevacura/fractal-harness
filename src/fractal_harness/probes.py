@@ -11,7 +11,8 @@ Probe shapes:
    "concept": "ranking expression"}   # single ownership: the pattern appears in `files` and nowhere else
   {"type": "only_in", "kind": "struct", "name": "Nearest\\w*", "paths": ["src/**/*.rs"], "files": ["src/nearest.rs"]}
       # the same claim for a symbol kind (struct|enum|trait|class|fn|def): every definition whose
-      # name matches `name` is in `files`. Optional `exclude`/`exclude_paths` as for grep. Passes when
+      # name matches `name` is in `files`. `decision` (an ID or a list) names the decisions the concept owns:
+      # the ownership lint on nodes' exports applies to those IDs only (IDs in `concept` count too). Optional `exclude`/`exclude_paths` as for grep. Passes when
       # there is at least one match in `files` (`"min": 0` allows none) and none elsewhere.
 
   {"type": "all", "probes": [<probe>, ...]}  # passes only if every sub-probe passes
@@ -130,6 +131,9 @@ def validate(probe: dict) -> None:
                 raise ProbeError(f"only_in probe needs '{key}' (a non-empty list of globs/paths)")
         if not isinstance(probe.get("exclude_paths", []), list) or not isinstance(probe.get("min", 1), int):
             raise ProbeError("'exclude_paths' must be a list of globs and 'min' an integer")
+        d = probe.get("decision", [])
+        if not isinstance(d, (str, list)) or not all(isinstance(x, str) for x in ([d] if isinstance(d, str) else d)):
+            raise ProbeError("'decision' must be a decision ID or a list of them")
     elif kind in GATE_TYPES:
         keys = ("forbid", "only") if kind == "staged_paths" else ("forbid", "require")
         if not any(k in probe for k in keys):

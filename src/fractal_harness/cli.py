@@ -160,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
     oi.add_argument("--in", dest="files", action="append", required=True, help="the owner file or glob (repeatable)")
     oi.add_argument("--paths", action="append", required=True, help="where to look (glob, repeatable)")
     oi.add_argument("--exclude", help="skip lines matching this regex")
+    oi.add_argument("--decision", action="append", default=[], metavar="ID",
+                    help="a decision this concept owns (repeatable); the ownership lint applies to these IDs only")
     cn = sub.add_parser("concepts", help="the registry of single-ownership claims: concept -> owner -> still true?")
     cn.add_argument("--write", metavar="FILE", help="also save it as markdown")
     rc = sub.add_parser("reclaim", help="propose (and with --verify/--apply, carry out) deleting what nothing reaches")
@@ -430,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
                     probe["name"] = args.name
             if args.exclude:
                 probe["exclude"] = args.exclude
+            if args.decision:
+                probe["decision"] = args.decision
             from . import probes
             held = probes.run(probe, root)
             if not held.passed:
