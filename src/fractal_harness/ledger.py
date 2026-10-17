@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import re
 import subprocess
+import difflib
 from pathlib import Path
 
 from .cache import ClaimCache
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
-from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint, spec_lint
+from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint, spec_key, spec_lint, edit_header
 from .store import GOOD
 from .symbols import SymbolError, digest, symbol_of
 
@@ -64,7 +65,8 @@ def node_commit(cache: ClaimCache, root: Path, node: str, commit: str | None = N
 
 
 def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
-                  id_pattern: str = DEFAULT_ID_PATTERN, branch: str | None = None) -> dict:
+                  id_pattern: str = DEFAULT_ID_PATTERN, branch: str | None = None, fix: bool = False,
+                  dry_run: bool = False) -> dict:
     """Record which spec and which premises the node's verdicts rest on. With a spec header the
     premises are exactly its declared `implements` decisions and `parents` contracts; without one
     (legacy) they are whatever the text cites. Re-run after the spec changes and the node has been
@@ -74,6 +76,18 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
         raise SymbolError(f"no such spec: {spec}")
     text = f.read_text(errors="replace")
     h = parse_header(text)
+    diff = ""
+    if fix and h is not None:
+        fixes: dict = {}
+        repo_lint(root, h, cache.store.all_nodes(), text, node, fixes)
+        if any(fixes["add"].values()) or any(fixes["remove"].values()):
+            new = edit_header(text, fixes["add"], fixes["remove"])
+            diff = "".join(difflib.unified_diff(text.splitlines(True), new.splitlines(True), f"a/{spec}", f"b/{spec}"))
+            if dry_run:
+                return {"spec": spec, "premises": {"decisions": [], "parents": {}}, "uncited": [], "declared": True,
+                        "lint": [], "autoregistered": [], "diff": diff, "dry_run": True}
+            f.write_text(new)
+            text, h = new, parse_header(new)
     edges = cache.store.all()
     registered: list[str] = []
     failed: dict[str, str] = {}
@@ -99,14 +113,15 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
     keep = premises_of(prev).get("branch") if prev else None
     if branch or keep:
         premises["branch"] = branch or keep
-    cache.store.put_node(node, spec, digest(text), premises)
+    premises["prose_sha"] = digest(text)         # the whole text, to say when only prose moved
+    cache.store.put_node(node, spec, digest(spec_key(text)), premises)
     notes = []
     if h:
         notes = lint(h) + spec_lint(text) + repo_lint(root, h, cache.store.all_nodes(), text, node)
         notes += [f"{i} has no claim ({failed.get(i, 'not found')}); `fractal put --section DECISIONS.md::{i}`"
                   for i in missing]
     return {"spec": spec, "premises": premises, "uncited": [] if h else missing, "declared": h is not None,
-            "lint": notes, "autoregistered": registered}
+            "lint": notes, "autoregistered": registered, "diff": diff}
 
 
 def record(cache: ClaimCache, root: Path, node: str, *, file: str, span: str, mutant: str, result: str,
@@ -216,16 +231,24 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
     info = cache.store.get_node(node)
     children: list[str] = []
     changed_export: tuple[str, str] | None = None
+    prose_changed = None
     oracle = ""
     if info:
         if (sp := root / info["spec"]).is_file():
             oh = parse_header(sp.read_text(errors="replace"))
             oracle = oh.oracle if oh else ""
         spec = root / info["spec"]
-        if not spec.is_file() or digest(spec.read_text(errors="replace")) != info["spec_sha"]:
+        stext = spec.read_text(errors="replace") if spec.is_file() else None
+        try:
+            keyed = stext is not None and info["spec_sha"] in (digest(spec_key(stext)), digest(stext))
+        except SymbolError:
+            keyed = False
+        if not keyed:
             node_reason = f"spec {info['spec']} changed"
         else:
             pre = premises_of(info)
+            if pre.get("prose_sha") and digest(stext) != pre["prose_sha"]:
+                prose_changed = info["spec"]
             for pid in pre["decisions"]:
                 e = cache.store.get(pid)
                 if e is None:
@@ -284,7 +307,7 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
     base = max(rows, key=lambda r: r["ts"])["commit"]
     return {"node": node, "base": base, "stale": [(r, why) for r, why in stale],
             "valid": [r for r, _ in valid], "node_reason": node_reason,
-            "open": [r for r, _ in valid if r["result"] == "survived"], "required": required,
+            "open": [r for r, _ in valid if r["result"] == "survived"], "required": required, "prose_changed": prose_changed,
             "narrow": _narrow(root, rows, changed_export) if changed_export else None,
             "children": children, "against": against, "changed": sorted(changed_files), "test_files": sorted(test_files), "files": sorted({r["file"] for r in rows})}
 
@@ -343,6 +366,16 @@ def render(p: dict, with_arguments: bool = False, diff: bool = True, root: Path 
     if p["children"]:
         out += ["", f"Nodes that assume this one's contract: {', '.join(p['children'])}. Changing its guarantee, "
                     "condition or exports stales them."]
+    if p.get("prose_changed") and not p["node_reason"]:
+        out += ["", f"{p['prose_changed']}'s prose changed since it was registered. Its header and design points did "
+                    "not, so the verdicts stand; read the change in case a requirement moved:"]
+        if root is not None and diff:
+            try:
+                text = _git(root, "diff", "--no-color", p["base"], "--", p["prose_changed"])
+            except SymbolError:
+                text = ""
+            if text:
+                out += ["", "```diff", text[:MAX_DIFF_CHARS].rstrip(), "```"]
     if p["node_reason"]:
         out += ["", f"Everything is stale: {p['node_reason']}. Re-verify the node in full."]
     if n := p.get("narrow"):

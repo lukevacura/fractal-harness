@@ -98,7 +98,8 @@ def test_child_stales_on_parent_contract_not_on_grandparent_or_parent_prose(tmp_
     assert p("stats")["node_reason"] == "parent gp's contract changed: its guarantee or condition changed"  # ...but it is stats's
     (tmp_path / "stats.md").write_text((tmp_path / "stats.md").read_text().replace("prose", "other prose"))
     assert p()["node_reason"] is None                                   # parent's own spec changed, contract didn't
-    assert p("stats")["node_reason"] == "spec stats.md changed"   # (spec check precedes parents)
+    assert p("stats")["prose_changed"] == "stats.md"      # prose is not part of the key: noted, not stale
+    assert "spec stats.md changed" not in str(p("stats")["node_reason"])
     (tmp_path / "stats.md").write_text(_spec(parents="gp", guarantee="Exact windowed mean.",
                                              condition="For every window.", exports="lib.rs::update"))
     assert p()["node_reason"] == "parent stats's contract changed: its guarantee or condition changed"   # condition is part of the contract
@@ -418,3 +419,56 @@ def test_ownership_lint_frictions_moved_owner_and_symbol_forms(tmp_path):
     assert "`Name`, `file::Name` or `Name::method`" in note and "src/n.rs::NearestK" in note
     note = next(n for n in ledger.register_node(c, tmp_path, "beside", "beside.md")["lint"] if "owned" in n)
     assert "if this node modifies src/n.rs::Nearest" in note
+
+
+def test_spec_prose_does_not_stale_but_header_and_design_points_do(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    spec = "---\nguarantee: g\nsee: x\n---\n# Node\nSome prose.\n\n## Design\n- [binding] use NaN\n"
+    (tmp_path / "n.md").write_text(spec)
+    (tmp_path / "f.rs").write_text("fn a() {}\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "c1")
+    ledger.register_node(c, tmp_path, "n", "n.md")
+    ledger.record(c, tmp_path, "n", file="f.rs", span="1", mutant="m", result="killed", tests=["t"])
+    plan = lambda: ledger.plan(c, tmp_path, "n")
+    (tmp_path / "n.md").write_text(spec.replace("Some prose.", "Orchestrator note.").replace("see: x", "see: y"))
+    p = plan()
+    assert p["node_reason"] is None and p["prose_changed"] == "n.md" and not p["stale"]
+    assert "prose changed" in ledger.render(p, root=tmp_path)
+    (tmp_path / "n.md").write_text(spec.replace("use NaN", "use zero"))
+    assert plan()["node_reason"] == "spec n.md changed"
+    (tmp_path / "n.md").write_text(spec.replace("guarantee: g", "guarantee: h"))
+    assert plan()["node_reason"] == "spec n.md changed"
+    (tmp_path / "n.md").write_text(spec)
+    assert plan()["node_reason"] is None and plan()["prose_changed"] is None
+
+
+def test_edit_header_adds_removes_and_keeps_comments():
+    from fractal_harness.nodes import edit_header
+    text = _spec(parents="a", exports="f.rs::T") .replace("parents: a", "parents: a   # uses a").replace(
+        "---\n# Body", "after: b\n---\n# Body")
+    out = edit_header(text, {"parents": ["b", "a"], "exports": ["f.rs::T::m"], "public": ["Z"]}, {"after": ["b"]})
+    h = parse_header(out)
+    assert h.parents == ["a", "b"] and h.exports == ["f.rs::T", "f.rs::T::m"] and h.public == ["Z"] and h.after == []
+    assert "# uses a" in out and out.endswith("# Body text\nprose\n")
+
+
+def test_ledger_node_fix_writes_missing_parent_and_methods(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "stats.rs").write_text(STATS_RS)
+    (tmp_path / "src" / "grow.rs").write_text("use crate::stats::WindowStats;\npub fn grow() {}\n")
+    (tmp_path / "stats.md").write_text(_spec(guarantee="g", exports="src/stats.rs::WindowStats"))
+    (tmp_path / "grow.md").write_text(_spec(after="stats", guarantee="g", exports="src/grow.rs::grow"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "stats", "stats.md", fix=True, dry_run=True)
+    assert parse_header((tmp_path / "stats.md").read_text()).exports == ["src/stats.rs::WindowStats"]   # dry run wrote nothing
+    r = ledger.register_node(c, tmp_path, "stats", "stats.md", fix=True)
+    assert "+exports:" in r["diff"] and "WindowStats::push" in r["diff"]
+    assert not any("public methods are not exported" in n for n in r["lint"])
+    r = ledger.register_node(c, tmp_path, "grow", "grow.md", fix=True)
+    h = parse_header((tmp_path / "grow.md").read_text())
+    assert h.parents == ["stats"] and h.after == [] and r["premises"]["parents"]
+    assert not any("module" in n for n in r["lint"])

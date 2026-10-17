@@ -21,6 +21,7 @@ the mutant ledger watches, so a parent's contract changing stales exactly its ch
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -112,6 +113,61 @@ def spec_lint(text: str) -> list[str]:
     shown = "; ".join(p[:50] for p in unmarked[:3])
     return [f"{len(unmarked)} design point(s) are not marked `[binding]` or `[advisory]` ({shown}"
             f"{'...' if len(unmarked) > 3 else ''}); an implementer cannot tell which they may override"]
+
+
+def spec_key(text: str) -> str:
+    """What a node's verdicts rest on in its spec: the header fields that change what the code must do
+    (parents, implements, exports, guarantee, condition, oracle) and the design points. Other prose and the
+    lint-only fields (see, after, public, refines, distinct) are not part of it. A spec with no header is
+    its own key."""
+    h = parse_header(text)
+    if h is None:
+        return text
+    keyed = {k: (sorted(getattr(h, k)) if isinstance(getattr(h, k), list) else getattr(h, k))
+             for k in ("parents", "implements", "exports", "guarantee", "condition", "oracle")}
+    return json.dumps(keyed, sort_keys=True) + "\n" + "\n".join(" ".join(p.split()) for p in design_points(text))
+
+
+def edit_header(text: str, add: dict[str, list[str]] | None = None, remove: dict[str, list[str]] | None = None) -> str:
+    """The spec with items added to or removed from list fields of its front matter. A touched field is
+    rewritten (wrapped) and keeps the trailing comment of its first line; an absent one is appended."""
+    lines = text.splitlines(keepends=True)
+    if not lines or not re.match(r"---[ \t]*$", lines[0]):
+        raise SymbolError("the spec has no front matter to edit")
+    end = next((i for i in range(1, len(lines)) if re.match(r"---[ \t]*$", lines[i])), None)
+    if end is None:
+        raise SymbolError("the spec's front matter is not closed")
+    for field_name in dict.fromkeys([*(add or {}), *(remove or {})]):
+        start = next((i for i in range(1, end) if re.match(rf"{field_name}:", lines[i])), None)
+        items: list[str] = []
+        comment, stop = "", None
+        if start is not None:
+            stop = start + 1
+            while stop < end and lines[stop][:1] in (" ", "\t"):
+                stop += 1
+            if c := re.search(r"\s+(#.*)$", lines[start].rstrip("\n")):
+                comment = c.group(1)
+            raw = " ".join(re.sub(r"\s+#.*$", "", l.rstrip()) for l in lines[start:stop])
+            items = [x for x in re.split(r"[,\s]+", raw.partition(":")[2]) if x]
+        items = [x for x in items if x not in (remove or {}).get(field_name, [])]
+        items += [x for x in (add or {}).get(field_name, []) if x not in items]
+        out, cur = [], f"{field_name}:"
+        for k, item in enumerate(items):
+            piece = item + ("," if k < len(items) - 1 else "")
+            if len(cur) + len(piece) + 1 > 100 and cur.strip() != f"{field_name}:":
+                out.append(cur.rstrip() + "\n")
+                cur = "  "
+            cur += (" " if not cur.endswith(" ") else "") + piece
+        out.append(cur + (f"   {comment}" if comment else "") + "\n")
+        if not items:
+            out = []
+        if start is None:
+            lines[end:end] = out
+            end += len(out)
+        else:
+            lines[start:stop] = out
+            end += len(out) - (stop - start)
+    return "".join(lines)
 
 
 def contract(root: Path, spec_path: str, exports: int | None = None) -> str:
@@ -281,9 +337,14 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> 
     return notes
 
 
-def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str, node: str = "") -> list[str]:
+def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str, node: str = "",
+              fixes: dict | None = None) -> list[str]:
     """Header problems that are visible in the repository and would starve a node's context bundle,
-    each with the fix."""
+    each with the fix. When `fixes` is given, the mechanical ones are also collected in it:
+    {"add": {field: [items]}, "remove": {field: [items]}}."""
+    if fixes is not None:
+        fixes.setdefault("add", {})
+        fixes.setdefault("remove", {})
     notes: list[str] = ownership_lint(h, node, nodes, root) if node else []
     own_files: set[str] = set()
     exported: set[str] = set(h.exports)
@@ -305,6 +366,8 @@ def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str,
         if TYPE_RE.search(first):
             missing = [m for m in _methods(f.read_text(errors="replace"), name) if f"{ref}::{m}" not in exported]
             if missing:
+                if fixes is not None:
+                    fixes["add"].setdefault("exports", []).extend(f"{ref}::{m}" for m in missing)
                 shown = ", ".join(missing[:MAX_NAMES]) + (f", +{len(missing) - MAX_NAMES} more" if len(missing) > MAX_NAMES else "")
                 notes.append(f"export `{ref}` is a type but its public methods are not exported ({shown}); "
                              f"children would see the definition and not how to call it. Add `{ref}::<method>`")
@@ -327,6 +390,10 @@ def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str,
         if not files or any(f in parent_files or f in own_files for f in files):
             continue
         who = next((owner[f] for f in files if f in owner), None)
+        if fixes is not None and who and who != node:
+            fixes["add"].setdefault("parents", []).append(who)
+            if who in h.after:
+                fixes["remove"].setdefault("after", []).append(who)
         if who in h.after:
             notes.append(f"the node uses module `{mod}` ({files[0]}) but declares {who} only `after:` (sequencing, "
                          f"not a dependency); move it to `parents:`")

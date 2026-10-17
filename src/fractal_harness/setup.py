@@ -258,6 +258,39 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
     return done
 
 
+def _worktree_checks(root: Path) -> list[tuple[bool, str]]:
+    """Per worktree: uncommitted changes against its own branch head, and leftover proptest-regressions/."""
+    import subprocess
+    def git(cwd: str, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True).stdout
+    trees, cur = [], {}
+    for line in git(str(root), "worktree", "list", "--porcelain").splitlines() + [""]:
+        if not line:
+            if cur.get("worktree"):
+                trees.append(cur)
+            cur = {}
+        else:
+            k, _, v = line.partition(" ")
+            cur[k] = v
+    out, bad = [], 0
+    for t in trees:
+        path, name = t["worktree"], t.get("branch", "detached").removeprefix("refs/heads/")
+        dirty = [l for l in git(path, "status", "--porcelain", "--untracked-files=no").splitlines() if l.strip()]
+        leftovers = sorted({l for l in git(path, "ls-files", "--cached", "--others", "--exclude-standard").splitlines()
+                            if "proptest-regressions/" in l})
+        if dirty:
+            bad += 1
+            out.append((False, f"worktree {path} ({name}): {len(dirty)} uncommitted change(s) against its branch head, "
+                               f"e.g. {dirty[0][3:]}"))
+        if leftovers:
+            bad += 1
+            out.append((False, f"worktree {path} ({name}): leftover {leftovers[0]}" +
+                               (f" (+{len(leftovers) - 1} more)" if len(leftovers) > 1 else "")))
+    if len(trees) > 1 or bad:
+        out.append((bad == 0, f"{len(trees)} worktree(s), {'all clean' if not bad else f'{bad} problem(s)'}"))
+    return out
+
+
 def doctor(root: Path) -> list[tuple[bool, str]]:
     """Checks that `root` is ready; returns (ok, message) pairs."""
     checks: list[tuple[bool, str]] = []
@@ -299,6 +332,9 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
             ("UserPromptSubmit", PROMPT_HOOK), ("Stop", STOP_HOOK), ("PreToolUse", PRE_EDIT_HOOK),
             ("SubagentStart", AGENT_HOOK), ("PostToolUse", EDIT_HOOK))),
             "no fractal hooks in the shared .claude/settings.json (re-run `fractal init` to move them)"))
+
+    if git("rev-parse", "--git-dir").returncode == 0:
+        checks += _worktree_checks(root)
 
     cache = ClaimCache(root)
     try:

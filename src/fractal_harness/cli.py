@@ -121,6 +121,9 @@ def main(argv: list[str] | None = None) -> int:
     ln.add_argument("--spec", required=True)
     ln.add_argument("--id-pattern")
     ln.add_argument("--branch", help="the node's branch: verdicts default to its tip (else `node-<name>`, else HEAD)")
+    ln.add_argument("--fix", action="store_true", help="write the missing parents/exports the header lint computes "
+                    "into the spec (prints the diff; the spec is yours to commit)")
+    ln.add_argument("--dry-run", action="store_true", help="with --fix: print the diff, change nothing")
     lx = lsub.add_parser("rm", help="deregister a node that left the DAG (it stops counting as a child)")
     lx.add_argument("node")
     lx.add_argument("--forget-verdicts", action="store_true", help="also delete its recorded verdicts")
@@ -340,7 +343,12 @@ def main(argv: list[str] | None = None) -> int:
             if args.ledger_cmd == "node":
                 from .context import DEFAULT_ID_PATTERN
                 r = ledger.register_node(cache, root, args.node, args.spec, args.id_pattern or DEFAULT_ID_PATTERN,
-                                      args.branch)
+                                      args.branch, args.fix, args.dry_run)
+                if r.get("diff"):
+                    print(r["diff"], end="")
+                if r.get("dry_run"):
+                    print("(dry run: nothing written or registered)")
+                    return 0
                 pre = r["premises"]
                 print(f"{args.node}: spec {r['spec']}, " + (f"{len(pre['parents'])} parent(s), " if r["declared"]
                       else "premises inferred from the text, ") + f"{len(pre['decisions'])} decision claim(s)"

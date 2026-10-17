@@ -139,3 +139,26 @@ def test_verify_skill_is_installed_and_its_example_records(tmp_path: Path):
     (tmp_path / "v.json").write_text(example)
     assert main(["--root", str(tmp_path), "ledger", "record", "n", "--json", str(tmp_path / "v.json")]) == 0
     assert main(["--root", str(tmp_path), "verify-plan", "n"]) == 0
+
+
+def test_doctor_flags_dirty_worktrees_and_leftover_proptest_regressions(tmp_path: Path):
+    import subprocess
+    def git(cwd, *a):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, check=True, capture_output=True)
+    main = tmp_path / "main"
+    main.mkdir()
+    git(main, "init", "-q")
+    (main / "a.txt").write_text("1\n")
+    git(main, "add", "-A")
+    git(main, "commit", "-qm", "c1")
+    wt = tmp_path / "wt"
+    git(main, "worktree", "add", "-q", "-b", "node-x", str(wt))
+    msgs = [m for ok, m in doctor(main) if "worktree" in m]
+    assert msgs == ["2 worktree(s), all clean"]
+    (wt / "a.txt").write_text("2\n")
+    (wt / "proptest-regressions").mkdir()
+    (wt / "proptest-regressions" / "x.txt").write_text("seed\n")
+    results = [(ok, m) for ok, m in doctor(main) if "worktree" in m]
+    assert any(not ok and "1 uncommitted" in m and "node-x" in m for ok, m in results)
+    assert any(not ok and "leftover proptest-regressions/x.txt" in m for ok, m in results)
+    assert results[-1] == (False, "2 worktree(s), 2 problem(s)")
