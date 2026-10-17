@@ -150,6 +150,15 @@ oracle: equality        # tests compare two implementations: verify-plan require
 - When one parent export changes, `verify-plan` suggests starting with the mutants whose code names it.
   Every verdict still counts as stale.
 
+## Single ownership ("only here")
+
+Some invariants say a thing exists in exactly one place: one ranking expression, one kind encoding, one nearest
+order. `fractal only-in "<concept>" --pattern '<regex>' --in <owner file> --paths '<glob>'` proposes that as a rule
+(or `--kind struct --name 'Nearest\w*'` for definitions of a symbol kind). The `only_in` probe fails when the
+pattern appears anywhere else, and when the owner no longer has it (moved or renamed). It also works in the
+pre-edit hook, so a second copy is blocked before it is written. `fractal concepts [--write CONCEPTS.md]` prints the
+registry generated from these claims: concept, owner, and whether it still holds.
+
 ## Region tree
 
 Claims live on a capacity-bounded tree over the code's own address space (directories →

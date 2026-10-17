@@ -7,6 +7,13 @@ Probe shapes:
    "exclude_paths": ["src/legacy/*.py"],  # optional: files the rule does not cover
    "expect": "present" | "absent" | {"count": 3} | {"min": 1}}
 
+  {"type": "only_in", "pattern": "fn rank_key", "paths": ["src/**/*.rs"], "files": ["src/rank.rs"],
+   "concept": "ranking expression"}   # single ownership: the pattern appears in `files` and nowhere else
+  {"type": "only_in", "kind": "struct", "name": "Nearest\\w*", "paths": ["src/**/*.rs"], "files": ["src/nearest.rs"]}
+      # the same claim for a symbol kind (struct|enum|trait|class|fn|def): every definition whose
+      # name matches `name` is in `files`. Optional `exclude`/`exclude_paths` as for grep. Passes when
+      # there is at least one match in `files` (`"min": 0` allows none) and none elsewhere.
+
   {"type": "all", "probes": [<probe>, ...]}  # passes only if every sub-probe passes
   {"type": "test", "runner": "flutter" | "dart" | "pytest", "file": "test/x_test.dart"}
       # a behavioral probe: the test file passes. Slow (seconds): never run in the
@@ -52,6 +59,15 @@ class ProbeError(ValueError):
 
 
 RUNNERS = {"flutter", "dart", "pytest"}
+KINDS = {"struct", "enum", "trait", "class", "fn", "def", "type"}
+
+
+def only_in_pattern(probe: dict) -> str:
+    """The regex an `only_in` probe looks for: its `pattern`, or the definitions of `kind` named `name`."""
+    if "pattern" in probe:
+        return probe["pattern"]
+    return (rf"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+|unsafe\s+|const\s+)*{probe['kind']}\s+"
+            rf"(?:{probe.get('name', r'\w+')})\b")
 
 
 def is_slow(probe: dict | None) -> bool:
@@ -97,6 +113,22 @@ def validate(probe: dict) -> None:
         if not isinstance(probe.get("exclude_paths", []), list):
             raise ProbeError("'exclude_paths' must be a list of globs")
         _expectation(probe.get("expect", "present"))
+    elif kind == "only_in":
+        if ("pattern" in probe) == ("kind" in probe):
+            raise ProbeError("only_in probe needs exactly one of 'pattern' or 'kind' (+ optional 'name')")
+        if "kind" in probe and probe["kind"] not in KINDS:
+            raise ProbeError(f"only_in kind must be one of {sorted(KINDS)}")
+        try:
+            re.compile(only_in_pattern(probe))
+            if "exclude" in probe:
+                re.compile(probe["exclude"])
+        except (re.error, TypeError) as e:
+            raise ProbeError(f"invalid regex: {e}") from e
+        for key in ("paths", "files"):
+            if not isinstance(probe.get(key), list) or not probe[key] or not all(isinstance(g, str) for g in probe[key]):
+                raise ProbeError(f"only_in probe needs '{key}' (a non-empty list of globs/paths)")
+        if not isinstance(probe.get("exclude_paths", []), list) or not isinstance(probe.get("min", 1), int):
+            raise ProbeError("'exclude_paths' must be a list of globs and 'min' an integer")
     elif kind in GATE_TYPES:
         keys = ("forbid", "only") if kind == "staged_paths" else ("forbid", "require")
         if not any(k in probe for k in keys):
@@ -157,6 +189,8 @@ def run(probe: dict, root: Path, overlay: dict[str, str] | None = None,
         if failed:
             return ProbeResult(False, "; ".join(failed), matches)
         return ProbeResult(True, f"all {len(results)} probes passed", matches)
+    if probe["type"] == "only_in":
+        return _run_only_in(probe, root, overlay)
     return _run_grep(probe, root, overlay)
 
 
@@ -189,10 +223,10 @@ def _expectation(expect: object) -> tuple[str, int]:
     raise ProbeError(f"invalid grep expectation: {expect!r}")
 
 
-def _run_grep(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> ProbeResult:
-    pattern = re.compile(probe["pattern"])
+def _scan(pattern: str, probe: dict, root: Path, overlay: dict[str, str] | None) -> tuple[int, list[tuple[str, int]]]:
+    """(files scanned, every (file, 0-based line) matching `pattern`) over the probe's paths."""
+    rx = re.compile(pattern)
     exclude = re.compile(probe["exclude"]) if probe.get("exclude") else None
-    op, n = _expectation(probe.get("expect", "present"))
     files: set[Path] = set()
     for glob in probe["paths"]:
         files.update(p for p in root.glob(glob) if p.is_file())
@@ -202,23 +236,42 @@ def _run_grep(probe: dict, root: Path, overlay: dict[str, str] | None = None) ->
     if probe.get("exclude_paths"):
         files = {f for f in files if not any(matches(g, f.relative_to(root).as_posix())
                                              for g in probe["exclude_paths"])}
-    count = 0
-    matches: list[tuple[str, int]] = []
+    hits: list[tuple[str, int]] = []
     for path in sorted(files):
         rel = path.relative_to(root).as_posix()
         try:
             text = overlay[rel] if overlay and rel in overlay else path.read_text(errors="replace")
         except OSError:
             continue
-        lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if pattern.search(line) and not (exclude and exclude.search(line)):
-                count += 1
-                if len(matches) < 20:
-                    matches.append((rel, i))
+        for i, line in enumerate(text.splitlines()):
+            if rx.search(line) and not (exclude and exclude.search(line)):
+                hits.append((rel, i))
+    return len(files), hits
+
+
+def _run_grep(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> ProbeResult:
+    op, n = _expectation(probe.get("expect", "present"))
+    nfiles, hits = _scan(probe["pattern"], probe, root, overlay)
+    count = len(hits)
     ok = {"count": count == n, "min": count >= n, "max": count <= n}[op]
     # An "absent" probe has no positive matches to anchor on; its anchors come from violations.
-    return ProbeResult(ok, f"{count} matching lines in {len(files)} files (expected {op} {n})", matches)
+    return ProbeResult(ok, f"{count} matching lines in {nfiles} files (expected {op} {n})", hits[:20])
+
+
+def _run_only_in(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> ProbeResult:
+    from .regions import matches
+    nfiles, hits = _scan(only_in_pattern(probe), probe, root, overlay)
+    inside = [h for h in hits if any(matches(g, h[0]) for g in probe["files"])]
+    outside = [h for h in hits if h not in inside]
+    what = probe.get("concept") or probe.get("pattern") or f"{probe['kind']} {probe.get('name', '*')}"
+    if outside:
+        where = ", ".join(sorted({f"{f}:{i + 1}" for f, i in outside})[:5])
+        return ProbeResult(False, f"{what!r} must appear only in {', '.join(probe['files'])} but also appears at "
+                                  f"{where}", outside[:20])
+    if len(inside) < probe.get("min", 1):
+        return ProbeResult(False, f"{what!r} no longer appears in {', '.join(probe['files'])} "
+                                  f"({len(inside)} of at least {probe.get('min', 1)}): moved or renamed?")
+    return ProbeResult(True, f"{what!r}: {len(inside)} match(es), all in {', '.join(probe['files'])}", inside[:20])
 
 
 def _run_gate(probe: dict, ctx: dict) -> ProbeResult:

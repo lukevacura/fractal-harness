@@ -36,7 +36,7 @@ def dependencies(e: Edge) -> list[str]:
         p = stack.pop()
         if p.get("type") == "all":
             stack.extend(p["probes"])
-        elif p.get("type") == "grep":
+        elif p.get("type") in ("grep", "only_in"):
             paths.update(p["paths"])
         elif p.get("type") in ("section", "symbol"):
             paths.add(p["ref"].partition("::")[0])

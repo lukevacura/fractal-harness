@@ -431,7 +431,7 @@ def pre_edit_violations(root: Path, rel: str, content: str, generated: int = 0) 
 def _in_memory_checkable(probe: dict) -> bool:
     if probe.get("type") == "all":
         return all(_in_memory_checkable(p) for p in probe["probes"])
-    return probe.get("type") == "grep"
+    return probe.get("type") in ("grep", "only_in")
 
 
 def pre_edit_hook(stdin: str) -> tuple[int, str]:
