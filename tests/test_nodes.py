@@ -528,3 +528,49 @@ def test_an_id_in_the_concept_name_counts_and_only_in_takes_a_decision_flag():
     assert decisions_of({}, "S5 nearest order") == ["S5"]
     assert decisions_of({"decision": ["D1", "S5"]}, "S5 order") == ["D1", "S5"]
     assert decisions_of({"decision": "D3"}, "order") == ["D3"]
+
+
+def test_planned_exports_let_a_spec_be_registered_and_depended_on_before_its_code_exists(tmp_path):
+    import pytest
+    from fractal_harness.symbols import SymbolError
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "new.md").write_text(_spec(guarantee="Will do X.", exports="src/new.rs::Thing, src/new.rs::Thing::go",
+                                           planned="src/new.rs::Thing, src/new.rs::Thing::go"))
+    (tmp_path / "child.md").write_text(_spec(parents="new", guarantee="g"))
+    (tmp_path / "typo.md").write_text(_spec(guarantee="g", exports="src/new.rs::Thing"))
+    (tmp_path / "typo_child.md").write_text(_spec(parents="typo", guarantee="g"))
+    (tmp_path / "f.rs").write_text("fn a() {}\n")
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "new", "new.md")
+    r = ledger.register_node(c, tmp_path, "child", "child.md")                     # was: error: no such file
+    assert r["premises"]["parents"]["new"]["exports"]["src/new.rs::Thing"]
+    from fractal_harness.context import bundle
+    assert "(planned: not defined yet)" in bundle(tmp_path, "child.md")
+    # an unplanned export that does not exist is still an error, and it says what to do
+    ledger.register_node(c, tmp_path, "typo", "typo.md")
+    with pytest.raises(SymbolError, match="list it under `planned:`"):
+        ledger.register_node(c, tmp_path, "typo_child", "typo_child.md")
+    # not stale while it is still planned; building it is a contract event the child is told about
+    _git(tmp_path, "commit", "-qm", "c1")
+    ledger.record(c, tmp_path, "child", file="f.rs", span="1", mutant="m", result="killed", tests=["t"])
+    assert ledger.plan(c, tmp_path, "child")["node_reason"] is None
+    (tmp_path / "src" / "new.rs").write_text("pub struct Thing;\nimpl Thing {\n    pub fn go(&self) {}\n}\n")
+    assert "is now defined (it was planned" in ledger.plan(c, tmp_path, "child")["node_reason"]
+    notes = ledger.register_node(c, tmp_path, "new", "new.md")["lint"]
+    assert any("is now defined; remove it from `planned:`" in n for n in notes)
+    ledger.register_node(c, tmp_path, "new", "new.md", fix=True)                   # --fix drops them from planned:
+    assert parse_header((tmp_path / "new.md").read_text()).planned == []
+
+
+def test_graph_check_does_not_call_a_planned_export_stale(tmp_path):
+    from fractal_harness import graph_check
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "new.md").write_text(_spec(guarantee="g", exports="src/new.rs::Thing", planned="src/new.rs::Thing"))
+    (tmp_path / "old.md").write_text(_spec(guarantee="g", exports="src/old.rs::Gone"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "new", "new.md")
+    ledger.register_node(c, tmp_path, "old", "old.md")
+    assert [m["symbol"] for m in graph_check.check(c, tmp_path)["missing"]] == ["src/old.rs::Gone"]

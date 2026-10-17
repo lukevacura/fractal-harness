@@ -2,6 +2,7 @@
 
     ---
     parents: stats, cov            # nodes whose contracts this one assumes (direct dependencies only)
+    planned: src/x.rs::T::m        # exports not written yet: a child may depend on them as "planned"
     public: src/api.rs::Reader, src/testkit/**   # intended surface nothing in the repo uses: graph-check skips it
     refines: NearestK=Nearest      # optional: a new export for an owned decision says how it relates
     after: bench                   # nodes that must come first but whose contracts this one does not use
@@ -28,7 +29,7 @@ from pathlib import Path
 
 from .symbols import SymbolError, digest, split_ref, symbol_of
 
-LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "public", "refines", "distinct")
+LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "planned", "public", "refines", "distinct")
 STR_FIELDS = ("guarantee", "condition", "oracle")
 CONDITIONAL_WORDS = re.compile(r"\b(only (?:when|if|for)|provided|unless|assuming|as long as|given that)\b", re.I)
 
@@ -38,6 +39,7 @@ class Header:
     parents: list[str] = field(default_factory=list)
     after: list[str] = field(default_factory=list)     # sequencing only: not a premise, no contract watched
     implements: list[str] = field(default_factory=list)
+    planned: list[str] = field(default_factory=list)   # exports whose code does not exist yet (spec written first)
     public: list[str] = field(default_factory=list)    # intended API with no consumer in this repo (graph-check skips it)
     refines: list[str] = field(default_factory=list)   # `New=Existing`: New extends Existing's decision, deliberately
     distinct: list[str] = field(default_factory=list)  # `New=Existing`: New is a separate concept despite the shared decision
@@ -170,6 +172,21 @@ def edit_header(text: str, add: dict[str, list[str]] | None = None, remove: dict
     return "".join(lines)
 
 
+PLANNED_TEXT = "(planned: not defined yet)"
+PLANNED_DIGEST = digest(PLANNED_TEXT)
+
+
+def _signature(root: Path, ref: str, h: "Header") -> str:
+    """An export's current signature; a `planned:` export whose code does not exist yet is the planned
+    sentinel. Any other export that cannot be found is an error that says how to declare it planned."""
+    try:
+        return symbol_of(root, ref)
+    except SymbolError as e:
+        if ref in h.planned:
+            return PLANNED_TEXT
+        raise SymbolError(f"export {ref} is not defined ({e}); if the code comes later, list it under `planned:`") from e
+
+
 def contract(root: Path, spec_path: str, exports: int | None = None) -> str:
     """The text a child may rely on: guarantee, condition, and the exports' current signatures
     (only the first `exports` of them when given)."""
@@ -184,7 +201,7 @@ def contract(root: Path, spec_path: str, exports: int | None = None) -> str:
         out.append(f"condition: {h.condition}")
     for ref in h.exports[:exports]:
         split_ref(ref)
-        out += [f"interface {ref}:", symbol_of(root, ref)]
+        out += [f"interface {ref}:", _signature(root, ref, h)]
     return "\n".join(out)
 
 
@@ -201,7 +218,7 @@ def contract_parts(root: Path, spec_path: str) -> dict:
     for ref in h.exports:
         split_ref(ref)
     return {"claim": digest(f"{h.guarantee}\n{h.condition}"),
-            "exports": {ref: digest(symbol_of(root, ref)) for ref in h.exports}}
+            "exports": {ref: digest(_signature(root, ref, h)) for ref in h.exports}}
 
 
 def contract_change(old, root: Path, spec_path: str) -> str | None:
@@ -220,6 +237,8 @@ def contract_change(old, root: Path, spec_path: str) -> str | None:
         if ref not in now["exports"]:
             return f"export {ref} was removed"
         if now["exports"][ref] != sig:
+            if sig == PLANNED_DIGEST:
+                return f"export {ref} is now defined (it was planned when this node was registered)"
             return f"export {ref} changed"
     return None
 
@@ -352,6 +371,17 @@ def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str,
         fixes.setdefault("add", {})
         fixes.setdefault("remove", {})
     notes: list[str] = ownership_lint(h, node, nodes, root, concepts) if node else []
+    for ref in h.planned:
+        if ref not in h.exports:
+            notes.append(f"`planned: {ref}` is not in `exports:`; list it there too")
+            continue
+        try:
+            symbol_of(root, ref)
+        except SymbolError:
+            continue
+        notes.append(f"export {ref} is now defined; remove it from `planned:`")
+        if fixes is not None:
+            fixes["remove"].setdefault("planned", []).append(ref)
     own_files: set[str] = set()
     exported: set[str] = set(h.exports)
     for ref in h.exports:

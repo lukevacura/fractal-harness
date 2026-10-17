@@ -135,6 +135,7 @@ see: naive              # non-binding peer examples
 guarantee: ...          # what a child may rely on
 condition: ...          # when the guarantee holds
 exports: src/x.rs::T, src/x.rs::T::m
+planned: src/x.rs::T::m     # exports whose code does not exist yet (spec first): children may depend on them
 refines: NearestK=Nearest   # a new export for an already-owned decision extends it on purpose
 distinct: Other=Nearest     # ...or is a separate concept (silences the ownership lint either way)
 oracle: equality        # tests compare two implementations: verify-plan requires the
@@ -142,6 +143,9 @@ oracle: equality        # tests compare two implementations: verify-plan require
 ---
 ```
 
+- An export that does not exist yet is an error unless the spec lists it under `planned:`. A planned export has no
+  signature, so a child sees it as "planned"; when the code appears the child's verdicts go stale once, with the reason
+  "is now defined", and `ledger node --fix` drops it from `planned:`. `graph-check` does not call it stale.
 - Under a "Design" heading, mark each list item `[binding]` (reproduce it) or `[advisory]` (override it with
   evidence, and say so). `ledger node` warns about unmarked ones.
 - `ledger node` also warns when a node exports a new symbol for a decision another node's symbol already

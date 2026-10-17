@@ -110,6 +110,8 @@ def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
             if len(name) < MIN_NAME or name in ENTRY_NAMES:
                 continue
             if path not in texts or not idx.mentions(name, path):
+                if any(r.partition("::")[0] + "::" + r.partition("::")[2].split("::")[0] == key for r in h.planned):
+                    continue                     # written ahead of its code, on purpose
                 missing.append({"node": n, "symbol": key})
                 continue
             others = _refs(idx, texts, path, name)
