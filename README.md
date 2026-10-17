@@ -162,6 +162,15 @@ reported invalid. Outcomes are memoized by the commit's tree, the edits and the 
 `--env CARGO_TARGET_DIR=/tmp/t{job}` gives parallel runs their own build directories. The executor underneath
 (`executor.py`) is the primitive other judges, such as reclamation, reuse.
 
+## Contract changes across worktrees
+
+`fractal impact <node>` compares the node's exports with the merge-base against the default branch (your working tree
+included). For each export whose definition changed or vanished, or all of them when the `guarantee:`/`condition:`
+changed, it asks the reference index which *other* live worktrees (`--branches` adds branch tips with no worktree)
+mention the item in files this checkout has no mention in: callers added elsewhere that this node's own tests cannot
+see. `verify-plan` prints the same section when it finds any. It is a warning: a mention is a word match, so confirm it
+is a real use.
+
 ## Single ownership ("only here")
 
 Some invariants say a thing exists in exactly one place: one ranking expression, one kind encoding, one nearest
