@@ -392,3 +392,29 @@ def test_refines_target_must_be_exported_by_another_node(tmp_path):
     notes = ledger.register_node(c, tmp_path, "typo", "typo.md")["lint"]
     assert any("`Nearst` is not exported" in n and "n.rs::Nearest" in n for n in notes)
     assert not any("not exported" in n for n in ledger.register_node(c, tmp_path, "ok", "ok.md")["lint"])
+
+
+def test_ownership_lint_frictions_moved_owner_and_symbol_forms(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
+    (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="src/n.rs::Nearest"))
+    # the modifier exports the owner's type from where it lives now: still the owner, not a new symbol
+    (tmp_path / "moved.md").write_text(_spec(implements="S5", guarantee="g", exports="src/nearest/mod.rs::Nearest"))
+    # every spelling of both sides is accepted
+    for i, (left, right) in enumerate([("NearestK", "Nearest"), ("src/n.rs::NearestK", "src/n.rs::Nearest"),
+                                       ("NearestK::go", "Nearest")]):
+        (tmp_path / f"r{i}.md").write_text(_spec(implements="S5", guarantee="g", exports="src/n.rs::NearestK::go",
+                                                 refines=f"{left}={right}"))
+    (tmp_path / "bad.md").write_text(_spec(implements="S5", guarantee="g", exports="src/n.rs::NearestK", refines="Nope"))
+    (tmp_path / "beside.md").write_text(_spec(implements="S5", guarantee="g", exports="src/n.rs::Helper"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "a", "a.md")
+    assert not any("owned" in n for n in ledger.register_node(c, tmp_path, "moved", "moved.md")["lint"])
+    for i in range(3):
+        notes = ledger.register_node(c, tmp_path, f"r{i}", f"r{i}.md")["lint"]
+        assert not any("owned" in n or "must be" in n for n in notes), (i, notes)
+    note = next(n for n in ledger.register_node(c, tmp_path, "bad", "bad.md")["lint"] if "must be" in n)
+    assert "`Name`, `file::Name` or `Name::method`" in note and "src/n.rs::NearestK" in note
+    note = next(n for n in ledger.register_node(c, tmp_path, "beside", "beside.md")["lint"] if "owned" in n)
+    assert "if this node modifies src/n.rs::Nearest" in note

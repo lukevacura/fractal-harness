@@ -161,6 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     cn.add_argument("--write", metavar="FILE", help="also save it as markdown")
     gc = sub.add_parser("graph-check", help="warn about dead exports and phantom parent edges (declared graph vs code)")
     gc.add_argument("node", nargs="?", help="only this node's exports and parents")
+    gc.add_argument("--strict", action="store_true", help="exit 1 when anything is reported (a commit probe)")
     cx = sub.add_parser("context", help="one bounded bundle for a spec: its cited decisions, interfaces and rules")
     cx.add_argument("spec", help="path to the spec (markdown)")
     cx.add_argument("--id-pattern", help="regex for the IDs a spec cites (default: letters + digits, e.g. D16)")
@@ -388,6 +389,11 @@ def main(argv: list[str] | None = None) -> int:
                     probe["name"] = args.name
             if args.exclude:
                 probe["exclude"] = args.exclude
+            from . import probes
+            held = probes.run(probe, root)
+            if not held.passed:
+                raise CacheError(f"the rule does not hold now, so it would be created failing: {held.detail}. "
+                                 "Fix the pattern/--in, or the code, first")
             e = cache.put(f"{args.concept} is defined only in {', '.join(args.files)}", args.files, kind="invariant",
                           probe=probe)
             _emit(args, [e])
@@ -404,6 +410,8 @@ def main(argv: list[str] | None = None) -> int:
             from . import graph_check
             r = graph_check.check(cache, root, args.node)
             print(json.dumps(r, indent=2) if args.json else graph_check.render(r), end="")
+            if args.strict and any(r.values()):
+                return 1
         elif args.cmd == "verify-plan":
             from . import ledger
             print(ledger.render(ledger.plan(cache, root, args.node, args.against), args.with_arguments,

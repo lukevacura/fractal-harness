@@ -67,3 +67,18 @@ def test_cli_only_in_and_concepts_registry(tmp_path, capsys):
     c.close()
     main(base + ["concepts"])
     assert "failed" in capsys.readouterr().out
+
+
+def test_kind_name_with_anchors_matches_the_whole_identifier_and_a_failing_rule_is_refused(tmp_path, capsys):
+    _repo(tmp_path)
+    (tmp_path / "src" / "other.rs").write_text("pub fn r_bias() {}\nfn r_bias_2() {}\n")
+    probe = {"type": "only_in", "kind": "fn", "name": "^r_bias$", "paths": ["src/**/*.rs"], "files": ["src/other.rs"]}
+    assert probes.run(probe, tmp_path).passed                      # r_bias_2 is a different identifier
+    base = ["--root", str(tmp_path)]
+    assert main(base + ["only-in", "bias", "--kind", "fn", "--name", "^r_bias$", "--in", "src/other.rs",
+                        "--paths", "src/**/*.rs"]) == 0
+    capsys.readouterr()
+    # a rule that already fails is an error at creation, not a failing claim
+    assert main(base + ["only-in", "bias", "--kind", "fn", "--name", "r_bias", "--in", "src/nearest.rs",
+                        "--paths", "src/**/*.rs"]) == 1
+    assert "created failing" in capsys.readouterr().err

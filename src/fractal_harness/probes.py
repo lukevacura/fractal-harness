@@ -66,8 +66,9 @@ def only_in_pattern(probe: dict) -> str:
     """The regex an `only_in` probe looks for: its `pattern`, or the definitions of `kind` named `name`."""
     if "pattern" in probe:
         return probe["pattern"]
+    name = probe.get("name", r"\w+").removeprefix("^").removesuffix("$")    # `name` is the whole identifier already
     return (rf"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+|unsafe\s+|const\s+)*{probe['kind']}\s+"
-            rf"(?:{probe.get('name', r'\w+')})\b")
+            rf"(?:{name})\b")
 
 
 def is_slow(probe: dict | None) -> bool:

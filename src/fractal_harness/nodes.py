@@ -2,6 +2,7 @@
 
     ---
     parents: stats, cov            # nodes whose contracts this one assumes (direct dependencies only)
+    public: src/api.rs::Reader, src/testkit/**   # intended surface nothing in the repo uses: graph-check skips it
     refines: NearestK=Nearest      # optional: a new export for an owned decision says how it relates
     after: bench                   # nodes that must come first but whose contracts this one does not use
     implements: D18                # decisions this node must reproduce, taken in full
@@ -26,7 +27,7 @@ from pathlib import Path
 
 from .symbols import SymbolError, digest, split_ref, symbol_of
 
-LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "refines", "distinct")
+LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "public", "refines", "distinct")
 STR_FIELDS = ("guarantee", "condition", "oracle")
 CONDITIONAL_WORDS = re.compile(r"\b(only (?:when|if|for)|provided|unless|assuming|as long as|given that)\b", re.I)
 
@@ -36,6 +37,7 @@ class Header:
     parents: list[str] = field(default_factory=list)
     after: list[str] = field(default_factory=list)     # sequencing only: not a premise, no contract watched
     implements: list[str] = field(default_factory=list)
+    public: list[str] = field(default_factory=list)    # intended API with no consumer in this repo (graph-check skips it)
     refines: list[str] = field(default_factory=list)   # `New=Existing`: New extends Existing's decision, deliberately
     distinct: list[str] = field(default_factory=list)  # `New=Existing`: New is a separate concept despite the shared decision
     see: list[str] = field(default_factory=list)
@@ -223,24 +225,43 @@ def _symbol_keys(refs: list[str]) -> set[str]:
     return {r.partition("::")[0] + "::" + r.partition("::")[2].split("::")[0] for r in refs if "::" in r}
 
 
+def _forms(refs: list[str]) -> dict[str, str]:
+    """{every spelling a `refines:`/`distinct:` side may use: top-level key} for export refs. A ref
+    `src/n.rs::Nearest::k` is spelled `src/n.rs::Nearest::k`, `src/n.rs::Nearest`, `Nearest::k` or `Nearest`."""
+    out: dict[str, str] = {}
+    for r in refs:
+        if "::" not in r:
+            continue
+        path, _, rest = r.partition("::")
+        key = f"{path}::{rest.split('::')[0]}"
+        for form in (r, key, rest, rest.split("::")[0]):
+            out.setdefault(form, key)
+    return out
+
+
 def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> list[str]:
     """A decision already implemented by another node's exported symbol should be extended, not
-    shadowed: warn when this node exports a *new* top-level symbol for an ID others already own."""
+    shadowed: warn when this node exports a *new* top-level symbol for an ID others already own.
+    A symbol counts as already owned by name, wherever it lives now (a moved owner is still the owner)."""
     notes: list[str] = []
     mine = _symbol_keys(h.exports)
-    declared = {pair.partition("=")[0] for pair in h.refines + h.distinct if "=" in pair}
-    others: set[str] = set()
+    mine_forms, other_forms = _forms(h.exports), {}
     for other, info in nodes.items():
         if other != node and (s := root / info["spec"]).is_file() and (oh := parse_header(s.read_text(errors="replace"))):
-            others |= _symbol_keys(oh.exports)
+            other_forms.update(_forms(oh.exports))
+    declared: set[str] = set()
     for pair in h.refines + h.distinct:
         left, _, right = pair.partition("=")
-        if not right or not any(k.rpartition("::")[2] == left for k in mine):
-            notes.append(f"`{pair}` must be `<this node's exported symbol>=<existing symbol>`")
-        elif not any(right in (k, k.rpartition("::")[2]) for k in others):
+        if not right or left not in mine_forms:
+            notes.append(f"`{pair}` must be `New=Existing`: New is one of this node's exports, Existing one exported "
+                         f"by another node; each as `Name`, `file::Name` or `Name::method` "
+                         f"(this node exports: {', '.join(sorted(mine)) or 'nothing'})")
+        elif right not in other_forms:
             notes.append(f"`{pair}`: `{right}` is not exported by any other registered node "
-                         f"(known: {', '.join(sorted(others)[:5]) or 'none'}); check the spelling")
-    mine = {k for k in mine if k.rpartition("::")[2] not in declared}
+                         f"(known: {', '.join(sorted(set(other_forms.values()))[:5]) or 'none'}); check the spelling")
+        else:
+            declared.add(mine_forms[left])
+    mine = {k for k in mine if k not in declared}
     for decision in h.implements:
         for other, info in sorted(nodes.items()):
             if other == node or not (s := root / info["spec"]).is_file():
@@ -249,11 +270,14 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> 
             if not oh or decision not in oh.implements:
                 continue
             theirs = _symbol_keys(oh.exports)
-            new = sorted(mine - theirs)
+            owned_names = {k.rpartition("::")[2] for k in theirs}
+            new = sorted(k for k in mine - theirs if k.rpartition("::")[2] not in owned_names)
             if theirs and new:
+                beside = sorted({t for t in theirs for k in new if t.partition("::")[0] == k.partition("::")[0]})
                 notes.append(f"{decision} is already owned by {', '.join(sorted(theirs))} (node {other}); this node "
-                             f"exports new {', '.join(new)}. Extend the existing symbol rather than adding a parallel one? "
-                             "If deliberate, declare `refines: New=Existing` or `distinct: New=Existing`.")
+                             f"exports new {', '.join(new)}. Extend the existing symbol rather than adding a parallel one"
+                             + (f" (if this node modifies {', '.join(beside)}, export that or its methods instead)" if beside else "")
+                             + "? If deliberate, declare `refines: New=Existing` or `distinct: New=Existing`.")
     return notes
 
 
