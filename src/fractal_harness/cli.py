@@ -149,6 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     vp.add_argument("--against", metavar="REV", help="judge staleness against this commit instead of the working tree")
     vp.add_argument("--with-arguments", action="store_true", help="include prior equivalence arguments")
     vp.add_argument("--no-diff", action="store_true")
+    gc = sub.add_parser("graph-check", help="warn about dead exports and phantom parent edges (declared graph vs code)")
+    gc.add_argument("node", nargs="?", help="only this node's exports and parents")
     cx = sub.add_parser("context", help="one bounded bundle for a spec: its cited decisions, interfaces and rules")
     cx.add_argument("spec", help="path to the spec (markdown)")
     cx.add_argument("--id-pattern", help="regex for the IDs a spec cites (default: letters + digits, e.g. D16)")
@@ -366,6 +368,10 @@ def main(argv: list[str] | None = None) -> int:
                                   tests=tests, argument=it.get("argument") or "")
                 print(f"recorded {len(items)} verdict(s) for {args.node} at "
                       f"{ledger.node_commit(cache, root, args.node, args.commit)[:10]}")
+        elif args.cmd == "graph-check":
+            from . import graph_check
+            r = graph_check.check(cache, root, args.node)
+            print(json.dumps(r, indent=2) if args.json else graph_check.render(r), end="")
         elif args.cmd == "verify-plan":
             from . import ledger
             print(ledger.render(ledger.plan(cache, root, args.node, args.against), args.with_arguments,
