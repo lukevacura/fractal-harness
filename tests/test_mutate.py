@@ -116,3 +116,19 @@ def test_timeouts_are_reported_not_recorded_and_not_memoized(tmp_path):
     assert out.status == "timeout" and not out.cached
     assert not run_all(c.store, tmp_path, sha, [Job({}, "sleep 30", timeout=1)], workers=1)[0].cached
     assert subprocess.run(["git", "worktree", "list"], cwd=tmp_path, capture_output=True, text=True).stdout.count("\n") == 1
+
+
+def test_the_memo_key_includes_the_command_the_edits_and_the_environment(tmp_path):
+    from fractal_harness.executor import Job, memo_key
+    k = memo_key("tree", Job({"a.py": "x"}, "pytest -q", "", {"E": "1"}))
+    assert k == memo_key("tree", Job({"a.py": "x"}, "pytest -q", "", {"E": "1"}))
+    for other in (Job({"a.py": "x"}, "pytest -x", "", {"E": "1"}), Job({"a.py": "y"}, "pytest -q", "", {"E": "1"}),
+                  Job({"a.py": "x"}, "pytest -q", "make", {"E": "1"}), Job({"a.py": "x"}, "pytest -q", "", {"E": "2"})):
+        assert memo_key("tree", other) != k
+    assert memo_key("other-tree", Job({"a.py": "x"}, "pytest -q", "", {"E": "1"})) != k
+    c = _repo(tmp_path)
+    sha = ledger.resolve_commit(tmp_path)
+    from fractal_harness.executor import run_all
+    assert not run_all(c.store, tmp_path, sha, [Job({}, "true")])[0].cached
+    assert run_all(c.store, tmp_path, sha, [Job({}, "true")])[0].cached
+    assert run_all(c.store, tmp_path, sha, [Job({}, "false")])[0].status == "failed"       # not answered by the "true" run

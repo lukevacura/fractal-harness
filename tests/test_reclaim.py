@@ -141,3 +141,16 @@ def test_cli_plan_then_apply(tmp_path, capsys):
     assert "give the test command" in capsys.readouterr().err
     assert main(["--root", str(tmp_path), "reclaim", "--apply", "--class", "code", "--cmd", "python3 check.py"]) == 0
     assert "def dead_fn" not in (tmp_path / "lib.py").read_text()
+
+
+def test_apply_writes_only_candidates_that_verified_passing_never_blocked_or_unrun_ones(tmp_path):
+    c = _repo(tmp_path)
+    cands = reclaim.sweep(c, tmp_path, {"code"})
+    assert {x.verdict for x in cands} == {"not run"}
+    assert [d for d in reclaim.apply(c, tmp_path, cands) if d.startswith("deleted")] == []      # nothing verified yet
+    for verdict in ("blocked", "timeout", "build_failed", "passed alone, fails with the others"):
+        for x in cands:
+            x.verdict = verdict
+        assert reclaim.apply(c, tmp_path, cands) == []
+    assert (tmp_path / "lib.py").read_text() == LIB and parse_header((tmp_path / "n.md").read_text()).exports == [
+        "lib.py::used", "lib.py::dead_fn", "lib.py::Gone"]
