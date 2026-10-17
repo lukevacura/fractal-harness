@@ -325,3 +325,70 @@ def test_ownership_lint_warns_on_a_parallel_symbol_for_an_owned_decision(tmp_pat
     assert not any("owned" in n for n in ledger.register_node(c, tmp_path, "b", "b.md")["lint"])   # refines it
     notes = ledger.register_node(c, tmp_path, "c", "c.md")["lint"]
     assert any("S5" in n and "NearestK" in n and "Extend" in n for n in notes)
+
+
+def test_after_edges_are_not_premises_and_do_not_satisfy_a_used_module(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "stats.rs").write_text("pub fn mean() {}\n")
+    (tmp_path / "src" / "grow.rs").write_text("use crate::stats::mean;\npub fn grow() {}\n")
+    (tmp_path / "stats.md").write_text(_spec(guarantee="g", exports="src/stats.rs::mean"))
+    (tmp_path / "grow.md").write_text(_spec(after="stats", guarantee="g", exports="src/grow.rs::grow"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "stats", "stats.md")
+    r = ledger.register_node(c, tmp_path, "grow", "grow.md")
+    assert r["premises"]["parents"] == {}                              # no contract watched
+    assert any("only `after:`" in n and "move it to `parents:`" in n for n in r["lint"])
+    assert any("both" in n for n in lint(parse_header(_spec(parents="a", after="a"))))
+
+
+def test_refines_and_distinct_declarations_silence_the_ownership_lint(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
+    (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Nearest"))
+    (tmp_path / "c.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::NearestK",
+                                         refines="NearestK=Nearest"))
+    (tmp_path / "d.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Other", distinct="Wrong"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "a", "a.md")
+    assert not any("owned" in n for n in ledger.register_node(c, tmp_path, "c", "c.md")["lint"])
+    notes = ledger.register_node(c, tmp_path, "d", "d.md")["lint"]
+    assert any("must be" in n for n in notes) and any("owned" in n for n in notes)
+
+
+def test_spec_lint_wants_design_points_marked_binding_or_advisory():
+    from fractal_harness.nodes import spec_lint
+    spec = "---\nguarantee: g\n---\n# N\n\n## Design\n- [binding] use NaN sentinel\n- tile size 64\n- [advisory] unroll 4\n\n## Notes\n- anything\n"
+    notes = spec_lint(spec)
+    assert len(notes) == 1 and "1 design point" in notes[0] and "tile size" in notes[0]
+    assert spec_lint(spec.replace("- tile size 64", "- [advisory] tile size 64")) == []
+
+
+def test_changed_parent_export_suggests_a_narrow_order_but_keeps_everything_stale(tmp_path):
+    c = _repo(tmp_path)
+    ledger.record(c, tmp_path, "child", file="lib.rs", span="2-3", mutant="uses update", result="killed", tests=["t"])
+    ledger.record(c, tmp_path, "child", file="lib.rs", span="1", mutant="comment only", result="killed", tests=["t"])
+    (tmp_path / "lib.rs").write_text(LIB.replace("x: f64", "x: f32"))
+    p = ledger.plan(c, tmp_path, "child")
+    assert p["node_reason"] and len(p["stale"]) == 2                     # still everything
+    assert [r["mutant"] for r in p["narrow"]["near"]] == ["uses update"]
+    assert [r["mutant"] for r in p["narrow"]["far"]] == ["comment only"]
+    assert "Suggested order" in ledger.render(p, diff=False)
+
+
+def test_refines_target_must_be_exported_by_another_node(tmp_path):
+    c = ClaimCache(tmp_path)
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "DECISIONS.md").write_text("# D\n\n## S5 nearest\nExact nearest.\n")
+    (tmp_path / "a.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::Nearest"))
+    (tmp_path / "typo.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::NearestK",
+                                            refines="NearestK=Nearst"))
+    (tmp_path / "ok.md").write_text(_spec(implements="S5", guarantee="g", exports="n.rs::NearestK",
+                                          refines="NearestK=n.rs::Nearest"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "a", "a.md")
+    notes = ledger.register_node(c, tmp_path, "typo", "typo.md")["lint"]
+    assert any("`Nearst` is not exported" in n and "n.rs::Nearest" in n for n in notes)
+    assert not any("not exported" in n for n in ledger.register_node(c, tmp_path, "ok", "ok.md")["lint"])

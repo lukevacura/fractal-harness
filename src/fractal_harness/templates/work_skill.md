@@ -26,6 +26,8 @@ code it imports, grouped into regions. Use it as your framework for the task in 
 5. **Verify independently.** Hand the finished node to a fresh verifier subagent running
    `/fractal-verify`: it re-runs only the mutants a change can have affected and records its
    verdicts in the mutant ledger. Pass it the spec path, not your own reasoning.
+   Spec design points marked `[advisory]` may be overridden when the code or measurements contradict them;
+   `[binding]` ones may not. Say which you overrode and why.
 6. **Never** edit or work around enforced rules; if the task requires breaking one, stop and
    ask the user.
 

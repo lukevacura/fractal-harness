@@ -121,6 +121,35 @@ prompt wanted). On a 20-commit replay of a real repo, ~89% of re-checks were fre
 change stated values, rename mentioned identifiers): `weak` probes don't depend on their
 code; `partial` claims say more than their probes check.
 
+## Node specs and the mutant ledger
+
+A node spec starts with front matter declaring what it rests on and what it offers (`fractal ledger node
+<name> --spec <file>` registers it; `fractal verify-plan <name>` says which verdicts still hold):
+
+```
+---
+parents: stats          # nodes whose contracts this one uses; their changes stale it
+after: bench            # sequencing only: must come first, contract not used (never stales)
+implements: D18         # decisions reproduced in full
+see: naive              # non-binding peer examples
+guarantee: ...          # what a child may rely on
+condition: ...          # when the guarantee holds
+exports: src/x.rs::T, src/x.rs::T::m
+refines: NearestK=Nearest   # a new export for an already-owned decision extends it on purpose
+distinct: Other=Nearest     # ...or is a separate concept (silences the ownership lint either way)
+oracle: equality        # tests compare two implementations: verify-plan requires the
+                        # "every output entry is NONE/empty" mutant to be recorded killed
+---
+```
+
+- Under a "Design" heading, mark each list item `[binding]` (reproduce it) or `[advisory]` (override it with
+  evidence, and say so). `ledger node` warns about unmarked ones.
+- `ledger node` also warns when a node exports a new symbol for a decision another node's symbol already
+  implements, and when code uses a module that is only declared `after:`.
+- `fractal update` lists `unchecked` decisions: registered, but no `Check:` line, citing claim or test names them.
+- When one parent export changes, `verify-plan` suggests starting with the mutants whose code names it.
+  Every verdict still counts as stale.
+
 ## Region tree
 
 Claims live on a capacity-bounded tree over the code's own address space (directories →

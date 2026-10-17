@@ -119,3 +119,18 @@ def test_subagent_hook_carries_cited_decisions(tmp_path):
                                                "agent_type": "general-purpose"}))
     ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
     assert "Fused multiply-add" in ctx and "Exactly pinned" not in ctx   # D17 cited, D16 not
+
+
+def test_unchecked_decisions_are_those_nothing_names(tmp_path):
+    import subprocess
+    from fractal_harness.context import put_extracted, unchecked_decisions
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "DECISIONS.md").write_text(
+        "## D1 — tested\nx\n\n## D2 — nothing\ny\n\n## D3 — has a line\nz\nCheck: bench_d3\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_a.py").write_text("def test_d1_holds(): pass\n")
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+    c = ClaimCache(tmp_path)
+    for i in ("D1", "D2", "D3"):
+        put_extracted(c, tmp_path, section=f"DECISIONS.md::{i}")
+    assert unchecked_decisions(c, tmp_path) == ["D2"]

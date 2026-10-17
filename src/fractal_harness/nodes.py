@@ -2,6 +2,8 @@
 
     ---
     parents: stats, cov            # nodes whose contracts this one assumes (direct dependencies only)
+    refines: NearestK=Nearest      # optional: a new export for an owned decision says how it relates
+    after: bench                   # nodes that must come first but whose contracts this one does not use
     implements: D18                # decisions this node must reproduce, taken in full
     see: naive                     # peer nodes: non-binding examples of how a similar node was done
     guarantee: Windowed mean and variance, exact for N.
@@ -24,7 +26,7 @@ from pathlib import Path
 
 from .symbols import SymbolError, digest, split_ref, symbol_of
 
-LIST_FIELDS = ("parents", "implements", "see", "exports")
+LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "refines", "distinct")
 STR_FIELDS = ("guarantee", "condition", "oracle")
 CONDITIONAL_WORDS = re.compile(r"\b(only (?:when|if|for)|provided|unless|assuming|as long as|given that)\b", re.I)
 
@@ -32,7 +34,10 @@ CONDITIONAL_WORDS = re.compile(r"\b(only (?:when|if|for)|provided|unless|assumin
 @dataclass
 class Header:
     parents: list[str] = field(default_factory=list)
+    after: list[str] = field(default_factory=list)     # sequencing only: not a premise, no contract watched
     implements: list[str] = field(default_factory=list)
+    refines: list[str] = field(default_factory=list)   # `New=Existing`: New extends Existing's decision, deliberately
+    distinct: list[str] = field(default_factory=list)  # `New=Existing`: New is a separate concept despite the shared decision
     see: list[str] = field(default_factory=list)
     exports: list[str] = field(default_factory=list)
     guarantee: str = ""
@@ -73,11 +78,38 @@ def body(text: str) -> str:
 
 def lint(h: Header) -> list[str]:
     notes = []
+    if both := sorted(set(h.parents) & set(h.after)):
+        notes.append(f"{', '.join(both)} listed in both `parents:` (uses) and `after:` (sequencing); keep one")
     if h.guarantee and CONDITIONAL_WORDS.search(h.guarantee) and not h.condition:
         notes.append("the guarantee reads as conditional but declares no `condition:`; a child would not see it")
     if h.exports and not h.guarantee:
         notes.append("exports are declared without a `guarantee:`")
     return notes
+
+
+BINDING_RE = re.compile(r"\[(binding|advisory)\]", re.I)
+
+
+def design_points(text: str) -> list[str]:
+    """List items under a heading containing "design" in the spec body: the points an implementer
+    either must reproduce (`[binding]`) or may override with evidence (`[advisory]`)."""
+    out, inside = [], False
+    for line in body(text).splitlines():
+        if m := re.match(r"^#{1,6}\s+(.*)$", line):
+            inside = "design" in m.group(1).lower()
+        elif inside and re.match(r"^\s*(?:[-*]|\d+[.)])\s+\S", line):
+            out.append(line.strip())
+    return out
+
+
+def spec_lint(text: str) -> list[str]:
+    """Design points that do not say whether they bind the implementer."""
+    unmarked = [p for p in design_points(text) if not BINDING_RE.search(p)]
+    if not unmarked:
+        return []
+    shown = "; ".join(p[:50] for p in unmarked[:3])
+    return [f"{len(unmarked)} design point(s) are not marked `[binding]` or `[advisory]` ({shown}"
+            f"{'...' if len(unmarked) > 3 else ''}); an implementer cannot tell which they may override"]
 
 
 def contract(root: Path, spec_path: str, exports: int | None = None) -> str:
@@ -196,6 +228,19 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> 
     shadowed: warn when this node exports a *new* top-level symbol for an ID others already own."""
     notes: list[str] = []
     mine = _symbol_keys(h.exports)
+    declared = {pair.partition("=")[0] for pair in h.refines + h.distinct if "=" in pair}
+    others: set[str] = set()
+    for other, info in nodes.items():
+        if other != node and (s := root / info["spec"]).is_file() and (oh := parse_header(s.read_text(errors="replace"))):
+            others |= _symbol_keys(oh.exports)
+    for pair in h.refines + h.distinct:
+        left, _, right = pair.partition("=")
+        if not right or not any(k.rpartition("::")[2] == left for k in mine):
+            notes.append(f"`{pair}` must be `<this node's exported symbol>=<existing symbol>`")
+        elif not any(right in (k, k.rpartition("::")[2]) for k in others):
+            notes.append(f"`{pair}`: `{right}` is not exported by any other registered node "
+                         f"(known: {', '.join(sorted(others)[:5]) or 'none'}); check the spelling")
+    mine = {k for k in mine if k.rpartition("::")[2] not in declared}
     for decision in h.implements:
         for other, info in sorted(nodes.items()):
             if other == node or not (s := root / info["spec"]).is_file():
@@ -207,7 +252,8 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path) -> 
             new = sorted(mine - theirs)
             if theirs and new:
                 notes.append(f"{decision} is already owned by {', '.join(sorted(theirs))} (node {other}); this node "
-                             f"exports new {', '.join(new)}. Extend the existing symbol rather than adding a parallel one?")
+                             f"exports new {', '.join(new)}. Extend the existing symbol rather than adding a parallel one? "
+                             "If deliberate, declare `refines: New=Existing` or `distinct: New=Existing`.")
     return notes
 
 
@@ -257,6 +303,10 @@ def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str,
         if not files or any(f in parent_files or f in own_files for f in files):
             continue
         who = next((owner[f] for f in files if f in owner), None)
+        if who in h.after:
+            notes.append(f"the node uses module `{mod}` ({files[0]}) but declares {who} only `after:` (sequencing, "
+                         f"not a dependency); move it to `parents:`")
+            continue
         notes.append(f"the node uses module `{mod}` ({files[0]}) that no parent exports: "
                      + (f"add parent `{who}`" if who else "no registered node exports it, so declare the node that owns it"))
     return notes

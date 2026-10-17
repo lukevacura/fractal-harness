@@ -398,14 +398,19 @@ def main(argv: list[str] | None = None) -> int:
             if not args.json:
                 print(f"{len(stale)} claims newly stale")
         elif args.cmd == "update":
+            from .context import unchecked_decisions
             out = cache.update()
+            unchecked = unchecked_decisions(cache, root)
             if args.json:
-                print(json.dumps(out, indent=2))
+                print(json.dumps({**out, **({"unchecked_decisions": unchecked} if unchecked else {})}, indent=2))
             else:
                 for kind in MOTION_CLASSES:
                     if out.get(kind):
                         print(f"{kind:10} {len(out[kind]):3}  {' '.join(out[kind][:8])}")
-                if not out:
+                if unchecked:
+                    print(f"{'unchecked':10} {len(unchecked):3}  {' '.join(unchecked[:8])}  "
+                          "(decided, but no check line, citing claim or test names them)")
+                if not out and not unchecked:
                     print("nothing changed")
         elif args.cmd == "repair":
             from .repair import repair

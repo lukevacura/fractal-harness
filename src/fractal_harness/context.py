@@ -17,7 +17,7 @@ from pathlib import Path
 
 from .cache import ClaimCache
 from .store import Edge
-from .nodes import Header, body, contract, lint, parse_header
+from .nodes import BINDING_RE, Header, body, contract, lint, parse_header, spec_lint
 from .symbols import SymbolError, digest, section_of, split_ref, symbol_of
 
 DEFAULT_ID_PATTERN = r"\b[A-Z]{1,3}-?\d{1,3}\b"
@@ -113,6 +113,36 @@ def section_claims(edges: list[Edge], ids: list[str]) -> tuple[list[Edge], list[
     return found, missing
 
 
+CHECK_LINE = re.compile(r"^\s*(?:check(?:ed by)?|probe|test)s?\s*:", re.I | re.M)
+
+
+def unchecked_decisions(cache: ClaimCache, root: Path, id_pattern: str = DEFAULT_ID_PATTERN) -> list[str]:
+    """Decisions registered as claims that nothing checks: no check line in their text, no other claim
+    that cites or depends on them, and no test file that names the ID."""
+    import subprocess
+    edges = cache.store.all()
+    try:
+        files = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True).stdout.splitlines()
+    except FileNotFoundError:
+        files = []
+    tests = "\n".join((root / f).read_text(errors="replace") for f in files
+                      if re.search(r"(^|/)(tests?|test_[^/]*|[^/]*_test\.\w+)(/|\.|$)", f) and (root / f).is_file())
+    out = []
+    for e in edges:
+        if (e.probe or {}).get("type") != "section":
+            continue
+        m = re.search(id_pattern, e.post.splitlines()[0])
+        if not m or CHECK_LINE.search(e.post):
+            continue
+        i = m.group(0)
+        word = rf"(?<![A-Za-z0-9]){re.escape(i)}(?![0-9])"
+        cited = any(o.id != e.id and (e.id in o.depends_on or ((o.probe or {}).get("type") != "section"
+                    and re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", o.post))) for o in edges)
+        if not cited and not re.search(word, tests, re.I):
+            out.append(i)
+    return out
+
+
 def verification_label(cache: ClaimCache, root: Path, node: str) -> str:
     """Whether a parent node has itself been verified: a child may only assume what was checked."""
     from . import ledger
@@ -133,6 +163,9 @@ def _declared_sections(cache: ClaimCache, root: Path, spec: str, h: Header, id_p
     edges = cache.store.all()
     nodes = cache.store.all_nodes()
     out: list[str] = []
+    if BINDING_RE.search(spec):
+        out += ["(`[binding]` design points must be reproduced. `[advisory]` ones are suggestions: override one "
+                "when measurements or the code contradict it, and say so in your report.)", ""]
     if h.implements:
         found, missing = section_claims(edges, h.implements)
         if missing:
@@ -160,7 +193,7 @@ def _declared_sections(cache: ClaimCache, root: Path, spec: str, h: Header, id_p
         out += [f"- {n}" + (f": {nodes[n]['spec']}" if n in nodes else " (not registered)") for n in h.see] + [""]
     declared = set(h.implements) | set(h.parents)
     mentioned = [i for i in dict.fromkeys(re.findall(id_pattern, spec)) if i not in declared]
-    notes = lint(h)
+    notes = lint(h) + spec_lint(spec)
     if mentioned:
         notes.append("the spec mentions " + ", ".join(mentioned) + " without declaring it under "
                      "`implements:` or `parents:`: declare it or drop the mention")

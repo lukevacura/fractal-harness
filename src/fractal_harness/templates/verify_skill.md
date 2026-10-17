@@ -43,7 +43,10 @@ Do not rely on the implementer's reasoning, and do not read it if it was left in
    go stale only when the spec, an implemented decision, or a direct parent's contract (its
    `guarantee:`, `condition:` and `exports:` signatures) changes; if the header is missing, ask the
    orchestrator to add it.
-5. Report PASS only if no mutant survived unresolved and every verdict is recorded. List the
+   Also read the plan's other sections: "Required standard mutants" (an `oracle: equality` node must have the
+   all-entries-empty mutant recorded killed, with the exact mutant text shown) and "Suggested order" (start with the
+   mutants that name the changed parent export; the rest stay stale until you re-run them).
+5. Report PASS only if no mutant survived unresolved and every verdict is recorded and no required standard mutant is missing. List the
    survivors and any weak tests otherwise.
 
 Never run `fractal accept` or `fractal reject`.

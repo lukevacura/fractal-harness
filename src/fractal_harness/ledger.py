@@ -26,9 +26,9 @@ from pathlib import Path
 
 from .cache import ClaimCache
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
-from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint
+from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint, spec_lint
 from .store import GOOD
-from .symbols import SymbolError, digest
+from .symbols import SymbolError, digest, symbol_of
 
 RESULTS = ("killed", "survived", "equivalent")
 MAX_DIFF_CHARS = 20_000
@@ -102,7 +102,7 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
     cache.store.put_node(node, spec, digest(text), premises)
     notes = []
     if h:
-        notes = lint(h) + repo_lint(root, h, cache.store.all_nodes(), text, node)
+        notes = lint(h) + spec_lint(text) + repo_lint(root, h, cache.store.all_nodes(), text, node)
         notes += [f"{i} has no claim ({failed.get(i, 'not found')}); `fractal put --section DECISIONS.md::{i}`"
                   for i in missing]
     return {"spec": spec, "premises": premises, "uncited": [] if h else missing, "declared": h is not None,
@@ -215,6 +215,7 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
     node_reason = None
     info = cache.store.get_node(node)
     children: list[str] = []
+    changed_export: tuple[str, str] | None = None
     oracle = ""
     if info:
         if (sp := root / info["spec"]).is_file():
@@ -247,6 +248,8 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
                     continue
                 if why:
                     node_reason = f"parent {name}'s contract changed: {why}"
+                    if m := re.match(r"export (\S+) (?:changed|was removed)", why):
+                        changed_export = (name, m.group(1))
         children = sorted(n for n, i in cache.store.all_nodes().items() if node in premises_of(i)["parents"])
     by_commit: dict[str, dict[str, list[tuple[int, int]]] | str] = {}
     for c in {r["commit"] for r in rows}:
@@ -282,7 +285,27 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
     return {"node": node, "base": base, "stale": [(r, why) for r, why in stale],
             "valid": [r for r, _ in valid], "node_reason": node_reason,
             "open": [r for r, _ in valid if r["result"] == "survived"], "required": required,
+            "narrow": _narrow(root, rows, changed_export) if changed_export else None,
             "children": children, "against": against, "changed": sorted(changed_files), "test_files": sorted(test_files), "files": sorted({r["file"] for r in rows})}
+
+
+def _narrow(root: Path, rows: list[dict], changed: tuple[str, str]) -> dict:
+    """When one parent export changed, the verdicts stay stale, but say where to start: the mutants whose
+    code mentions the changed item come first; the rest reference nothing that changed (by name)."""
+    parent, ref = changed
+    item = ref.partition("::")[2].rpartition("::")[2]
+    near, far = [], []
+    for r in rows:
+        try:
+            lines = _git(root, "show", f"{r['commit']}:{r['file']}").splitlines()[r["start"] - 1:r["end"]]
+        except SymbolError:
+            lines = []
+        (near if item and _word_in(item, "\n".join(lines)) else far).append(r)
+    try:
+        sig = symbol_of(root, ref)
+    except SymbolError:
+        sig = ""
+    return {"parent": parent, "ref": ref, "item": item, "near": near, "far": far, "signature": sig}
 
 
 def _file_defines(root: Path, rel: str, commit: str, test: str, hunks: list) -> bool:
@@ -322,6 +345,15 @@ def render(p: dict, with_arguments: bool = False, diff: bool = True, root: Path 
                     "condition or exports stales them."]
     if p["node_reason"]:
         out += ["", f"Everything is stale: {p['node_reason']}. Re-verify the node in full."]
+    if n := p.get("narrow"):
+        out += ["", f"## Suggested order: {n['parent']}'s export {n['ref']} changed", ""]
+        out += [f"Start with the {len(n['near'])} mutant(s) whose code mentions `{n['item']}`:"]
+        out += [f"- {r['file']}:{r['start']}-{r['end']}  {r['mutant']}" for r in n["near"]] or ["- (none)"]
+        out += ["", f"The other {len(n['far'])} do not mention it by name. They are still stale (a field or "
+                    "behavior of the changed item can reach code that never names it), but re-run them only "
+                    "after checking the new signature below against what they depend on:"]
+        if n["signature"]:
+            out += ["", "```", n["signature"], "```"]
     if p["stale"]:
         out += ["", "## Re-run these mutants"]
         out += [f"- {r['file']}:{r['start']}-{r['end']}  {r['mutant']}  (was {r['result']}) — {why}"
