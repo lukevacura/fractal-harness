@@ -32,10 +32,10 @@ import re
 from pathlib import Path
 
 from .cache import ClaimCache
-from .nodes import _files, _symbol_keys, parse_header
+from .nodes import _symbol_keys, parse_header
+from .refindex import Index, is_test, load_trees
 
 MIN_NAME = 3
-TEST_PATH = re.compile(r"(^|/)(tests?|test_[^/]*|[^/]*_tests?\.\w+)(/|$)")
 ENTRY_NAMES = {"main", "run", "cli"}
 RUST_PUB = re.compile(r"^pub(?:\([^)]*\))?\s+(?:async\s+|unsafe\s+|const\s+|extern\s+\"[^\"]*\"\s+)*"
                       r"(?:struct|enum|trait|fn|type|const|static|union)\s+(\w+)", re.M)
@@ -77,18 +77,12 @@ def _is_public(key: str, patterns: list[str]) -> bool:
     return False
 
 
-def _word(name: str, text: str) -> bool:
-    return bool(re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", text))
-
-
-def _is_test(path: str) -> bool:
-    return bool(TEST_PATH.search(path))
-
-
 def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
     import subprocess
     nodes = cache.store.all_nodes()
-    texts = {f: (root / f).read_text(errors="replace") for f in _files(root) if (root / f).is_file()}
+    here = next((t for t in load_trees(root) if t.current), None)
+    texts = here.texts if here else {}
+    idx = here.index if here else Index({})
     headers = {}
     for n, info in nodes.items():
         if (s := root / info["spec"]).is_file():
@@ -102,11 +96,11 @@ def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
             path, name = key.split("::", 1)
             if len(name) < MIN_NAME or name in ENTRY_NAMES:
                 continue
-            if path not in texts or not _word(name, texts[path]):
+            if path not in texts or not idx.mentions(name, path):
                 missing.append({"node": n, "symbol": key})
                 continue
-            others = {f: t for f, t in texts.items() if f != path and _word(name, t)}
-            if not any(not _is_test(f) for f in others) and not _is_public(key, public):
+            others = idx.files(name, path)
+            if not any(not is_test(f) for f in others) and not _is_public(key, public):
                 dead.append({"node": n, "symbol": key, "tested_only": bool(others)})
         for p in h.parents:
             ph = headers.get(p)
@@ -117,23 +111,22 @@ def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
             mine = {r.partition("::")[0] for r in h.exports}
             mine |= {r["file"] for r in cache.store.mutants(n)}
             own_names = {k.split("::", 1)[1] for k in _symbol_keys(h.exports)}
-            mine |= {f for f, t in texts.items() if _is_test(f) and any(_word(x, t) for x in own_names if len(x) >= MIN_NAME)}
-            code = "\n".join(texts[f] for f in mine if f in texts)
-            if not any(_word(x, code) for x in names):
+            mine |= {f for f in texts if is_test(f) and any(idx.mentions(x, f) for x in own_names if len(x) >= MIN_NAME)}
+            if not any(idx.mentions(x, f) for x in names for f in mine):
                 phantom.append({"node": n, "parent": p, "looked_in": sorted(mine & set(texts))})
     result = {"dead": dead, "phantom": phantom, "missing": missing, "undeclared_dead": [], "unregistered": []}
     if only:
         return result
     declared = {k for h in headers.values() if h for k in _symbol_keys(h.exports)}
     for path, text in sorted(texts.items()):
-        if _is_test(path):
+        if is_test(path):
             continue
         for name in dict.fromkeys(public_items(path, text)):
             if (len(name) < MIN_NAME or name in ENTRY_NAMES or f"{path}::{name}" in declared
                     or _is_public(f"{path}::{name}", public)):
                 continue
-            others = {f: t for f, t in texts.items() if f != path and _word(name, t)}
-            if not any(not _is_test(f) for f in others):
+            others = idx.files(name, path)
+            if not any(not is_test(f) for f in others):
                 result["undeclared_dead"].append({"symbol": f"{path}::{name}", "tested_only": bool(others)})
     registered = {i["spec"] for i in nodes.values()}
     try:
