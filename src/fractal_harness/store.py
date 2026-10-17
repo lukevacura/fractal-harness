@@ -68,6 +68,14 @@ CREATE TABLE IF NOT EXISTS mutants (
     ts        REAL NOT NULL,
     PRIMARY KEY (node, file, start, end, mutant)
 );
+CREATE TABLE IF NOT EXISTS runs (           -- the executor's memo (see executor.py): content-addressed outcomes
+    key     TEXT PRIMARY KEY,
+    status  TEXT NOT NULL,       -- passed | failed | build_failed
+    code    INTEGER NOT NULL,
+    tail    TEXT NOT NULL,
+    seconds REAL NOT NULL,
+    ts      REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ledger_audit (   -- every change to recorded verdicts that is not a plain `record`
     id     INTEGER PRIMARY KEY AUTOINCREMENT,
     ts     REAL NOT NULL,
@@ -334,6 +342,15 @@ class Store:
         rows = self.db.execute("SELECT file, start, end, mutant, result, commit_sha, tests, argument, ts "
                                "FROM mutants WHERE node = ? ORDER BY ts, file, start", (node,))
         return [{**dict(zip(cols, r)), "tests": json.loads(r[6])} for r in rows]
+
+    def get_run(self, key: str) -> dict | None:
+        r = self.db.execute("SELECT status, code, tail, seconds FROM runs WHERE key = ?", (key,)).fetchone()
+        return dict(zip(("status", "code", "tail", "seconds"), r)) if r else None
+
+    def put_run(self, key: str, status: str, code: int, tail: str, seconds: float) -> None:
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO runs VALUES (?, ?, ?, ?, ?, ?)",
+                            (key, status, code, tail, seconds, time.time()))
 
     def dependents(self, edge_id: str) -> list[str]:
         return [r[0] for r in self.db.execute(

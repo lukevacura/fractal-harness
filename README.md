@@ -150,6 +150,18 @@ oracle: equality        # tests compare two implementations: verify-plan require
 - When one parent export changes, `verify-plan` suggests starting with the mutants whose code names it.
   Every verdict still counts as stale.
 
+## Running mutants
+
+`fractal mutate <node> --json mutants.json --cmd 'pytest -q {tests}' --build-cmd '<compile step>'` runs a verifier's
+mutants and records the verdicts in the ledger. The verifier chooses the mutants (small patterns: `file`, `span`,
+`tests`, and `find`+`replace` or `replacement`); fractal applies each in its own throwaway git worktree of the node's
+commit, so your checkout is never touched and nothing is left applied if a run dies. The same command must pass on the
+unmutated commit first, or nothing is recorded. A failing test is a kill, passing tests a survivor (recorded
+`survived`: arguing equivalence is still the verifier's, via `ledger record`), and a mutant that does not build is
+reported invalid. Outcomes are memoized by the commit's tree, the edits and the commands, so a repeat costs nothing.
+`--env CARGO_TARGET_DIR=/tmp/t{job}` gives parallel runs their own build directories. The executor underneath
+(`executor.py`) is the primitive other judges, such as reclamation, reuse.
+
 ## Single ownership ("only here")
 
 Some invariants say a thing exists in exactly one place: one ranking expression, one kind encoding, one nearest
