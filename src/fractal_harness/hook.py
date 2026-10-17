@@ -42,9 +42,11 @@ MAX_SPEC_CHARS = 4000        # how much of a referenced spec file is scanned for
 FACT_ORDER = ("verified", "trusted", "stale")
 RULES_HEADER = (
     "RULES: enforced by this project's owner. Every edit is checked against them before it is written "
-    "and again at commit, so they are GUARANTEED to hold: you do not need to re-verify them (no "
-    "grepping or test runs to confirm them) and you do not need defensive code or tests for what they "
-    "guarantee. Do not violate or work around them (never edit or remove the rules or their probes); "
+    "and again at commit. Each carries its evidence class: [exact] means the probe decides the rule, so "
+    "it is GUARANTEED to hold and you do not need to re-verify it (no grepping or test runs) or write defensive "
+    "code or tests for it. [proxy] is a pattern that approximates the rule, [test] runs a test at the end "
+    "of your turn, and [doc-pinned] only notices the rule's text changing: for those, the code still has "
+    "to actually satisfy the rule, so check it yourself. Do not violate or work around them (never edit or remove the rules or their probes); "
     "if the task requires breaking one, stop and ask the user."
 )
 FACTS_HEADER = (
@@ -164,10 +166,15 @@ def select(root: Path, prompt: str, session_id: str | None = None, log: bool = T
     return rules + facts
 
 
+def _class_tag(e: Edge) -> str:
+    from .probes import evidence_class
+    return f"[{evidence_class(e.probe) or 'no probe'}] "
+
+
 def _rule_line(e: Edge) -> str:
     if e.status == "failed":
-        return f"- {e.post}\n  ✗ VIOLATED NOW: {e.detail}"
-    return f"- {e.post}\n  ✓ holds now: {evidence(e)}"
+        return f"- {_class_tag(e)}{e.post}\n  ✗ VIOLATED NOW: {e.detail}"
+    return f"- {_class_tag(e)}{e.post}\n  ✓ holds now: {evidence(e)}"
 
 
 def _fact_line(e: Edge) -> str:
@@ -176,7 +183,7 @@ def _fact_line(e: Edge) -> str:
         return f"- {pre}{e.post}\n  ⚠ stale: {(e.detail or 'sources changed')[:160]}"
     if e.status == "trusted":
         return f"- {pre}{e.post}\n  ? asserted without proof"
-    return f"- {pre}{e.post}\n  ✓ {evidence(e)}"
+    return f"- {_class_tag(e)}{pre}{e.post}\n  ✓ {evidence(e)}"
 
 
 def render(rules: list[Edge], facts: list[Edge], budget: int = MAX_CONTEXT_CHARS) -> str:

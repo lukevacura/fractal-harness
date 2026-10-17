@@ -357,22 +357,27 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{e.id}  {state}: {e.post}" + (f"  (currently {e.status}: {e.detail})"
                                                        if e.status != "verified" else ""))
         elif args.cmd == "invariants":
+            from .probes import evidence_class
             rules = cache.invariants((args.state,) if args.state else ("proposed", "enforced", "rejected"))
             verdicts = {}
             if args.audit:
                 from .audit import audit_edge
                 verdicts = {e.id: audit_edge(e, cache.root).verdict for e in rules}
             if args.json:
-                print(json.dumps([{**e.to_dict(), "audit": verdicts.get(e.id)} for e in rules], indent=2))
+                print(json.dumps([{**e.to_dict(), "audit": verdicts.get(e.id), "evidence": evidence_class(e.probe)} for e in rules], indent=2))
             else:
                 order = {"enforced": 0, "proposed": 1, "rejected": 2}
                 for e in sorted(rules, key=lambda e: (order[e.rule_state], e.post)):
                     audit_note = f" audit={verdicts[e.id]}" if e.id in verdicts else ""
-                    print(f"{e.id}  [{e.rule_state:8}] [{e.status:8}]{audit_note} {e.post}")
+                    print(f"{e.id}  [{e.rule_state:8}] [{e.status:8}] [{evidence_class(e.probe) or 'no probe':10}]"
+                          f"{audit_note} {e.post}")
                     if e.status != "verified":
                         print(f"{'':20}{e.detail}")
                 print(" ".join(f"{s}={sum(e.rule_state == s for e in rules)}"
                                for s in ("enforced", "proposed", "rejected")))
+                weak = [e for e in rules if e.rule_state == "enforced" and evidence_class(e.probe) in (None, "doc-pinned")]
+                if weak:
+                    print(f"{len(weak)} enforced rule(s) have no mechanism checking the code (doc-pinned or no probe)")
         elif args.cmd == "ledger":
             from . import ledger
             if args.ledger_cmd == "node":

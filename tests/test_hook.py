@@ -211,3 +211,16 @@ def test_stale_fact_is_labeled_never_presented_as_verified(tmp_path: Path):
     assert "STALE FACTS" in ctx and "may be wrong" in ctx and "stale: blocked by upstream" in ctx
     assert "FACTS: verified" not in ctx or "applied before upload" not in ctx.split("STALE FACTS")[0]
     assert "defined in app.py" not in ctx   # the failed upstream claim is known false: left out
+
+
+def test_rules_show_their_evidence_class_and_only_exact_ones_are_guaranteed(tmp_path):
+    root = _rules_repo(tmp_path)
+    c = ClaimCache(root)
+    c.set_rule(c.put("only the ring owns eviction", ["*.py"], kind="invariant",
+                     probe={"type": "only_in", "pattern": "import os", "paths": ["*.py"], "files": ["legacy_free.py"]}).id,
+               "enforced")
+    c.close()
+    ctx = _ctx(root, "refactor the build pipeline")
+    assert "[proxy] no file imports legacy" in ctx            # an undeclared grep only approximates the rule
+    assert "[exact] only the ring owns eviction" in ctx
+    assert "[exact] means the probe decides the rule" in ctx and "[doc-pinned]" in ctx

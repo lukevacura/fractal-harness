@@ -37,6 +37,10 @@ Gate probes depend on the commit in flight, not on files, so they are never memo
 records them as holding vacuously, and the commit gates (`fractal check`, `fractal check
 --message FILE`) evaluate them with the real staged paths / message (`ctx`).
 
+Evidence class (see `evidence_class`): what a passing probe establishes, shown beside every rule and fact.
+A probe's class follows from its type; only a human, writing the probe, can declare a grep exact with
+`"evidence": "exact"` (a pattern that decides the property, not one that approximates it).
+
 grep is line-based: it counts matching lines, so `^`/`$` anchor to each line.
 """
 
@@ -83,6 +87,35 @@ def is_slow(probe: dict | None) -> bool:
 
 GATE_TYPES = {"staged_paths", "commit_message"}
 
+EVIDENCE = ("exact", "proxy", "test", "doc-pinned")     # strongest first: an `all` is as weak as its weakest member
+EVIDENCE_MEANING = {
+    "exact": "the probe decides the property",
+    "proxy": "a pattern approximates the property",
+    "test": "a test passes; only as strong as the test",
+    "doc-pinned": "the text is unchanged; the code is not checked",
+}
+
+
+def evidence_class(probe: dict | None) -> str | None:
+    """What a passing probe establishes, or None for a claim with no probe (no mechanism at all).
+
+    exact: only_in, the commit gates, or a grep its author declared `"evidence": "exact"`.
+    proxy: any other grep, and a command probe declared `"evidence": "proxy"`.
+    test: a test or command probe. doc-pinned: section/symbol, which only notice the text changing.
+    A declared value is honored only where a deterministic check can back it (grep, command)."""
+    if not probe:
+        return None
+    kind = probe.get("type")
+    if kind == "all":
+        return max((evidence_class(p) or "doc-pinned" for p in probe["probes"]), key=EVIDENCE.index)
+    if kind in GATE_TYPES or kind == "only_in":
+        return "exact"
+    if kind in ("section", "symbol"):
+        return "doc-pinned"
+    if kind == "grep":
+        return "exact" if probe.get("evidence") == "exact" else "proxy"
+    return "proxy" if probe.get("evidence") == "proxy" else "test"
+
 
 def gate_leaves(probe: dict | None) -> list[dict]:
     """The gate probes inside `probe` (itself, or the members of an `all`)."""
@@ -95,6 +128,9 @@ def gate_leaves(probe: dict | None) -> list[dict]:
 
 def validate(probe: dict) -> None:
     kind = probe.get("type")
+    declared = probe.get("evidence")
+    if declared is not None and not (declared == "exact" and kind == "grep" or declared == "proxy" and kind == "command"):
+        raise ProbeError('"evidence" may only be "exact" on a grep probe or "proxy" on a command probe')
     if kind == "command":
         if not isinstance(probe.get("run"), str) or not probe["run"].strip():
             raise ProbeError("command probe needs a non-empty 'run' string")

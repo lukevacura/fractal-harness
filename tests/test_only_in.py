@@ -96,3 +96,32 @@ def test_only_in_decision_flag_is_stored_and_listed_in_the_registry(tmp_path, ca
     c.close()
     main(base + ["concepts"])
     assert "S5, S6" in capsys.readouterr().out
+
+
+# --- evidence classes ------------------------------------------------------------------------
+
+def test_evidence_class_follows_the_probe_and_an_all_is_as_weak_as_its_weakest_member():
+    grep = {"type": "grep", "pattern": "x", "paths": ["*.py"]}
+    only = {"type": "only_in", "pattern": "x", "paths": ["*.py"], "files": ["a.py"]}
+    symbol = {"type": "symbol", "ref": "a.rs::f", "sha": "0"}
+    assert probes.evidence_class(None) is None
+    assert probes.evidence_class(only) == "exact"
+    assert probes.evidence_class({"type": "staged_paths", "forbid": "x"}) == "exact"
+    assert probes.evidence_class(grep) == "proxy"
+    assert probes.evidence_class({**grep, "evidence": "exact"}) == "exact"
+    assert probes.evidence_class({"type": "test", "runner": "pytest", "file": "t.py"}) == "test"
+    assert probes.evidence_class({"type": "command", "run": "true"}) == "test"
+    assert probes.evidence_class({"type": "command", "run": "true", "evidence": "proxy"}) == "proxy"
+    assert probes.evidence_class(symbol) == "doc-pinned"
+    assert probes.evidence_class({"type": "all", "probes": [only, grep]}) == "proxy"
+    assert probes.evidence_class({"type": "all", "probes": [only, symbol]}) == "doc-pinned"
+
+
+@pytest.mark.parametrize("probe", [
+    {"type": "command", "run": "true", "evidence": "exact"},   # a command cannot be declared exact
+    {"type": "grep", "pattern": "x", "paths": ["*.py"], "evidence": "test"},
+    {"type": "only_in", "pattern": "x", "paths": ["*.py"], "files": ["a.py"], "evidence": "exact"},
+])
+def test_an_evidence_declaration_the_probe_cannot_back_is_rejected(probe):
+    with pytest.raises(ProbeError):
+        probes.validate(probe)
