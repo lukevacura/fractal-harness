@@ -51,12 +51,17 @@ def _probe_args(parser: argparse.ArgumentParser, probe_help: str) -> None:
     parser.add_argument("--read", action="append", default=[], help="source path it depends on (repeatable)")
     parser.add_argument("--probe", help=probe_help)
     parser.add_argument("--run", help="shorthand for a command probe that must exit 0")
+    parser.add_argument("--behavioral", action="store_true",
+                        help="the rule constrains what the code does, not how it is written: a pattern alone is a gap")
 
 
 def _probe(args: argparse.Namespace) -> dict | None:
-    if args.run:
-        return {"type": "command", "run": args.run}
-    return json.loads(args.probe) if args.probe else None
+    probe = {"type": "command", "run": args.run} if args.run else json.loads(args.probe) if args.probe else None
+    if getattr(args, "behavioral", False):
+        if probe is None:
+            raise SystemExit("--behavioral needs a probe (--probe or --run)")
+        probe["behavioral"] = True
+    return probe
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,6 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     vp.add_argument("--against", metavar="REV", help="judge staleness against this commit instead of the working tree")
     vp.add_argument("--with-arguments", action="store_true", help="include prior equivalence arguments")
     vp.add_argument("--no-diff", action="store_true")
+    sub.add_parser("activations", help="which nodes are due an agent (spec, contract, probe, proposal or survivor events)")
     oi = sub.add_parser("only-in", help="propose a single-ownership rule: a pattern or symbol kind appears only in given files")
     oi.add_argument("concept", help='what is owned once, e.g. "ranking expression"')
     oi.add_argument("--pattern", help="regex for the thing that must exist in one place")
@@ -357,27 +363,38 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{e.id}  {state}: {e.post}" + (f"  (currently {e.status}: {e.detail})"
                                                        if e.status != "verified" else ""))
         elif args.cmd == "invariants":
-            from .probes import evidence_class
+            from .ledger import mutation_checked
+            from .probes import evidence_class, evidence_gap
             rules = cache.invariants((args.state,) if args.state else ("proposed", "enforced", "rejected"))
+            memo: dict[str, list[str]] = {}
+
+            def checked(e):
+                if e.id not in memo:
+                    memo[e.id] = mutation_checked(cache, root, e.probe) if evidence_class(e.probe) == "test" else []
+                return memo[e.id]
             verdicts = {}
             if args.audit:
                 from .audit import audit_edge
                 verdicts = {e.id: audit_edge(e, cache.root).verdict for e in rules}
             if args.json:
-                print(json.dumps([{**e.to_dict(), "audit": verdicts.get(e.id), "evidence": evidence_class(e.probe)} for e in rules], indent=2))
+                print(json.dumps([{**e.to_dict(), "audit": verdicts.get(e.id), "evidence": evidence_class(e.probe),
+                                   "gap": evidence_gap(e.probe), "mutation_checked": checked(e)} for e in rules], indent=2))
             else:
                 order = {"enforced": 0, "proposed": 1, "rejected": 2}
                 for e in sorted(rules, key=lambda e: (order[e.rule_state], e.post)):
                     audit_note = f" audit={verdicts[e.id]}" if e.id in verdicts else ""
                     print(f"{e.id}  [{e.rule_state:8}] [{e.status:8}] [{evidence_class(e.probe) or 'no probe':10}]"
                           f"{audit_note} {e.post}")
+                    if gap := evidence_gap(e.probe):
+                        print(f"{'':20}gap: {gap}")
+                    if by := checked(e):
+                        print(f"{'':20}mutation-checked by {', '.join(by)}")
                     if e.status != "verified":
                         print(f"{'':20}{e.detail}")
                 print(" ".join(f"{s}={sum(e.rule_state == s for e in rules)}"
                                for s in ("enforced", "proposed", "rejected")))
-                weak = [e for e in rules if e.rule_state == "enforced" and evidence_class(e.probe) in (None, "doc-pinned")]
-                if weak:
-                    print(f"{len(weak)} enforced rule(s) have no mechanism checking the code (doc-pinned or no probe)")
+                if weak := [e for e in rules if e.rule_state == "enforced" and evidence_gap(e.probe)]:
+                    print(f"{len(weak)} enforced rule(s) have an evidence gap (see `gap:` above)")
         elif args.cmd == "ledger":
             from . import ledger
             if args.ledger_cmd == "node":
@@ -506,6 +523,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(r, indent=2) if args.json else graph_check.render(r), end="")
             if args.strict and any(r.values()):
                 return 1
+        elif args.cmd == "activations":
+            from . import activation
+            rows = activation.due(cache, root)
+            print(json.dumps(rows, indent=2) if args.json else activation.render(rows), end="")
         elif args.cmd == "verify-plan":
             from . import ledger
             print(ledger.render(ledger.plan(cache, root, args.node, args.against), args.with_arguments,

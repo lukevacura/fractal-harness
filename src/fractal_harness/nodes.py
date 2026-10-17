@@ -11,6 +11,7 @@
     guarantee: Windowed mean and variance, exact for N.
     condition: Only for windows with V < 2^63; stats flags the rest.
     exports: src/stats.rs::Stats::update, src/stats.rs::Stats
+    joins: engine_a, engine_b      # a join node: tests that these nodes' outputs agree; each must be a parent
     oracle: equality               # optional: tests compare two engines; adds the degenerate-output mutant
     ---
 
@@ -29,7 +30,7 @@ from pathlib import Path
 
 from .symbols import SymbolError, digest, split_ref, symbol_of
 
-LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "planned", "public", "refines", "distinct")
+LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "planned", "public", "refines", "distinct", "joins")
 STR_FIELDS = ("guarantee", "condition", "oracle")
 CONDITIONAL_WORDS = re.compile(r"\b(only (?:when|if|for)|provided|unless|assuming|as long as|given that)\b", re.I)
 
@@ -44,6 +45,7 @@ class Header:
     refines: list[str] = field(default_factory=list)   # `New=Existing`: New extends Existing's decision, deliberately
     distinct: list[str] = field(default_factory=list)  # `New=Existing`: New is a separate concept despite the shared decision
     see: list[str] = field(default_factory=list)
+    joins: list[str] = field(default_factory=list)     # a join node's compared nodes: each is a parent, by contract
     exports: list[str] = field(default_factory=list)
     guarantee: str = ""
     condition: str = ""
@@ -89,6 +91,15 @@ def lint(h: Header) -> list[str]:
         notes.append("the guarantee reads as conditional but declares no `condition:`; a child would not see it")
     if h.exports and not h.guarantee:
         notes.append("exports are declared without a `guarantee:`")
+    if h.joins:
+        if len(h.joins) < 2:
+            notes.append("a join node compares at least two nodes; `joins:` lists one")
+        if missing := [j for j in h.joins if j not in h.parents]:
+            notes.append(f"a join node relies on every node it joins by contract: add {', '.join(missing)} to "
+                         f"`parents:` (an `after:` edge watches no contract, so a loosened guarantee would go unseen)")
+        if h.oracle.strip().lower() != "equality":
+            notes.append("a join node compares implementations but declares no `oracle: equality`, so the "
+                         "degenerate-output mutant is not required of it")
     return notes
 
 
@@ -127,6 +138,8 @@ def spec_key(text: str) -> str:
         return text
     keyed = {k: (sorted(getattr(h, k)) if isinstance(getattr(h, k), list) else getattr(h, k))
              for k in ("parents", "implements", "exports", "guarantee", "condition", "oracle")}
+    if h.joins:      # only when present, so registered nodes without it keep their key
+        keyed["joins"] = sorted(h.joins)
     return json.dumps(keyed, sort_keys=True) + "\n" + "\n".join(" ".join(p.split()) for p in design_points(text))
 
 
@@ -371,6 +384,8 @@ def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str,
         fixes.setdefault("add", {})
         fixes.setdefault("remove", {})
     notes: list[str] = ownership_lint(h, node, nodes, root, concepts) if node else []
+    if unknown := [j for j in h.joins if j not in nodes]:
+        notes.append(f"`joins:` names {', '.join(unknown)}, which no registered node is; register them first")
     for ref in h.planned:
         if ref not in h.exports:
             notes.append(f"`planned: {ref}` is not in `exports:`; list it there too")

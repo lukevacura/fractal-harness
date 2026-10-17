@@ -103,6 +103,20 @@ Probes: `{"type":"grep","pattern":…,"paths":[globs],"expect":"present"|"absent
 (line-based), `{"type":"command","run":…}`, or `{"type":"all","probes":[…]}`. Every path a
 probe scans is a dependency. Globs follow `Path.glob` semantics.
 
+Every rule and fact shows an **evidence class**, what a pass establishes. Only `[exact]` is a guarantee the agent
+need not re-check; the others say what remains to verify:
+
+| Class | Probe | What a pass means |
+|---|---|---|
+| `exact` | `only_in`, commit gates, or a grep with `"evidence":"exact"` (human-declared) | the probe decides the property |
+| `proxy` | any other grep | a pattern approximates it |
+| `test` | `test`, `command` | a test passes; `fractal invariants` adds `mutation-checked by <node>` when a still-valid killed verdict names the test |
+| `doc-pinned` | `section`, `symbol` | the text is unchanged; the code is not checked |
+
+An `all` probe is as weak as its weakest member. `--behavioral` (or `"behavioral":true`) marks a rule about what the
+code does; `fractal invariants` reports it as a `gap` while only a pattern backs it, and reports probe-less and
+doc-pinned rules too.
+
 ## Keeping claims true
 
 After edits, `fractal update` classifies every affected claim locally (no model, no git),
@@ -140,6 +154,7 @@ refines: NearestK=Nearest   # a new export for an already-owned decision extends
 distinct: Other=Nearest     # ...or is a separate concept (silences the ownership lint either way)
 oracle: equality        # tests compare two implementations: verify-plan requires the
                         # "every output entry is NONE/empty" mutant to be recorded killed
+joins: engine_a, engine_b   # a join node: tests that these agree; each must be a parent (contract watched)
 ---
 ```
 
@@ -153,6 +168,9 @@ oracle: equality        # tests compare two implementations: verify-plan require
   concept's name): ownership belongs to a concept, and a cross-cutting decision many nodes implement is not checked.
   It also warns when code uses a module that is only declared `after:`.
 - `fractal update` lists `unchecked` decisions: registered, but no `Check:` line, citing claim or test names them.
+- `fractal activations` lists the nodes due an agent and why: `spec` or `contract` changed, a failing `probe` or a
+  `proposal` on the node's files, or a `survivor` mutant. A parent's implementation change that keeps its contract
+  raises nothing.
 - When one parent export changes, `verify-plan` suggests starting with the mutants whose code names it.
   Every verdict still counts as stale.
 

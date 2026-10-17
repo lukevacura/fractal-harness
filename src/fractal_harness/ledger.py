@@ -221,6 +221,56 @@ def _word_in(name: str, text: str) -> bool:
 
 # --- the plan -----------------------------------------------------------------------------
 
+def premise_change(cache: ClaimCache, root: Path, pre: dict) -> tuple[str | None, tuple[str, str] | None]:
+    """Why a node's recorded premises no longer hold, and the parent export that changed when that is why:
+    a decision claim changed or fails, or a parent's contract (guarantee, condition, exports) differs from
+    what was recorded. (None, None) when they all hold."""
+    for pid in pre["decisions"]:
+        e = cache.store.get(pid)
+        if e is None:
+            return f"decision claim {pid} changed or was removed", None
+        if e.status not in GOOD:
+            return f"decision claim {pid} is {e.status}: {e.detail}", None
+    for name, old in pre["parents"].items():
+        pinfo = cache.store.get_node(name)
+        if pinfo is None:
+            return f"parent {name} is no longer registered", None
+        try:
+            why = contract_change(old, root, pinfo["spec"])
+        except SymbolError as e:
+            return f"parent {name}'s contract is unreadable: {e}", None
+        if why:
+            m = re.match(r"export (\S+) (?:changed|was removed)", why)
+            return f"parent {name}'s contract changed: {why}", (name, m.group(1)) if m else None
+    return None, None
+
+
+def mutation_checked(cache: ClaimCache, root: Path, probe: dict | None) -> list[str]:
+    """Nodes whose still-valid `killed` verdicts name a test this probe runs: evidence that the test fails
+    when the code it guards is broken, not just that it passes. Heuristic: a test is matched by name against
+    the probe's test file or command, so a renamed test drops out rather than counts."""
+    texts: list[str] = []
+    stack = [probe] if probe else []
+    while stack:
+        p = stack.pop()
+        if p.get("type") == "all":
+            stack.extend(p["probes"])
+        elif p.get("type") == "command":
+            texts.append(p["run"])
+        elif p.get("type") == "test":
+            f = root / p["file"]
+            texts.append(p["file"] + "\n" + (f.read_text(errors="replace") if f.is_file() else ""))
+    out = []
+    for node in sorted(cache.store.verdict_nodes()):
+        try:
+            valid = plan(cache, root, node)["valid"]
+        except SymbolError:
+            continue
+        if any(r["result"] == "killed" and any(_word_in(t, x) for t in r["tests"] for x in texts) for r in valid):
+            out.append(node)
+    return out
+
+
 def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -> dict:
     """Classify every recorded mutant of `node`: {valid, stale: [(mutant, reason)], open, base,
     changed, node_reason}."""
@@ -250,30 +300,7 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
             pre = premises_of(info)
             if pre.get("prose_sha") and digest(stext) != pre["prose_sha"]:
                 prose_changed = info["spec"]
-            for pid in pre["decisions"]:
-                e = cache.store.get(pid)
-                if e is None:
-                    node_reason = f"decision claim {pid} changed or was removed"
-                elif e.status not in GOOD:
-                    node_reason = f"decision claim {pid} is {e.status}: {e.detail}"
-                if node_reason:
-                    break
-            for name, old in pre["parents"].items():
-                if node_reason:
-                    break
-                pinfo = cache.store.get_node(name)
-                if pinfo is None:
-                    node_reason = f"parent {name} is no longer registered"
-                    continue
-                try:
-                    why = contract_change(old, root, pinfo["spec"])
-                except SymbolError as e:
-                    node_reason = f"parent {name}'s contract is unreadable: {e}"
-                    continue
-                if why:
-                    node_reason = f"parent {name}'s contract changed: {why}"
-                    if m := re.match(r"export (\S+) (?:changed|was removed)", why):
-                        changed_export = (name, m.group(1))
+            node_reason, changed_export = premise_change(cache, root, pre)
         children = sorted(n for n, i in cache.store.all_nodes().items() if node in premises_of(i)["parents"])
     by_commit: dict[str, dict[str, list[tuple[int, int]]] | str] = {}
     for c in {r["commit"] for r in rows}:

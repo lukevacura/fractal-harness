@@ -38,7 +38,8 @@ records them as holding vacuously, and the commit gates (`fractal check`, `fract
 --message FILE`) evaluate them with the real staged paths / message (`ctx`).
 
 Evidence class (see `evidence_class`): what a passing probe establishes, shown beside every rule and fact.
-A probe's class follows from its type; only a human, writing the probe, can declare a grep exact with
+A probe's class follows from its type; `"behavioral": true` marks a rule about what the code does,
+which `evidence_gap` then holds to a test-class mechanism; only a human, writing the probe, can declare a grep exact with
 `"evidence": "exact"` (a pattern that decides the property, not one that approximates it).
 
 grep is line-based: it counts matching lines, so `^`/`$` anchor to each line.
@@ -126,8 +127,24 @@ def gate_leaves(probe: dict | None) -> list[dict]:
     return [probe] if probe.get("type") in GATE_TYPES else []
 
 
+def evidence_gap(probe: dict | None) -> str | None:
+    """Why a rule's mechanism does not establish it, or None. A rule with no probe or a doc-pinned one checks
+    nothing about the code; a rule its author marked `"behavioral": true` (it constrains what the code does,
+    not how it is written) needs more than a pattern."""
+    cls = evidence_class(probe)
+    if cls is None:
+        return "no probe: nothing checks the code"
+    if cls == "doc-pinned":
+        return "doc-pinned: only the rule's text is checked, not the code"
+    if cls == "proxy" and probe.get("behavioral"):
+        return "behavioral rule checked only by a pattern; it needs a test"
+    return None
+
+
 def validate(probe: dict) -> None:
     kind = probe.get("type")
+    if not isinstance(probe.get("behavioral", False), bool):
+        raise ProbeError('"behavioral" must be true or false')
     declared = probe.get("evidence")
     if declared is not None and not (declared == "exact" and kind == "grep" or declared == "proxy" and kind == "command"):
         raise ProbeError('"evidence" may only be "exact" on a grep probe or "proxy" on a command probe')

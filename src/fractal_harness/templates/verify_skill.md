@@ -49,4 +49,7 @@ Do not rely on the implementer's reasoning, and do not read it if it was left in
 5. Report PASS only if no mutant survived unresolved and every verdict is recorded and no required standard mutant is missing. List the
    survivors and any weak tests otherwise.
 
+A join node (`joins:`) failing means a parent's contract was too loose: fix it by tightening that parent's
+`guarantee:`/`condition:`, never by relaxing the join's check or its probe.
+
 Never run `fractal accept` or `fractal reject`.
