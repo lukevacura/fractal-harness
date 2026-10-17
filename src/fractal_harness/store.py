@@ -343,6 +343,22 @@ class Store:
                                "FROM mutants WHERE node = ? ORDER BY ts, file, start", (node,))
         return [{**dict(zip(cols, r)), "tests": json.loads(r[6])} for r in rows]
 
+    def verdict_nodes(self) -> set[str]:
+        return {r[0] for r in self.db.execute("SELECT DISTINCT node FROM mutants")}
+
+    def drop_verdicts(self, node: str, action: str, detail: str) -> int:
+        """Delete a node's recorded verdicts, auditing it."""
+        with self.db:
+            n = self.db.execute("DELETE FROM mutants WHERE node = ?", (node,)).rowcount
+            self.db.execute("INSERT INTO ledger_audit (ts, node, action, detail) VALUES (?, ?, ?, ?)",
+                            (time.time(), node, action, f"{n} verdict(s) dropped: {detail}"))
+        return n
+
+    def audit_add(self, node: str, action: str, detail: str) -> None:
+        with self.db:
+            self.db.execute("INSERT INTO ledger_audit (ts, node, action, detail) VALUES (?, ?, ?, ?)",
+                            (time.time(), node, action, detail))
+
     def get_run(self, key: str) -> dict | None:
         r = self.db.execute("SELECT status, code, tail, seconds FROM runs WHERE key = ?", (key,)).fetchone()
         return dict(zip(("status", "code", "tail", "seconds"), r)) if r else None
