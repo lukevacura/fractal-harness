@@ -77,6 +77,19 @@ def _is_public(key: str, patterns: list[str]) -> bool:
     return False
 
 
+def _refs(idx: Index, texts: dict[str, str], path: str, name: str) -> list[str]:
+    """Files other than the definition that use `name`. In Python a def has no `pub`: a module-level helper
+    the module itself calls is internal, not an orphan, so a use inside the defining file counts there. In
+    Rust `pub` is a promise of API, and a `pub` item only its own file uses is the smell this looks for."""
+    files = idx.files(name, path)
+    if path.endswith(".py"):
+        text = texts.get(path, "")
+        defs = len(re.findall(rf"^[ \t]*(?:async\s+)?(?:def|class)\s+{re.escape(name)}\b", text, re.M))
+        if len(re.findall(rf"(?<!\w){re.escape(name)}(?!\w)", text)) > defs:
+            files = sorted({*files, path})
+    return files
+
+
 def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
     import subprocess
     nodes = cache.store.all_nodes()
@@ -99,7 +112,7 @@ def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
             if path not in texts or not idx.mentions(name, path):
                 missing.append({"node": n, "symbol": key})
                 continue
-            others = idx.files(name, path)
+            others = _refs(idx, texts, path, name)
             if not any(not is_test(f) for f in others) and not _is_public(key, public):
                 dead.append({"node": n, "symbol": key, "tested_only": bool(others)})
         for p in h.parents:
@@ -125,7 +138,7 @@ def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
             if (len(name) < MIN_NAME or name in ENTRY_NAMES or f"{path}::{name}" in declared
                     or _is_public(f"{path}::{name}", public)):
                 continue
-            others = idx.files(name, path)
+            others = _refs(idx, texts, path, name)
             if not any(not is_test(f) for f in others):
                 result["undeclared_dead"].append({"symbol": f"{path}::{name}", "tested_only": bool(others)})
     registered = {i["spec"] for i in nodes.values()}

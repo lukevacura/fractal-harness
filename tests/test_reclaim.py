@@ -115,19 +115,20 @@ def test_verify_refuses_a_dirty_tree_or_failing_baseline_and_public_items_are_ne
         reclaim.verify(c, tmp_path, reclaim.sweep(c, tmp_path, {"code"}), cmd="python3 -c 'raise SystemExit(1)'")
 
 
-def test_store_candidates_orphan_verdicts_and_missing_spec(tmp_path, capsys):
+def test_verdicts_are_never_deleted_only_listed_and_a_node_without_a_spec_is_deregistered(tmp_path, capsys):
     c = _repo(tmp_path)
     ledger.record(c, tmp_path, "n", file="lib.py", span="2", mutant="m", result="killed", tests=["t"])
     ledger.record(c, tmp_path, "ghost", file="lib.py", span="2", mutant="m", result="killed", tests=["t"])
     (tmp_path / "n.md").unlink()
     got = {(x.what, x.action) for x in reclaim.sweep(c, tmp_path, {"store"})}
-    assert got == {("n", "deregister"), ("ghost", "drop_verdicts")}
+    assert got == {("n", "deregister"), ("ghost", "keep")}
     c.close()
     assert main(["--root", str(tmp_path), "reclaim", "--class", "store", "--apply"]) == 0
     assert "applied to the working tree" in capsys.readouterr().out
     c = ClaimCache(tmp_path)
-    assert c.store.verdict_nodes() == set() and c.store.get_node("n") is None
-    assert {a["action"] for a in c.store.audit()} >= {"reclaim"}
+    assert c.store.get_node("n") is None
+    assert c.store.verdict_nodes() == {"n", "ghost"}                      # evidence stays, for the deregistered node too
+    assert not hasattr(c.store, "drop_verdicts")
 
 
 def test_cli_plan_then_apply(tmp_path, capsys):

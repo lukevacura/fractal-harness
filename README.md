@@ -167,8 +167,8 @@ reported invalid. Outcomes are memoized by the commit's tree, the edits and the 
 `fractal reclaim` shrinks the repo to the smallest state that keeps every verdict: mark, sweep, gate, verify.
 `graph-check` marks what nothing reaches (anything under `public:` or `.fractal-public` is exempt; tests, rules and
 probes are never candidates). The sweep proposes three kinds: stale spec `exports:` (metadata), code nothing reaches
-(the item, its decorators/docs, and for Rust the `impl` blocks of that type), and store entries with nothing behind
-them (verdicts for an unregistered node, a node whose spec is gone). A code candidate that another live worktree
+(the item, its decorators/docs, and for Rust the `impl` blocks of that type), and a node whose spec is gone (deregistered).
+Recorded verdicts are evidence: they are never proposed for deletion, and those of unregistered nodes are only listed. A code candidate that another live worktree
 mentions is blocked. `--verify --cmd '<tests>'` applies each deletion in a scratch worktree of HEAD (all the passing
 ones together as a last check); `--apply` writes only what verified to your working tree and the audit log, and commits
 nothing. It needs a clean tree and tests that pass first. Passing is required, not proof: reference scanning is a word

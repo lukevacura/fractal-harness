@@ -107,8 +107,16 @@ def find(text: str, name: str) -> tuple[int, str]:
             enclosing = next((lines[j] for j in range(i - 1, -1, -1)
                               if lines[j].strip() and _indent(lines[j]) < _indent(lines[i])), "")
             if re.search(rf"\b({'|'.join(TYPE_KW)})\b.*\b{re.escape(q)}\b", enclosing):
-                scoped.append((i, kw))
-        hits = scoped
+                scoped.append((i, kw, enclosing))
+        # `Type::m` written both in `impl Type` and in `impl Trait for Type`: the bare name means the inherent
+        # one (qualify with the trait, `Trait::m`, for the other)
+        inherent = [h for h in scoped if re.match(r"\s*impl\b(?![^{]*\bfor\b)", h[2])]
+        if len(scoped) > 1 and len(inherent) == 1:
+            scoped = inherent
+        own = [h for h in scoped if re.match(r"\s*(?:pub(?:\([^)]*\))?\s+)?trait\b", h[2])]
+        if len(scoped) > 1 and len(own) == 1:      # `Trait::m` is the trait's own declaration, not an impl of it
+            scoped = own
+        hits = [(i, kw) for i, kw, _ in scoped]
     if len(hits) > 1 and any(kw not in LOCAL_KW for _, kw in hits):
         hits = [h for h in hits if h[1] not in LOCAL_KW]    # a method or item, not a local binding of its name
     if len(hits) > 1 and any(kw != "impl" for _, kw in hits):

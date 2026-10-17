@@ -3,10 +3,11 @@
 Mark, sweep, verify, gate:
 
   mark    `graph-check` finds what nothing reaches: exports the code no longer defines, dead exports, public
-          items no spec declares and nothing uses, and verdicts or nodes pointing at nothing. Anything marked
+          items no spec declares and nothing uses, and nodes pointing at nothing. Anything marked
           public (`public:`, `.fractal-public`) is never a candidate. Tests, rules and probes are never candidates.
   sweep   those become candidates, in classes: metadata (a spec's stale `exports:`), code (delete the item and
-          the `impl` blocks that hang off it), store (verdicts and nodes with nothing behind them).
+          the `impl` blocks that hang off it), store (a node whose spec is gone is deregistered). Recorded
+          verdicts are evidence and are never proposed for deletion; those of unregistered nodes are only listed.
   gate    a code candidate that another live worktree mentions is blocked (`impact.callers`): unreachable here
           is not unreachable there.
   verify  a code deletion is applied in a scratch worktree and the test command must still pass. Reference
@@ -150,8 +151,9 @@ def sweep(cache: ClaimCache, root: Path, classes: set[str], branches: bool = Fal
         for n, info in sorted(nodes.items()):
             if not (root / info["spec"]).is_file():
                 out.append(Candidate("store", n, f"its spec {info['spec']} no longer exists", n, action="deregister"))
-        for n in sorted(cache.store.verdict_nodes() - set(nodes)):
-            out.append(Candidate("store", n, "verdicts recorded for a node that is not registered", n, action="drop_verdicts"))
+        for n in sorted(cache.store.verdict_nodes() - set(nodes)):    # evidence: listed, never proposed for deletion
+            out.append(Candidate("store", n, "holds verdicts but is not registered; they are kept (re-register it with "
+                                 "`ledger node`)", n, action="keep"))
     return out
 
 
@@ -226,13 +228,10 @@ def apply(cache: ClaimCache, root: Path, cands: list[Candidate]) -> list[str]:
             if c.cls == "metadata":
                 done.append(f"removed export {c.what} from {c.spec_remove[0]}")
                 cache.store.audit_add(c.node or "(reclaim)", "reclaim", f"removed stale export {c.what} from {c.spec_remove[0]}")
-        if c.cls == "store":
-            if c.action == "deregister":
-                ledger.deregister(cache, c.node, forget_verdicts=True)
-                cache.store.audit_add(c.node, "reclaim", f"deregistered ({c.why})")
-            else:
-                cache.store.drop_verdicts(c.node, "reclaim", c.why)
-            done.append(f"{c.action.replace('_', ' ')} {c.node}")
+        if c.cls == "store" and c.action == "deregister":      # verdicts stay: they are evidence
+            ledger.deregister(cache, c.node)
+            cache.store.audit_add(c.node, "reclaim", f"deregistered, verdicts kept ({c.why})")
+            done.append(f"deregistered {c.node} (its verdicts are kept)")
     for path, spans in per.items():
         f = root / path
         f.write_text(remove_spans(f.read_text(errors="replace"), spans))
@@ -247,7 +246,7 @@ def render(cands: list[Candidate], info: dict | None = None) -> str:
         return "nothing to reclaim\n"
     out = ["# Reclamation plan", ""]
     names = {"metadata": "Stale spec metadata (no code changes)", "code": "Code nothing reaches",
-             "store": "Store entries with nothing behind them"}
+             "store": "Store entries with nothing behind them (verdicts are never deleted)"}
     for cls in ("metadata", "code", "store"):
         rows = [c for c in cands if c.cls == cls]
         if not rows:

@@ -94,3 +94,13 @@ def test_public_surface_can_be_marked_per_node_or_repo_wide_and_strict_can_gate(
     (tmp_path / ".fractal-public").write_text("src/testkit/**\ngrow\n")
     capsys.readouterr()
     assert main(["--root", str(tmp_path), "graph-check", "--strict"]) == 0
+
+
+def test_python_helpers_used_inside_their_own_module_are_not_orphans_but_rust_pub_items_are(tmp_path):
+    c = _repo(tmp_path, "from src.stats import mean\ndef grow():\n    return mean(1)\n", parents="stats")
+    (tmp_path / "src" / "util.py").write_text("def helper():\n    return 1\n\ndef api():\n    return helper()\n")
+    (tmp_path / "src" / "lib.rs").write_text("pub fn only_here() {}\nfn go() { only_here(); }\n")
+    _git(tmp_path, "add", "-A")
+    syms = {d["symbol"] for d in graph_check.check(c, tmp_path)["undeclared_dead"]}
+    assert "src/util.py::helper" not in syms and "src/util.py::api" in syms        # api has no caller at all
+    assert "src/lib.rs::only_here" in syms                                           # `pub` promised API nobody else uses

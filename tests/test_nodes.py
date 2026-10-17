@@ -472,3 +472,27 @@ def test_ledger_node_fix_writes_missing_parent_and_methods(tmp_path):
     h = parse_header((tmp_path / "grow.md").read_text())
     assert h.parents == ["stats"] and h.after == [] and r["premises"]["parents"]
     assert not any("module" in n for n in r["lint"])
+
+
+def test_inherent_and_trait_methods_of_the_same_type_resolve_to_the_inherent_one():
+    from fractal_harness.symbols import find
+    src = """pub trait Reducer {
+    fn offer(&mut self, x: f64);
+}
+
+pub struct Nearest;
+
+impl Nearest {
+    /// Inherent.
+    pub fn offer(&mut self, x: f64) -> bool {
+        true
+    }
+}
+
+impl Reducer for Nearest {
+    fn offer(&mut self, x: f64) {
+    }
+}
+"""
+    assert "-> bool" in find(src, "Nearest::offer")[1]                  # was "ambiguous"
+    assert find(src, "Reducer::offer")[0] == 1                          # the trait's own declaration, by the trait's name

@@ -346,14 +346,6 @@ class Store:
     def verdict_nodes(self) -> set[str]:
         return {r[0] for r in self.db.execute("SELECT DISTINCT node FROM mutants")}
 
-    def drop_verdicts(self, node: str, action: str, detail: str) -> int:
-        """Delete a node's recorded verdicts, auditing it."""
-        with self.db:
-            n = self.db.execute("DELETE FROM mutants WHERE node = ?", (node,)).rowcount
-            self.db.execute("INSERT INTO ledger_audit (ts, node, action, detail) VALUES (?, ?, ?, ?)",
-                            (time.time(), node, action, f"{n} verdict(s) dropped: {detail}"))
-        return n
-
     def audit_add(self, node: str, action: str, detail: str) -> None:
         with self.db:
             self.db.execute("INSERT INTO ledger_audit (ts, node, action, detail) VALUES (?, ?, ?, ?)",
