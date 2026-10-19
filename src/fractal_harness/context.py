@@ -24,17 +24,59 @@ DEFAULT_ID_PATTERN = r"\b[A-Z]{1,3}-?\d{1,3}\b"
 MAX_RULES = 12
 
 
+MAX_CLAIM = 2000
+
+
+def _orphaned(e: Edge) -> bool:
+    """A section claim whose heading no longer exists (renamed or removed), not merely one whose text changed."""
+    return e.status == "failed" and "no heading" in (e.detail or "")
+
+
+def _orphans_naming(cache: ClaimCache, path: str, ids: set[str]) -> list[Edge]:
+    """Orphaned section claims in `path` whose heading names one of `ids`: what a claim for the live heading replaces."""
+    return [e for e in cache.store.all() if (e.probe or {}).get("type") == "section" and _orphaned(e)
+            and split_ref(e.probe["ref"])[0] == path
+            and ids & set(re.findall(DEFAULT_ID_PATTERN, split_ref(e.probe["ref"])[1]))]
+
+
+def relinkable(cache: ClaimCache, root: Path) -> list[tuple[str, str]]:
+    """(claim id, ref) for each orphaned section claim whose decision ID heads a section that exists now:
+    `INVARIANTS.md::S4 (proposed)` became `S4`. `fractal put --section <ref>` replaces the dead claim."""
+    out = []
+    for e in cache.store.all():
+        if (e.probe or {}).get("type") != "section" or not _orphaned(e):
+            continue
+        path, heading = split_ref(e.probe["ref"])
+        for i in re.findall(DEFAULT_ID_PATTERN, heading):
+            try:
+                section_of(root, f"{path}::{i}")
+            except SymbolError:
+                continue
+            out.append((e.id, f"{path}::{i}"))
+            break
+    return out
+
+
 def put_extracted(cache: ClaimCache, root: Path, *, section: str | None = None, symbol: str | None = None,
-                  depends_on: list[str] | None = None) -> Edge:
+                  depends_on: list[str] | None = None, notes: list[str] | None = None) -> Edge:
     """Assert a claim carrying a section's or an interface's exact text, probed by its digest.
     A claim for the same ref with older text is replaced, not left behind failing."""
     ref, kind, probe_type = (section, "knowledge", "section") if section else (symbol, "interface", "symbol")
     text = (section_of if section else symbol_of)(root, ref)
     path = split_ref(ref)[0]
     post = text if section else f"{ref}\n{text}"
-    if len(post) > 2000:
-        raise SymbolError(f"{ref} is {len(post)} characters; claims carry at most 2000")
+    full = len(post)
+    if full > MAX_CLAIM:      # the probe's digest still covers the whole text; only what is injected is cut
+        post = post[:MAX_CLAIM - 120].rstrip() + f"\n... [{full} characters; cut here, the rest is at {ref}]"
+        if notes is not None:
+            notes.append(f"{ref} is {full} characters, over the {MAX_CLAIM} a claim carries: the injected text is cut, "
+                         "the digest covers all of it")
+    elif full > MAX_CLAIM * 0.9 and notes is not None:
+        notes.append(f"{ref} is {full} of {MAX_CLAIM} characters; one more amendment and the injected text is cut")
     old = [e for e in cache.store.all() if (e.probe or {}).get("type") == probe_type and e.probe.get("ref") == ref]
+    if section:     # a renamed heading ("S4 (proposed)" -> "S4") leaves a claim that can never pass again
+        old += [e for e in _orphans_naming(cache, path, set(re.findall(DEFAULT_ID_PATTERN, split_ref(ref)[1])))
+                if e not in old]
     edge = cache.put(post, [path], kind=kind, probe={"type": probe_type, "ref": ref, "sha": digest(text)},
                      depends_on=depends_on)
     for e in old:
@@ -75,6 +117,7 @@ def _cited(edges: list[Edge], spec: str, id_pattern: str) -> tuple[list[Edge], l
     found, missing = [], []
     for i in ids:
         hit = [e for e in sections if re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", e.post.splitlines()[0])]
+        hit = [e for e in hit if not _orphaned(e)] or hit    # a renamed heading leaves a dead claim behind
         found += [e for e in hit if e not in found]
         if not hit:
             missing.append(i)
@@ -107,6 +150,7 @@ def section_claims(edges: list[Edge], ids: list[str]) -> tuple[list[Edge], list[
     found, missing = [], []
     for i in ids:
         hit = [e for e in sections if re.search(rf"(?<![\w-]){re.escape(i)}(?![\w-])", e.post.splitlines()[0])]
+        hit = [e for e in hit if not _orphaned(e)] or hit    # a renamed heading leaves a dead claim behind
         found += [e for e in hit if e not in found]
         if not hit:
             missing.append(i)

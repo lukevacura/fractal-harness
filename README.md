@@ -99,6 +99,7 @@ fractal manifest app/lib           # an owner's context for a region: rules firs
 | `stale` | sources or upstream changed since the verdict; re-checked on demand |
 | `failed` | the probe did not pass |
 
+Paths in a grep probe may start with `!` to exclude (`"paths":["src/**","!src/legacy.rs"]`; at least one must not).
 Probes: `{"type":"grep","pattern":…,"paths":[globs],"expect":"present"|"absent"|{"count":n}|{"min":n}|{"max":n},"exclude":…}`
 (line-based), `{"type":"command","run":…}`, or `{"type":"all","probes":[…]}`. Every path a
 probe scans is a dependency. Globs follow `Path.glob` semantics.
@@ -168,9 +169,13 @@ joins: engine_a, engine_b   # a join node: tests that these agree; each must be 
   concept's name): ownership belongs to a concept, and a cross-cutting decision many nodes implement is not checked.
   It also warns when code uses a module that is only declared `after:`.
 - `fractal update` lists `unchecked` decisions: registered, but no `Check:` line, citing claim or test names them.
-- `fractal activations` lists the nodes due an agent and why: `spec` or `contract` changed, a failing `probe` or a
-  `proposal` on the node's files, or a `survivor` mutant. A parent's implementation change that keeps its contract
-  raises nothing.
+- `fractal activations` lists the nodes due an agent and why: `spec` or `contract` changed, a failing `probe` (rejected
+  rules don't count; a grep is blamed on the files with matching lines), or an unresolved `survivor` mutant. A parent's
+  implementation change that keeps its contract raises nothing. Two things are listed once, not per node: proposals
+  awaiting a human, and survivors that carry an equivalence argument but were never recorded `equivalent`.
+- When a decision heading is renamed (`S4 (proposed)` to `S4`), `fractal update` offers the relink; `fractal put
+  --section INVARIANTS.md::S4` replaces the dead claim, then re-run `ledger node` for the specs that cite it. A section
+  over 2,000 characters is injected cut (marked, with its ref) but its digest covers all of it; `put` warns at 90%.
 - When one parent export changes, `verify-plan` suggests starting with the mutants whose code names it.
   Every verdict still counts as stale.
 

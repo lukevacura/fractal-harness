@@ -2,7 +2,7 @@
 
 Probe shapes:
   {"type": "command", "run": "pytest -q tests/test_x.py", "expect_exit": 0, "timeout": 120}
-  {"type": "grep", "pattern": "auth_middleware", "paths": ["src/**/*.py"],
+  {"type": "grep", "pattern": "auth_middleware", "paths": ["src/**/*.py", "!src/legacy.py"],  # `!` excludes
    "exclude": "^\\s*(#|//)",  # optional: skip lines matching this (e.g. comments)
    "exclude_paths": ["src/legacy/*.py"],  # optional: files the rule does not cover
    "expect": "present" | "absent" | {"count": 3} | {"min": 1}}
@@ -163,8 +163,8 @@ def validate(probe: dict) -> None:
                 re.compile(probe["exclude"])
             except (re.error, TypeError) as e:
                 raise ProbeError(f"invalid exclude regex: {e}") from e
-        if not probe.get("paths"):
-            raise ProbeError("grep probe needs 'paths' (list of globs)")
+        if not probe.get("paths") or all(g.startswith("!") for g in probe["paths"]):
+            raise ProbeError("grep probe needs 'paths' (list of globs, at least one not starting with `!`)")
         if not isinstance(probe.get("exclude_paths", []), list):
             raise ProbeError("'exclude_paths' must be a list of globs")
         _expectation(probe.get("expect", "present"))
@@ -286,14 +286,15 @@ def _scan(pattern: str, probe: dict, root: Path, overlay: dict[str, str] | None)
     rx = re.compile(pattern)
     exclude = re.compile(probe["exclude"]) if probe.get("exclude") else None
     files: set[Path] = set()
-    for glob in probe["paths"]:
+    include = [g for g in probe["paths"] if not g.startswith("!")]
+    skip = [*probe.get("exclude_paths", []), *(g[1:] for g in probe["paths"] if g.startswith("!"))]
+    for glob in include:
         files.update(p for p in root.glob(glob) if p.is_file())
     from .regions import matches
     if overlay:  # in-memory files (e.g. a Write creating a new file) count if a glob covers them
-        files.update(root / rel for rel in overlay if any(matches(g, rel) for g in probe["paths"]))
-    if probe.get("exclude_paths"):
-        files = {f for f in files if not any(matches(g, f.relative_to(root).as_posix())
-                                             for g in probe["exclude_paths"])}
+        files.update(root / rel for rel in overlay if any(matches(g, rel) for g in include))
+    if skip:
+        files = {f for f in files if not any(matches(g, f.relative_to(root).as_posix()) for g in skip)}
     hits: list[tuple[str, int]] = []
     for path in sorted(files):
         rel = path.relative_to(root).as_posix()

@@ -20,7 +20,9 @@ Do not rely on the implementer's reasoning, and do not read it if it was left in
    tests, and note whether any test fails.
    - A failing test **kills** it. Note which tests fail.
    - No test fails: it **survived**. Decide whether it is really equivalent (same behavior on every
-     input): if so, write the argument. If not, the tests are weak: report that as a finding.
+     input): if so, write the argument and record it as `equivalent` with that `argument` (step 3); a survivor
+     left as `survived` keeps waking the node in `fractal activations`. If not, the tests are weak: report
+     that as a finding.
 3. **Record every verdict at the commit you verified**, so the next run can reuse it:
 
    ```

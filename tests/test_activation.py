@@ -36,7 +36,7 @@ def test_an_implementation_change_that_keeps_the_contract_wakes_nobody(tmp_path)
     assert _due(c, tmp_path) == {}
 
 
-def test_a_failing_probe_and_a_proposal_on_the_nodes_files_wake_it(tmp_path):
+def test_a_failing_probe_on_the_nodes_files_wakes_it_but_a_proposal_waits_for_a_human(tmp_path):
     c = _repo(tmp_path)
     bad = c.put("lib has no secret", ["lib.rs"], kind="invariant",
                 probe={"type": "grep", "pattern": "secret_impl", "paths": ["lib.rs"], "expect": "absent"})
@@ -44,8 +44,37 @@ def test_a_failing_probe_and_a_proposal_on_the_nodes_files_wake_it(tmp_path):
           probe={"type": "grep", "pattern": "///", "paths": ["lib.rs"]})
     c.put("elsewhere", ["other.rs"], kind="invariant", probe={"type": "grep", "pattern": "x", "paths": ["other.rs"]})
     c.check(bad.id)
-    rows = {r["node"]: r["events"] for r in activation.due(c, tmp_path)}
-    assert {e["kind"] for e in rows["stats"]} == {"probe", "proposal"} and set(rows) == {"stats"}
+    r = activation.scan(c, tmp_path)
+    assert {row["node"]: {e["kind"] for e in row["events"]} for row in r["nodes"]} == {"stats": {"probe"}}
+    assert sorted((p["rule"], p["nodes"]) for p in r["proposals"]) == [
+        ("lib has no secret", ["stats"]), ("lib is documented", ["stats"])]      # "elsewhere" touches no node
+    assert "2 proposal(s) awaiting a human" in activation.render(r)
+
+
+def test_a_rejected_rule_raises_no_probe_event(tmp_path):
+    c = _repo(tmp_path)
+    bad = c.put("lib has no secret", ["lib.rs"], kind="invariant",
+                probe={"type": "grep", "pattern": "secret_impl", "paths": ["lib.rs"], "expect": "absent"})
+    c.check(bad.id)
+    c.set_rule(bad.id, "rejected")
+    assert _due(c, tmp_path) == {}
+
+
+def test_a_failing_grep_is_blamed_on_the_files_with_matching_lines_and_bang_paths_exclude(tmp_path):
+    c = _repo(tmp_path)
+    (tmp_path / "sync.rs").write_text("pub fn sync() { secret_impl(1) }\n")
+    (tmp_path / "wide.md").write_text(_spec(guarantee="g", exports="sync.rs::sync"))
+    ledger.register_node(c, tmp_path, "wide", "wide.md")
+    probe = {"type": "grep", "pattern": "secret_impl", "paths": ["*.rs", "!sync.rs"], "expect": "absent"}
+    e = c.put("no secrets", ["*.rs"], kind="invariant", probe=probe)
+    c.check(e.id)
+    assert {r["node"] for r in activation.due(c, tmp_path)} == {"stats"}       # lib.rs matches; sync.rs is excluded
+    (tmp_path / "lib.rs").write_text((tmp_path / "lib.rs").read_text().replace("secret_impl", "other_impl"))
+    c.check(e.id)
+    assert activation.due(c, tmp_path) == []
+    assert probes.run({**probe, "paths": ["*.rs"]}, tmp_path).passed is False  # without the `!`, sync.rs fails it
+    with pytest.raises(probes.ProbeError):
+        probes.validate({**probe, "paths": ["!sync.rs"]})
 
 
 def test_a_survived_mutant_wakes_the_node_until_a_later_run_kills_it(tmp_path):
@@ -55,6 +84,15 @@ def test_a_survived_mutant_wakes_the_node_until_a_later_run_kills_it(tmp_path):
     assert _due(c, tmp_path) == {"stats": {"survivor"}}
     ledger.record(c, tmp_path, "stats", result="killed", tests=["t"], **kw)
     assert _due(c, tmp_path) == {}
+
+
+def test_a_survivor_with_an_equivalence_argument_needs_a_record_not_an_agent(tmp_path):
+    c = _repo(tmp_path)
+    ledger.record(c, tmp_path, "stats", file="lib.rs", span="1-2", mutant="m", result="survived",
+                  argument="operands commute")
+    r = activation.scan(c, tmp_path)
+    assert r["nodes"] == [] and [a["node"] for a in r["argued"]] == ["stats"]
+    assert "record them with" in activation.render(r)
 
 
 def test_activations_command(tmp_path, capsys):
@@ -128,3 +166,76 @@ def test_only_a_killed_verdict_counts_as_mutation_evidence(tmp_path):
     ledger.record(c, tmp_path, "stats", file="lib.rs", span="2-3", mutant="n", result="equivalent",
                   argument="same output", tests=["bit_equality"])
     assert ledger.mutation_checked(c, tmp_path, {"type": "command", "run": "cargo test bit_equality"}) == []
+
+
+# --- renamed headings, oversize sections ------------------------------------------------------
+
+def _decision_repo(tmp_path, heading="S4 (proposed)", body="Windows are exact.\n"):
+    c = _repo(tmp_path)
+    (tmp_path / "INVARIANTS.md").write_text(f"## {heading}\n{body}")
+    (tmp_path / "s4.md").write_text(_spec(guarantee="g", implements="S4"))
+    return c
+
+
+def test_a_renamed_heading_is_relinked_by_id_and_the_citing_node_stops_waking(tmp_path):
+    from fractal_harness.context import premises_of, put_extracted, relinkable
+    c = _decision_repo(tmp_path)
+    old = put_extracted(c, tmp_path, section="INVARIANTS.md::S4 (proposed)")
+    ledger.register_node(c, tmp_path, "s4", "s4.md")
+    (tmp_path / "INVARIANTS.md").write_text("## S4\nWindows are exact.\n")
+    c.verify()
+    assert relinkable(c, tmp_path) == [(old.id, "INVARIANTS.md::S4")]
+    assert _due(c, tmp_path)["s4"] == {"contract"}
+    new = put_extracted(c, tmp_path, section="INVARIANTS.md::S4")
+    assert c.store.get(old.id) is None and relinkable(c, tmp_path) == []      # the dead claim was replaced
+    ledger.register_node(c, tmp_path, "s4", "s4.md")
+    assert premises_of(c.store.get_node("s4"))["decisions"] == [new.id]
+    assert "s4" not in _due(c, tmp_path)
+
+
+def test_registration_prefers_the_live_claim_when_a_dead_one_for_the_same_id_is_still_there(tmp_path):
+    from fractal_harness.context import put_extracted, section_claims
+    c = _decision_repo(tmp_path)
+    old = put_extracted(c, tmp_path, section="INVARIANTS.md::S4 (proposed)")
+    (tmp_path / "INVARIANTS.md").write_text("## S4\nWindows are exact.\n")
+    c.verify()
+    new = c.put("## S4\nWindows are exact.", ["INVARIANTS.md"], kind="knowledge", probe={
+        "type": "section", "ref": "INVARIANTS.md::S4", "sha": __import__("fractal_harness.symbols").symbols.digest(
+            "## S4\nWindows are exact.")})
+    found, missing = section_claims(c.store.all(), ["S4"])
+    assert [e.id for e in found] == [new.id] and old.id != new.id and missing == []
+
+
+def test_a_section_over_the_claim_limit_is_cut_for_injection_but_hashed_whole(tmp_path):
+    from fractal_harness.context import MAX_CLAIM, put_extracted
+    c = _decision_repo(tmp_path, heading="D24", body="Rule text. " * 250)
+    notes: list[str] = []
+    e = put_extracted(c, tmp_path, section="INVARIANTS.md::D24", notes=notes)
+    assert len(e.post) <= MAX_CLAIM and "cut here, the rest is at INVARIANTS.md::D24" in e.post
+    assert notes and "over the 2000" in notes[0]
+    c.verify([e.id])
+    assert c.store.get(e.id).status == "verified"
+    (tmp_path / "INVARIANTS.md").write_text((tmp_path / "INVARIANTS.md").read_text() + "A late amendment.\n")
+    c.verify([e.id])
+    assert c.store.get(e.id).status == "failed"                      # the cut part is still watched
+
+
+def test_a_section_near_the_limit_warns(tmp_path):
+    from fractal_harness.context import put_extracted
+    c = _decision_repo(tmp_path, heading="D24", body="x" * 1850)
+    notes: list[str] = []
+    e = put_extracted(c, tmp_path, section="INVARIANTS.md::D24", notes=notes)
+    assert "cut here" not in e.post and notes and "one more amendment" in notes[0]
+
+
+def test_a_headerless_spec_also_ignores_the_dead_claim_for_a_renamed_heading(tmp_path):
+    from fractal_harness.context import _cited, put_extracted
+    c = _decision_repo(tmp_path)
+    old = put_extracted(c, tmp_path, section="INVARIANTS.md::S4 (proposed)")
+    (tmp_path / "INVARIANTS.md").write_text("## S4\nWindows are exact.\n")
+    c.verify()
+    new = c.put("## S4\nWindows are exact.", ["INVARIANTS.md"], kind="knowledge", probe={
+        "type": "section", "ref": "INVARIANTS.md::S4", "sha": __import__("fractal_harness.symbols").symbols.digest(
+            "## S4\nWindows are exact.")})
+    found, missing, _ = _cited(c.store.all(), "Implements S4.", r"\bS\d+\b")
+    assert [e.id for e in found] == [new.id] and old.id not in [e.id for e in found] and missing == []

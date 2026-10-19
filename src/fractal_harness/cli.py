@@ -525,8 +525,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         elif args.cmd == "activations":
             from . import activation
-            rows = activation.due(cache, root)
-            print(json.dumps(rows, indent=2) if args.json else activation.render(rows), end="")
+            found = activation.scan(cache, root)
+            print(json.dumps(found, indent=2) if args.json else activation.render(found), end="")
         elif args.cmd == "verify-plan":
             from . import ledger
             print(ledger.render(ledger.plan(cache, root, args.node, args.against), args.with_arguments,
@@ -540,8 +540,11 @@ def main(argv: list[str] | None = None) -> int:
                 print("\n" + impact.render(r), end="")
         elif args.cmd == "put" and (args.section or args.symbol):
             from .context import put_extracted
+            notes: list[str] = []
             _emit(args, [put_extracted(cache, root, section=args.section, symbol=args.symbol,
-                                       depends_on=args.dep)])
+                                       depends_on=args.dep, notes=notes)])
+            for note in notes:
+                print(f"note: {note}", file=sys.stderr)
         elif args.cmd == "put":
             if not args.claim:
                 raise CacheError("put needs a claim text, or --section / --symbol")
@@ -566,11 +569,13 @@ def main(argv: list[str] | None = None) -> int:
             if not args.json:
                 print(f"{len(stale)} claims newly stale")
         elif args.cmd == "update":
-            from .context import unchecked_decisions
+            from .context import relinkable, unchecked_decisions
             out = cache.update()
             unchecked = unchecked_decisions(cache, root)
+            relink = relinkable(cache, root)
             if args.json:
-                print(json.dumps({**out, **({"unchecked_decisions": unchecked} if unchecked else {})}, indent=2))
+                print(json.dumps({**out, **({"unchecked_decisions": unchecked} if unchecked else {}),
+                                  **({"relink": relink} if relink else {})}, indent=2))
             else:
                 for kind in MOTION_CLASSES:
                     if out.get(kind):
@@ -578,7 +583,10 @@ def main(argv: list[str] | None = None) -> int:
                 if unchecked:
                     print(f"{'unchecked':10} {len(unchecked):3}  {' '.join(unchecked[:8])}  "
                           "(decided, but no check line, citing claim or test names them)")
-                if not out and not unchecked:
+                for cid, ref in relink:
+                    print(f"{'relink':10} {cid}  its heading is gone but {ref} exists: `fractal put --section {ref}` "
+                          "replaces it, then re-run `fractal ledger node` for the specs that cite it")
+                if not out and not unchecked and not relink:
                     print("nothing changed")
         elif args.cmd == "repair":
             from .repair import repair
