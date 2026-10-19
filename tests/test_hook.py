@@ -224,3 +224,11 @@ def test_rules_show_their_evidence_class_and_only_exact_ones_are_guaranteed(tmp_
     assert "[proxy] no file imports legacy" in ctx            # an undeclared grep only approximates the rule
     assert "[exact] only the ring owns eviction" in ctx
     assert "[exact] means the probe decides the rule" in ctx and "[doc-pinned]" in ctx
+
+
+def test_task_notifications_inject_nothing(tmp_path: Path):
+    root = _repo(tmp_path)
+    note = ("<task-notification>\n<output-file>/private/tmp/x/app.py/GPS_FILTER.output</output-file>\n"
+            "GPS distance filter finished\n</task-notification>")
+    assert _ctx(root, note) == ""
+    assert _ctx(root, "what GPS distance filter do we use?") != ""

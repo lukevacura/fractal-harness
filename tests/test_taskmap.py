@@ -36,3 +36,11 @@ def test_weak_spot_and_empty_map(repo):
     m = task_map(repo, "Give lonely a docstring in pkg/orphan.py", capacity=1)
     assert m.weak == ["pkg/orphan.py"] and "weak spot" in render(m)
     assert task_map(repo, "update the marketing copy").empty
+
+
+def test_paths_outside_the_repo_seed_nothing(repo):
+    _prep(repo)
+    for named in ("/private/tmp/claude-501/proj/tasks/abc.output", "~/Downloads/notes/draft.md",
+                  "../sibling/pkg/new.py", "pkg/../../etc/passwd.txt"):
+        assert task_map(repo, f"Read the output at {named}").empty, named
+    assert not task_map(repo, "Add pkg/brand_new.py with a helper").empty    # a new file inside the repo still seeds

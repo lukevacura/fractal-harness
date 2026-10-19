@@ -233,12 +233,19 @@ def context_for(root: Path, prompt: str, session_id: str | None = None,
     return text or None
 
 
+def _is_notification(prompt: str) -> bool:
+    """A harness message (background-task completion), not a task the user wrote."""
+    return prompt.lstrip().startswith("<task-notification")
+
+
 def prompt_hook(stdin: str) -> str:
     """UserPromptSubmit: returns the hook's stdout (possibly empty)."""
     if _disabled():
         return ""
     try:
         data = json.loads(stdin or "{}")
+        if _is_notification(data.get("prompt", "")):
+            return ""
         ctx = context_for(_root(data), data.get("prompt", ""), data.get("session_id"))
     except Exception as e:  # a broken cache must never block the user's prompt
         print(f"fractal hook: {e}", file=sys.stderr)

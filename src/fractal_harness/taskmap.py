@@ -35,6 +35,9 @@ DEF_RXS = [
     re.compile(r"^\s*(?:async\s+)?def\s+(\w+)", re.M),
     re.compile(r"^ {0,2}(?:static\s+|late\s+)*(?:final|const|var)\s+(?:[\w<>?,\s]+\s+)?(\w+)\s*[=;]", re.M),
 ]
+# A relative path the task writes; an absolute (`/tmp/x/y.out`) or home (`~/x/y.md`) path is outside the repo, so a
+# match may not start mid-path.
+NAMED_PATH = re.compile(r"(?<![\w./~-])[\w.-]+(?:/[\w.-]+)+\.\w+")
 MAX_DEF_FILES = 6            # an identifier defined in more files than this is too generic to route by
 MAX_REGIONS = 5
 MAX_CONTRACTS_PER_REGION = 4
@@ -110,8 +113,8 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
     for f in files:
         if f.lower() in low or (len(PurePosixPath(f).name) >= 6 and PurePosixPath(f).name.lower() in low):
             seeds.setdefault(f, []).append("named in the task")
-    for m in re.findall(r"[\w.-]+(?:/[\w.-]+)+\.\w+", prompt):
-        if m not in fileset:   # a new file the task asks for: seed its directory's neighbours
+    for m in NAMED_PATH.findall(prompt):
+        if m not in fileset and ".." not in m.split("/"):   # a new file the task asks for: seed its directory's neighbours
             seeds.setdefault(m, []).append("new file named in the task")
     index = definition_index(root, source)
     idents = list(dict.fromkeys(m for m in IDENT.findall(prompt) if len(m) >= 5))
