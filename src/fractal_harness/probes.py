@@ -58,6 +58,10 @@ class ProbeResult:
     passed: bool
     detail: str
     matches: list[tuple[str, int]] = field(default_factory=list)  # (repo-relative file, 0-based line)
+    vacuous: bool = False    # passed only because it scanned nothing: absence of scope, not evidence of absence
+
+
+VACUOUS = "vacuous: "
 
 
 class ProbeError(ValueError):
@@ -246,6 +250,9 @@ def run(probe: dict, root: Path, overlay: dict[str, str] | None = None,
         failed = [f"#{i}: {r.detail}" for i, r in enumerate(results) if not r.passed]
         if failed:
             return ProbeResult(False, "; ".join(failed), matches)
+        empty = [f"#{i}: {r.detail}" for i, r in enumerate(results) if r.vacuous]
+        if empty:
+            return ProbeResult(True, VACUOUS + "; ".join(empty), matches, vacuous=True)
         return ProbeResult(True, f"all {len(results)} probes passed", matches)
     if probe["type"] == "only_in":
         return _run_only_in(probe, root, overlay)
@@ -314,6 +321,8 @@ def _run_grep(probe: dict, root: Path, overlay: dict[str, str] | None = None) ->
     count = len(hits)
     ok = {"count": count == n, "min": count >= n, "max": count <= n}[op]
     # An "absent" probe has no positive matches to anchor on; its anchors come from violations.
+    if ok and nfiles == 0:    # a glob that matches nothing (a typo, a moved directory) must not read as "none found"
+        return ProbeResult(True, f"{VACUOUS}the paths match no files (expected {op} {n})", [], vacuous=True)
     return ProbeResult(ok, f"{count} matching lines in {nfiles} files (expected {op} {n})", hits[:20])
 
 

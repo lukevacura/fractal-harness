@@ -209,9 +209,10 @@ class ClaimCache:
                     self.store.set_motion(eid, None, {"kind": "rewrite", "residuals": comps,
                                                       "rewritten": [f for f, _ in rewritten]})
                 else:
-                    status = "trusted" if trusted_deps else "verified"
-                    detail = ("probe passed; depends on trusted: " + ", ".join(trusted_deps)
-                              if trusted_deps else result.detail)
+                    # Trusted, not verified: a probe that scanned nothing has shown neither presence nor absence.
+                    status = "trusted" if trusted_deps or result.vacuous else "verified"
+                    detail = (result.detail if result.vacuous else "probe passed; depends on trusted: "
+                              + ", ".join(trusted_deps) if trusted_deps else result.detail)
                     self.store.set_status(eid, status, detail, fp, hashes)
                     self.store.set_motion(eid, motion.capture(self.root, result.matches), None)
                     self._snapshot(hashes)

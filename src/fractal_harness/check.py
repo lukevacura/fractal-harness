@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .cache import STORE_DIR, ClaimCache, store_root
+from .probes import VACUOUS
 
 
 def staged_paths(root: Path) -> list[str] | None:
@@ -75,7 +76,9 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
     from .setup import forbidden_staged
     own = forbidden_staged(staged or [])
     gate_bad, gate_proposed = gate_violations(edges, root, {"staged": staged})
-    lines = [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}" for e in proposed_failing]
+    lines = [f"note: enforced rule {e.id} checks nothing: {e.detail[len(VACUOUS):]}\n          {e.post}"
+             for e in edges if e.enforced and (e.detail or "").startswith(VACUOUS)]
+    lines += [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}" for e in proposed_failing]
     lines += [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}\n          probe: {d}"
               for e, d in gate_proposed]
     lines += [f"VIOLATION {e.id}: {e.post}\n          probe: {d}" for e, d in gate_bad]

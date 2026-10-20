@@ -191,3 +191,25 @@ def test_grep_exclude_paths(cache, repo):
     assert cache.put("no eval anywhere", ["src/*.py"], probe=probe).status == "failed"
     ok = {**probe, "exclude_paths": ["src/legacy.py"]}
     assert cache.put("no eval outside legacy.py", ["src/*.py"], probe=ok).status == "verified"
+
+
+def test_a_probe_that_scans_nothing_is_trusted_not_verified(cache, repo):
+    typo = cache.put("no one calls eval", ["src/*.py"], probe=grep(r"\beval\(", "srcs/*.py", expect="absent"))
+    assert (typo.status, typo.detail.startswith("vacuous: ")) == ("trusted", True)
+    real = cache.put("no one calls eval", ["src/*.py"], probe=grep(r"\beval\(", expect="absent"))
+    assert real.status == "verified"
+    # an `all` is as weak as its weakest member
+    both = cache.put("both", ["src/*.py"], probe={"type": "all", "probes": [
+        grep(r"\beval\(", expect="absent"), grep(r"\beval\(", "srcs/*.py", expect="absent")]})
+    assert both.status == "trusted"
+
+
+def test_a_vacuous_probe_is_verified_once_files_appear(cache, repo):
+    e = cache.put("nothing in plugins calls eval", ["plugins/*.py"], probe=grep(r"\beval\(", "plugins/*.py", "absent"))
+    assert e.status == "trusted"
+    (repo / "plugins").mkdir()
+    (repo / "plugins" / "a.py").write_text("x = 1\n")
+    cache.refresh()
+    assert cache.check(e.id).status == "verified"
+    (repo / "plugins" / "a.py").write_text("eval('1')\n")
+    assert cache.check(e.id).status == "failed"

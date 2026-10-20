@@ -204,3 +204,19 @@ def test_check_refuses_to_commit_fractal_files(tmp_path):
     _git(tmp_path, "add", "-f", ".fractal")
     code, report = check(tmp_path)
     assert code == 1 and "never be committed" in report and ".fractal/" in report
+
+
+def test_enforced_rule_over_no_files_is_reported_not_blocking_and_not_claimed_to_hold(tmp_path):
+    import json
+    from fractal_harness.hook import prompt_hook
+    c = ClaimCache(tmp_path)
+    (tmp_path / "app.py").write_text("x = 1\n")
+    rule = c.put("handlers never call eval", ["*.go"], kind="invariant",
+                 probe={"type": "grep", "pattern": r"\beval\(", "paths": ["*.go"], "expect": "absent"})
+    c.set_rule(rule.id, "enforced")
+    c.close()
+    code, report = check(tmp_path)
+    assert code == 0 and f"enforced rule {rule.id} checks nothing" in report
+    out = prompt_hook(json.dumps({"prompt": "change app.py", "cwd": str(tmp_path)}))
+    ctx = json.loads(out)["hookSpecificOutput"]["additionalContext"]
+    assert "NOT CHECKED" in ctx and "holds now" not in ctx

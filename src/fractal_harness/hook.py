@@ -25,6 +25,7 @@ import sys
 from pathlib import Path
 
 from .cache import STORE_DIR, ClaimCache, dependencies, store_root
+from .probes import VACUOUS
 from .store import Edge, tokens
 
 MAX_FACTS = 6
@@ -174,6 +175,8 @@ def _class_tag(e: Edge) -> str:
 def _rule_line(e: Edge) -> str:
     if e.status == "failed":
         return f"- {_class_tag(e)}{e.post}\n  ✗ VIOLATED NOW: {e.detail}"
+    if (e.detail or "").startswith(VACUOUS):
+        return f"- {_class_tag(e)}{e.post}\n  ? NOT CHECKED: {e.detail[len(VACUOUS):]}"
     return f"- {_class_tag(e)}{e.post}\n  ✓ holds now: {evidence(e)}"
 
 
