@@ -150,7 +150,8 @@ def test_the_gap_views_see_every_kind_of_gap(repo):
             m = decorate(random_model(rng), rng)
             sc.save(m, f"s{seed}")
             seen |= {k for k, _ in sc.gap_pairs(Strength.CONSTRUCTION)}
-    assert seen == {"edge-assumption", "undischarged", "assembly-unjudged", "claim-undischarged", "weak"}
+    assert seen == {"edge-assumption", "undischarged", "assembly-unjudged", "claim-undischarged", "weak",
+                    "unfed-input", "unused-output"}
 
 
 def reach(m: Model) -> dict[str, set[str]]:

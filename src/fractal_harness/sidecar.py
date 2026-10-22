@@ -33,7 +33,7 @@ from .model import (Discharge, Edge, Gap, Invariant, Model, Node, Port, Preserve
 
 SIDECAR_DIR = "fractal"
 DB_NAME = "model.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SidecarError(RuntimeError):
@@ -59,12 +59,12 @@ CREATE TABLE IF NOT EXISTS log(seq INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT N
 """
 
 PROJECTION_TABLES = ("node", "owns", "port", "port_inv", "invariant", "assembled", "preserve", "edge")
-PROJECTION_VIEWS = ("feeds", "gap_edge", "gap_invariant", "gap_claim")
+PROJECTION_VIEWS = ("feeds", "gap_port", "gap_edge", "gap_invariant", "gap_claim")
 
 PROJECTION = """
 CREATE TABLE node(id TEXT, parent TEXT, depth INT, leaf INT, state INT, intent TEXT);
 CREATE TABLE owns(node TEXT, entry TEXT);
-CREATE TABLE port(node TEXT, name TEXT, direction TEXT, type TEXT);
+CREATE TABLE port(node TEXT, name TEXT, direction TEXT, type TEXT, many INT, binds TEXT);
 CREATE TABLE port_inv(node TEXT, port TEXT, direction TEXT, ref TEXT);
 CREATE TABLE invariant(ref TEXT, owner TEXT, name TEXT, statement TEXT, strength INT, pointer TEXT);
 CREATE TABLE assembled(ref TEXT, from_ref TEXT);
@@ -77,6 +77,18 @@ CREATE VIEW feeds AS
     SELECT src_node, dst_node FROM edge WHERE kind = 'sibling'
     UNION SELECT r.a, e.dst_node FROM r JOIN edge e ON e.kind = 'sibling' AND e.src_node = r.b)
   SELECT a, b FROM r;
+
+-- Below the top level, an input nothing feeds and an output nothing consumes. (The top level faces the outside.)
+CREATE VIEW gap_port AS
+  SELECT 'unfed-input' AS kind, p.node || '.' || p.name AS subject
+  FROM port p JOIN node n ON n.id = p.node
+  WHERE p.direction = 'in' AND n.parent <> ''
+    AND NOT EXISTS (SELECT 1 FROM edge e WHERE e.dst_node = p.node AND e.dst_port = p.name)
+  UNION
+  SELECT 'unused-output', p.node || '.' || p.name
+  FROM port p JOIN node n ON n.id = p.node
+  WHERE p.direction = 'out' AND n.parent <> ''
+    AND NOT EXISTS (SELECT 1 FROM edge e WHERE e.src_node = p.node AND e.src_port = p.name);
 
 -- A port requires an invariant the port feeding it does not provide. (A required invariant implies the
 -- requiring port exists; the feeding port may not, and then the edge is malformed, not a gap.)
@@ -212,7 +224,8 @@ class Sidecar:
                             (n.id, parent_of(n.id), n.id.count("/"), int(n.id in leaves), int(n.state), n.intent))
             self.db.executemany("INSERT INTO owns VALUES (?, ?)", [(n.id, o) for o in n.owns])
             for p in n.ports:
-                self.db.execute("INSERT INTO port VALUES (?, ?, ?, ?)", (n.id, p.name, p.direction, p.type))
+                self.db.execute("INSERT INTO port VALUES (?, ?, ?, ?, ?, ?)",
+                                (n.id, p.name, p.direction, p.type, int(p.many), p.binds))
                 self.db.executemany("INSERT INTO port_inv VALUES (?, ?, ?, ?)",
                                     [(n.id, p.name, p.direction, r) for r in p.invariants])
             for i in n.invariants:
@@ -234,10 +247,10 @@ class Sidecar:
         """The model as the projection holds it. Equal to `head()` unless the projection lost something."""
         q = self.db.execute
         ports: dict[str, list[Port]] = {}
-        for node, name, direction, type_ in q("SELECT node, name, direction, type FROM port"):
+        for node, name, direction, type_, many, binds in q("SELECT node, name, direction, type, many, binds FROM port"):
             refs = tuple(r for (r,) in q("SELECT ref FROM port_inv WHERE node = ? AND port = ? AND direction = ?",
                                          (node, name, direction)))
-            ports.setdefault(node, []).append(Port(name, direction, type_, refs))
+            ports.setdefault(node, []).append(Port(name, direction, type_, refs, bool(many), binds))
         nodes = []
         for nid, state, intent in q("SELECT id, state, intent FROM node"):
             invs = []
@@ -263,7 +276,7 @@ class Sidecar:
     def gap_pairs(self, floor: Strength | None = None) -> set[tuple[str, str]]:
         """(kind, subject) of every gap in the head model, from the views: the relational twin of `Model.gaps`."""
         out = set()
-        for view in ("gap_edge", "gap_invariant", "gap_claim"):
+        for view in ("gap_port", "gap_edge", "gap_invariant", "gap_claim"):
             out |= {(k, s) for k, s in self.query(f"SELECT kind, subject FROM {view}")}
         if floor is not None:
             out |= {(k, s) for k, s in self.query(WEAK, {"floor": int(floor)})}

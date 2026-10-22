@@ -23,7 +23,11 @@ def random_model(rng: random.Random) -> Model:
             inv = ()
             if rng.random() < 0.6:
                 inv = (Invariant("p", f"prop {counter}", Discharge(rng.choice(list(Strength)), f"t/{counter}.py::t")),)
-            nodes.append(Node(nid, ports=(Port("i", IN), Port("o", OUT, invariants=(ref_of(nid, "p"),) if inv else ())),
+            kind = rng.choice(["", "int"])            # "" matches anything, "int" matches itself: never a mismatch
+            bind = (lambda tag: f"src/{counter}.py::{tag}{counter}") if leaf else (lambda tag: "")
+            nodes.append(Node(nid, ports=(Port("i", IN, kind, many=rng.random() < 0.3, binds=bind("g")),
+                                          Port("o", OUT, kind, (ref_of(nid, "p"),) if inv else (),
+                                               many=rng.random() < 0.3, binds=bind("f"))),
                               invariants=inv, owns=(f"src/{counter}.py",) if leaf else ()))
             if not leaf:
                 inner = grow(nid, depth + 1)

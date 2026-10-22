@@ -5,8 +5,8 @@ import pytest
 
 from modelgen import random_model
 
-from fractal_harness.model import (Discharge, Edge, Invariant, Model, Node, Port, Preserve, Strength, covers, diff,
-                                   local_name, parent_of, ref_of, split_ref, IN, OUT)
+from fractal_harness.model import (FORMAT_VERSION, Discharge, Edge, Invariant, Model, ModelFormatError, Node, Port,
+                                   Preserve, Strength, covers, diff, local_name, parent_of, ref_of, split_ref, IN, OUT)
 
 SORTED = Invariant("sorted", "output is sorted", Discharge(Strength.PROPERTY, "tests/t.py::test_sorted"))
 KEEPS = Preserve("top/a#sorted", Discharge(Strength.PROPERTY, "tests/t.py::test_b_keeps_order"))
@@ -76,11 +76,11 @@ def test_assembled_invariants_may_only_be_defined_over_descendants():
 
 def test_edges_must_name_real_ports_in_a_wireable_relation_and_direction():
     m = pipe()
-    assert rules(m.with_edges(Edge(("top/a", "ghost"), ("top/b", "i")))) == ["edge-endpoint"]
+    assert rules(m.with_edges(Edge(("top/a", "ghost"), ("top/b", "o")))) == ["edge-endpoint"]
     far = m.with_nodes(Node("other", ports=(Port("p", IN),)), Node("other/deep", ports=(Port("q", IN),)))
     assert "edge-level" in rules(far.with_edges(Edge(("top/a", "o"), ("other/deep", "q"))))
-    assert rules(m.with_edges(Edge(("top/a", "i"), ("top/b", "i")))) == ["edge-direction"]        # an input feeding an input
-    assert rules(m.with_edges(Edge(("top", "y"), ("top/a", "i")))) == ["edge-direction"]          # an output passed inward
+    assert rules(m.with_edges(Edge(("top/a", "i"), ("top/b", "o")))) == ["edge-direction"]        # an input feeding an output
+    assert rules(m.with_edges(Edge(("top", "y"), ("top/a", "o")))) == ["edge-direction"]          # an output passed inward
 
 
 def _loop() -> Model:
@@ -367,8 +367,8 @@ def test_reports_are_immutable_too():
 
 
 def test_an_edge_to_a_missing_node_is_a_violation_and_gaps_skip_malformed_edges():
-    m = pipe().with_edges(Edge(("top/a", "o"), ("top/ghost", "i")), Edge(("ghost", "o"), ("top/b", "i")))
-    assert sorted((v.rule, v.subject) for v in m.validate()) == [("edge-endpoint", "ghost.o -> top/b.i"),
+    m = pipe().with_edges(Edge(("top/a", "o"), ("top/ghost", "i")), Edge(("ghost", "o"), ("top/b", "o")))
+    assert sorted((v.rule, v.subject) for v in m.validate()) == [("edge-endpoint", "ghost.o -> top/b.o"),
                                                                  ("edge-endpoint", "top/a.o -> top/ghost.i")]
     far = pipe().with_nodes(Node("other", ports=(Port("p", IN, invariants=("top/a#sorted",)),)))
     far = far.with_edges(Edge(("top/a", "o"), ("other", "p")))
@@ -410,3 +410,154 @@ def test_keys_do_not_depend_on_how_references_happen_to_sort():
     moved = m.rename("m/aa", "m/zzz")
     assert m.interface_digest("m/c") == moved.interface_digest("m/c")
     assert m.keys()["m/c"] == moved.keys()["m/c"]
+
+
+
+# ---- wiring is typed and counted, ports bind to code, content is per symbol, the format is versioned -------------
+
+def port(m: Model, node_id: str, name: str, **fields) -> Model:
+    node = m.node(node_id)
+    return tweak(m, node_id, ports=tuple(replace(p, **fields) if p.name == name else p for p in node.ports))
+
+
+def with_c() -> Model:
+    """pipe() plus a third leaf `c`, wired to nothing."""
+    return pipe().with_nodes(Node("top/c", ports=(Port("i", IN), Port("o", OUT)), owns=("src/c.py",)))
+
+
+def test_edge_types_must_agree_and_an_empty_type_matches_anything():
+    m = pipe()
+    assert port(port(m, "top/a", "o", type="int"), "top/b", "i", type="int").validate() == []
+    bad = port(port(m, "top/a", "o", type="int"), "top/b", "i", type="str")
+    assert [(v.rule, v.subject) for v in bad.validate()] == [("edge-type", "top/a.o -> top/b.i")]
+    assert "'int' feeds 'str'" in bad.validate()[0].message
+    assert port(m, "top/a", "o", type="int").validate() == []                  # the far end is untyped
+    assert port(m, "top/b", "i", type="int").validate() == []
+    inward = port(port(m, "top", "x", type="str"), "top/a", "i", type="int")   # boundary edges are checked the same way
+    assert [(v.rule, v.subject) for v in inward.validate()] == [("edge-type", "top.x -> top/a.i")]
+    outward = port(port(m, "top/b", "o", type="int"), "top", "y", type="str")
+    assert [(v.rule, v.subject) for v in outward.validate()] == [("edge-type", "top/b.o -> top.y")]
+
+
+def test_a_port_fed_by_two_edges_must_declare_many():
+    m = with_c().with_edges(Edge(("top/c", "o"), ("top/b", "i")))
+    assert [(v.rule, v.subject) for v in m.validate()] == [("fan-in", "top/b.i")]
+    assert "2 edges" in m.validate()[0].message
+    assert port(m, "top/b", "i", many=True).validate() == []
+    two_children = with_c().with_edges(Edge(("top/c", "o"), ("top", "y")))        # a container output fed by two children
+    assert [(v.rule, v.subject) for v in two_children.validate()] == [("fan-in", "top.y")]
+    assert with_c().with_edges(Edge(("top/a", "o"), ("top/c", "i"))).validate() == []   # fan-out is fine
+
+
+def test_below_the_top_an_unfed_input_and_an_unused_output_are_gaps():
+    assert pipe().gaps() == []
+    assert [(g.kind, g.subject) for g in with_c().gaps()] == [("unfed-input", "top/c.i"), ("unused-output", "top/c.o")]
+    lone = Model.of([Node("lone", ports=(Port("i", IN), Port("o", OUT)))])        # the top level faces the outside world
+    assert lone.gaps() == []
+    two = (Port("i", IN), Port("o", OUT))
+    inner = Model.of([Node("t"), Node("t/k", ports=two), Node("t/k/x", ports=two, owns=("x.py",))],
+                     [Edge(("t/k", "i"), ("t/k/x", "i")), Edge(("t/k/x", "o"), ("t/k", "o"))])
+    assert inner.validate() == []                                                  # a nested container's own ports count
+    assert {(g.kind, g.subject) for g in inner.gaps()} == {("unfed-input", "t/k.i"), ("unused-output", "t/k.o")}
+    fed = inner.with_nodes(Node("t", ports=two)).with_edges(Edge(("t", "i"), ("t/k", "i")), Edge(("t/k", "o"), ("t", "o")))
+    assert fed.validate() == [] and fed.gaps() == []
+
+
+def bound() -> Model:
+    return port(pipe(), "top/a", "o", binds="src/a.py::produce")
+
+
+def test_a_bound_port_must_name_code_its_leaf_owns_and_only_leaves_bind():
+    assert bound().validate() == []
+    assert port(pipe(), "top/a", "o", binds="src/a.py").validate() == []             # the whole file it owns
+    elsewhere = port(pipe(), "top/a", "o", binds="src/b.py::produce")
+    assert [(v.rule, v.subject) for v in elsewhere.validate()] == [("bind-unowned", "top/a.o")]
+    by_symbol = tweak(pipe(), "top/a", owns=("src/a.py::produce",))
+    assert port(by_symbol, "top/a", "o", binds="src/a.py::produce::helper").validate() == []   # a member of what it owns
+    assert [v.rule for v in port(by_symbol, "top/a", "o", binds="src/a.py::other").validate()] == ["bind-unowned"]
+    container = port(pipe(), "top", "y", binds="src/a.py::x")
+    assert [(v.rule, v.subject) for v in container.validate()] == [("bind-internal", "top.y")]
+
+
+def test_a_signature_change_is_an_interface_change_that_reaches_consumers():
+    m = bound()
+    s1, s2 = {"src/a.py::produce": "v1"}, {"src/a.py::produce": "v2"}
+    assert m.interface_digest("top/a", s1) != m.interface_digest("top/a", s2)
+    assert m.interface_digest("top/b", s1) == m.interface_digest("top/b", s2)         # b is not bound to it
+    d = diff(m, m, {}, {}, s1, s2)
+    assert d.interface_changed == {"top/a"} and d.key_changed == {"top/a", "top/b", "top"}
+    body_only = diff(m, m, {"src/a.py": "1"}, {"src/a.py": "2"}, s1, s1)               # a body edit, same signature: cut off at a
+    assert body_only.interface_changed == frozenset() and body_only.key_changed == {"top/a", "top"}
+    assert pipe().keys(signatures=s1) == pipe().keys(signatures=s2)                    # an unbound port ignores signatures
+    assert m.interface_digest("top/a") == m.interface_digest("top/a", {}) == m.interface_digest("top/a", {"src/a.py::produce": ""})
+    assert m.subtree_key("top/a", signatures=s1) != m.subtree_key("top/a", signatures=s2)
+
+
+def test_stale_bindings_name_the_ports_whose_symbol_the_code_lost():
+    assert bound().stale_bindings({}) == [("top/a.o", "src/a.py::produce")]
+    assert bound().stale_bindings({"src/a.py::produce": "x"}) == [] and pipe().stale_bindings({}) == []
+
+
+def test_leaves_that_split_a_file_are_keyed_by_their_own_symbol():
+    m = tweak(tweak(pipe(), "top/a", owns=("src/f.py::one",)), "top/b", owns=("src/f.py::two",))
+    base = {"src/f.py::one": "1", "src/f.py::two": "1", "src/f.py": "x", "tests/t.py": "1"}
+    before = m.keys(base)
+
+    def changed(edit: dict, start=base) -> set[str]:
+        after = m.keys({**start, **edit})
+        return {i for i in before if before[i] != after[i]}
+
+    assert changed({"src/f.py::one": "2"}) == {"top/a", "top"}
+    assert changed({"src/f.py::two": "2"}) == {"top/b", "top"}
+    file_only = {"src/f.py": "x", "tests/t.py": "1"}                                     # no per-symbol hashes: the file is the fallback
+    fb = m.keys(file_only)
+    assert {i for i in fb if fb[i] != m.keys({**file_only, "src/f.py": "y"})[i]} == {"top/a", "top/b", "top"}
+    assert changed({"tests/t.py::test_unrelated": "2"}) == set()                        # the discharging test is per symbol too
+    assert changed({"tests/t.py::test_sorted": "2"}) == {"top/a", "top"}
+    assert changed({"tests/t.py::test_b_keeps_order": "2"}) == {"top/b", "top"}
+
+
+def test_the_format_is_versioned_and_older_documents_migrate():
+    m = port(port(pipe(), "top/b", "i", many=True), "top/a", "o", binds="src/a.py::produce")
+    assert m.to_dict()["version"] == FORMAT_VERSION
+    legacy = m.to_dict()
+    del legacy["version"]
+    for n in legacy["nodes"]:
+        for p in n["ports"]:
+            del p["many"], p["binds"]
+    plain = pipe()
+    legacy_plain = plain.to_dict()
+    del legacy_plain["version"]
+    for n in legacy_plain["nodes"]:
+        for p in n["ports"]:
+            del p["many"], p["binds"]
+    assert Model.from_dict(legacy_plain) == plain                       # a version-0 document: no version, ports without many/binds
+    assert Model.from_dict(legacy) != m and Model.from_dict(m.to_dict()) == m
+    for bad in (FORMAT_VERSION + 1, -1, "1", 1.0, None, True):
+        with pytest.raises(ModelFormatError):
+            Model.from_dict({**m.to_dict(), "version": bad})
+    assert Model.from_dict({**m.to_dict(), "version": FORMAT_VERSION}) == m
+
+
+def test_many_and_binds_survive_rename_and_change_the_interface():
+    m = port(port(pipe(), "top/b", "i", many=True), "top/a", "o", binds="src/a.py::produce")
+    assert m.validate() == []
+    moved = m.with_nodes(Node("zone")).rename("top", "zone/top")
+    assert moved.node("zone/top/b").ports[0].many is True and moved.node("zone/top/a").ports[1].binds == "src/a.py::produce"
+    assert m.interface_digest("top/b") != pipe().interface_digest("top/b")              # `many` is part of the interface
+    assert moved.keys({"src/a.py": "1"}, {"src/a.py::produce": "s"})["zone/top"] == m.keys({"src/a.py": "1"}, {"src/a.py::produce": "s"})["top"]
+
+
+def test_a_bind_only_needs_one_of_the_leafs_owned_entries_to_cover_it():
+    m = tweak(pipe(), "top/a", owns=("src/a.py", "src/a2.py"))
+    assert port(m, "top/a", "o", binds="src/a2.py::produce").validate() == []
+    assert port(m, "top/a", "o", binds="src/a.py::produce").validate() == []
+    assert [v.rule for v in port(m, "top/a", "o", binds="src/a3.py::produce").validate()] == ["bind-unowned"]
+
+
+def test_stale_bindings_are_listed_in_port_order_even_where_ids_sort_oddly():
+    two = (Port("i", IN, binds="x.py::g"), Port("o", OUT, binds="x.py::f"))
+    m = Model.of([Node("a", ports=two, owns=("x.py",)), Node("a-x", ports=two, owns=("y.py",)),
+                  Node("b", ports=(Port("o", OUT, binds="x.py::f"),), owns=("z.py",))])
+    got = [subject for subject, _ in m.stale_bindings({})]
+    assert got == sorted(got) and len(got) == 5 and got[0] == "a-x.i"      # "a-x.i" < "a.i" as strings, though "a" < "a-x" as ids

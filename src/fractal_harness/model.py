@@ -17,11 +17,21 @@ Two kinds of invariant, kept apart:
 Flows: ownership allowances trickle down (a child may narrow what its container allows, never widen it);
 an assembled invariant is defined over references to invariants of *descendants* and so flows up.
 
+Wiring is typed and counted: the two ends of an edge must agree on a type (an empty type matches anything),
+and a port fed by more than one edge must say it is `many`. A leaf's port may be bound to the symbol that
+implements it (`Port.binds`), so a change to the code's signature is a change to the interface.
+
 Digests (see `interface_digest`, `Model.keys`): the interface digest is all other nodes' keys may depend
 on; the subtree key adds the node's internals. A change deep inside a leaf that leaves its interface
 alone changes the keys of that leaf and its ancestors, never of the nodes that merely connect to it
-(early cutoff). Keys use names relative to the container and the statements of referenced invariants, not their ids, so
+(early cutoff). That cutoff is only sound if the interface digest covers everything a neighbour can
+observe, which is why bound ports fold in the signature of their symbol (supplied by the caller as
+`signatures`). Content is hashed per owned entry: a leaf that owns `f.py::one` is not re-keyed by an edit to
+`f.py::two` when the caller supplies a hash for each symbol (a bare file hash is the fallback).
+Keys use names relative to the container and the statements of referenced invariants, not their ids, so
 moving a whole subtree (`Model.rename`) changes no key inside it.
+
+`to_dict` carries a format `version`; `from_dict` migrates older documents and refuses newer ones.
 
 What this does not do: prove that an assembled invariant follows from its parts. A gap says "nothing here
 backs this"; a judge, a test or a proof does the backing.
@@ -32,14 +42,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import IntEnum
 from functools import cached_property
 from typing import Iterable, Mapping
 
+FORMAT_VERSION = 1
 ID_SEGMENT = re.compile(r"^[A-Za-z0-9_.\-]+$")
 IN, OUT = "in", "out"
 Endpoint = tuple[str, str]          # (node id, port name)
+
+
+class ModelFormatError(ValueError):
+    """A serialized model this code cannot read."""
 
 
 class Strength(IntEnum):
@@ -82,6 +97,8 @@ class Port:
     direction: str                  # IN | OUT
     type: str = ""
     invariants: tuple[str, ...] = ()        # refs (`owner#name`) of what holds of values crossing this port
+    many: bool = False                      # fed by several edges on purpose; otherwise one feeder at most
+    binds: str = ""                         # on a leaf: the `path::Symbol` that implements this port
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "invariants", tuple(sorted(self.invariants)))
@@ -165,6 +182,12 @@ def covers(a: str, b: str) -> bool:
     return not asym or (bp == ap and (bsym == asym or bsym.startswith(asym + "::")))
 
 
+# Older documents differ from the current format only by lacking fields whose absence means the default
+# (version 0 to 1: ports gained `many` and `binds`), so a migration rewrites nothing. A format that does
+# change shape adds its step here.
+MIGRATIONS = {0: lambda d: d}
+
+
 def _hash(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:16]
 
@@ -209,7 +232,7 @@ class Model:
         def mv_inv(i: Invariant) -> Invariant:
             return Invariant(i.name, i.statement, i.discharge, tuple(mv_ref(r) for r in i.assembled_from))
 
-        nodes = [Node(mv(n.id), n.intent, tuple(Port(p.name, p.direction, p.type, tuple(mv_ref(r) for r in p.invariants)) for p in n.ports),
+        nodes = [Node(mv(n.id), n.intent, tuple(replace(p, invariants=tuple(mv_ref(r) for r in p.invariants)) for p in n.ports),
                       tuple(mv_inv(i) for i in n.invariants), n.owns, n.state,
                       tuple(Preserve(mv_ref(pr.ref), pr.discharge) for pr in n.preserves)) for n in self.nodes]
         return Model.of(nodes, [Edge((mv(e.src[0]), e.src[1]), (mv(e.dst[0]), e.dst[1])) for e in self.edges])
@@ -295,7 +318,8 @@ class Model:
             inv = [i.name for i in n.invariants]
             for dup in {x for x in inv if inv.count(x) > 1}:
                 v.append(Violation("invariant-dup", n.id, f"two invariants named {dup}"))
-        v += self._check_refs() + self._check_edges() + self._check_cycles() + self._check_owns() + self._check_boundary()
+        v += (self._check_refs() + self._check_edges() + self._check_fan_in() + self._check_cycles() + self._check_owns()
+              + self._check_binds() + self._check_boundary())
         return sorted(v, key=lambda x: (x.rule, x.subject, x.message))
 
     def _check_refs(self) -> list[Violation]:
@@ -337,6 +361,32 @@ class Model:
             if (sp.direction, dp.direction) != want:
                 v.append(Violation("edge-direction", subject,
                                    f"a {wire[1]} edge runs {want[0]} -> {want[1]}, not {sp.direction} -> {dp.direction}"))
+            if sp.type and dp.type and sp.type != dp.type:
+                v.append(Violation("edge-type", subject, f"{sp.type!r} feeds {dp.type!r}"))
+        return v
+
+    def _check_fan_in(self) -> list[Violation]:
+        feeders: dict[Endpoint, int] = {}
+        for e in self.edges:
+            feeders[e.dst] = feeders.get(e.dst, 0) + 1
+        v = []
+        for dst, count in feeders.items():
+            port = self._port(dst)
+            if port is not None and count > 1 and not port.many:
+                v.append(Violation("fan-in", f"{dst[0]}.{dst[1]}", f"{count} edges feed it and it is not declared `many`"))
+        return v
+
+    def _check_binds(self) -> list[Violation]:
+        v = []
+        for n in self.nodes:
+            for p in n.ports:
+                if not p.binds:
+                    continue
+                if n.id in self._children:
+                    v.append(Violation("bind-internal", f"{n.id}.{p.name}",
+                                       "a node with an inner graph is implemented by its wiring, not by a symbol"))
+                elif not any(covers(o, p.binds) for o in n.owns):
+                    v.append(Violation("bind-unowned", f"{n.id}.{p.name}", f"{p.binds} is not code {n.id} owns"))
         return v
 
     def _check_cycles(self) -> list[Violation]:
@@ -400,8 +450,19 @@ class Model:
         `edge-assumption`: a port requires invariants the port feeding it does not provide.
         `claim-undischarged`: a leaf's output port carries an invariant it does not own and the leaf records no
         discharge for it. `undischarged`: an invariant with no discharge and no assembly. `assembly-unjudged`: an assembled
-        invariant nobody has judged. `weak`: discharged below `floor`."""
+        invariant nobody has judged. `weak`: discharged below `floor`. `unfed-input` / `unused-output`: below
+        the top level, an input nothing feeds or an output nothing consumes (the top level faces the outside
+        world, so its ports are exempt)."""
         g: list[Gap] = []
+        fed, used = {e.dst for e in self.edges}, {e.src for e in self.edges}
+        for n in self.nodes:
+            if not parent_of(n.id):
+                continue
+            for p in n.ports:
+                if p.direction == IN and (n.id, p.name) not in fed:
+                    g.append(Gap("unfed-input", f"{n.id}.{p.name}", f"nothing feeds {n.id}.{p.name}"))
+                if p.direction == OUT and (n.id, p.name) not in used:
+                    g.append(Gap("unused-output", f"{n.id}.{p.name}", f"nothing consumes {n.id}.{p.name}"))
         for e in self.edges:
             sp, dp = self._port(e.src), self._port(e.dst)
             if sp is None or dp is None or self.wire(e) is None:
@@ -437,33 +498,44 @@ class Model:
         """The statements of referenced invariants (None if dangling): content, not location."""
         return sorted((i.statement if (i := self.invariant(r)) else None) or "" for r in refs)
 
-    def interface_digest(self, node_id: str) -> str | None:
-        """What other nodes may depend on: port names, directions, types, and the statements of the invariants
-        each port carries. None for a node not in the model."""
+    def interface_digest(self, node_id: str, signatures: Mapping[str, str] | None = None) -> str | None:
+        """What other nodes may depend on: port names, directions, types, whether a port takes several feeders,
+        the statements of the invariants each port carries, and the signature of the symbol a port is bound to
+        (`signatures` maps `path::Symbol` to a hash of its signature; a bound symbol it lacks hashes as empty).
+        None for a node not in the model."""
         node = self.node(node_id)
         if node is None:
             return None
+        signatures = signatures or {}
         ports = []
         for p in sorted(node.ports, key=lambda p: (p.direction, p.name)):
-            ports.append([p.direction, p.name, p.type, self._statements(p.invariants)])
+            ports.append([p.direction, p.name, p.type, p.many, self._statements(p.invariants),
+                          signatures.get(p.binds, "") if p.binds else None])
         return _hash(ports)
 
-    def keys(self, content: Mapping[str, str] | None = None) -> dict[str, str]:
-        """The subtree key of every node. `content` maps an owned path (or a discharge pointer's path) to the
-        hash of its text; a path it lacks hashes as empty."""
+    def stale_bindings(self, signatures: Mapping[str, str]) -> list[tuple[str, str]]:
+        """(port, symbol) for every bound port whose symbol `signatures` no longer has: the code moved on."""
+        return sorted((f"{n.id}.{p.name}", p.binds) for n in self.nodes for p in n.ports
+                      if p.binds and p.binds not in signatures)
+
+    def keys(self, content: Mapping[str, str] | None = None,
+             signatures: Mapping[str, str] | None = None) -> dict[str, str]:
+        """The subtree key of every node. `content` maps an owned entry (`path` or `path::Symbol`, and a
+        discharge pointer) to the hash of its text; an entry it lacks falls back to the hash of its file, and a
+        file it lacks hashes as empty. `signatures` is what `interface_digest` takes."""
         content = content or {}
         out: dict[str, str] = {}
         for node in sorted(self.nodes, key=lambda n: -n.id.count("/")):
-            out[node.id] = self._key(node, content, out)
+            out[node.id] = self._key(node, content, signatures, out)
         return out
 
-    def _key(self, node: Node, content: Mapping[str, str], done: dict[str, str]) -> str:
+    def _key(self, node: Node, content: Mapping[str, str], signatures: Mapping[str, str] | None,
+             done: dict[str, str]) -> str:
         def rel(endpoint: Endpoint) -> list[str]:
             return [".", endpoint[1]] if endpoint[0] == node.id else [local_name(endpoint[0]), endpoint[1]]
 
-        def digest_of(path_entry: str) -> list[str]:
-            path = _split_owns(path_entry)[0]
-            return [path_entry, content.get(path, "")]
+        def digest_of(entry: str) -> list[str]:
+            return [entry, content.get(entry, content.get(_split_owns(entry)[0], ""))]
 
         wires, upstream = [], []
         for e in self.edges:
@@ -473,10 +545,10 @@ class Model:
         for e in self.edges:       # what feeds this node from outside: only the feeder's interface, never its internals
             wire = self.wire(e)
             if wire and wire[1] == "sibling" and e.dst[0] == node.id:
-                upstream.append([e.dst[1], local_name(e.src[0]), e.src[1], self.interface_digest(e.src[0])])
+                upstream.append([e.dst[1], local_name(e.src[0]), e.src[1], self.interface_digest(e.src[0], signatures)])
         # Parts are sorted here even where `Model` already orders them: a key must never depend on that.
         payload = {
-            "interface": self.interface_digest(node.id),
+            "interface": self.interface_digest(node.id, signatures),
             "state": node.state,
             "owns": [digest_of(o) for o in node.owns],
             "invariants": sorted([i.name, i.statement, self._statements(i.assembled_from),
@@ -491,8 +563,9 @@ class Model:
         }
         return _hash(payload)
 
-    def subtree_key(self, node_id: str, content: Mapping[str, str] | None = None) -> str | None:
-        return self.keys(content).get(node_id)
+    def subtree_key(self, node_id: str, content: Mapping[str, str] | None = None,
+                    signatures: Mapping[str, str] | None = None) -> str | None:
+        return self.keys(content, signatures).get(node_id)
 
     # ---- serialization -------------------------------------------------------------------------------
 
@@ -508,24 +581,33 @@ class Model:
         def dis(d: Discharge | None):
             return {"strength": d.strength.name, "pointer": d.pointer} if d else None
 
-        return {"nodes": [{"id": n.id, "intent": n.intent, "state": n.state, "owns": list(n.owns),
+        return {"version": FORMAT_VERSION,
+                "nodes": [{"id": n.id, "intent": n.intent, "state": n.state, "owns": list(n.owns),
                            "preserves": [{"ref": pr.ref, "discharge": dis(pr.discharge)}
                                          for pr in n.preserves],
                            "ports": [{"name": p.name, "direction": p.direction, "type": p.type,
-                                      "invariants": list(p.invariants)} for p in n.ports],
+                                      "invariants": list(p.invariants), "many": p.many, "binds": p.binds}
+                                     for p in n.ports],
                            "invariants": [inv(i) for i in n.invariants]}
                           for n in self.nodes],
                 "edges": [{"src": list(e.src), "dst": list(e.dst)} for e in self.edges]}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Model":
+        version = d.get("version", 0)
+        if type(version) is not int or not 0 <= version <= FORMAT_VERSION:
+            raise ModelFormatError(f"model format {version!r} is not one this code reads (it reads 0 to {FORMAT_VERSION})")
+        for v in range(version, FORMAT_VERSION):
+            d = MIGRATIONS[v](d)
+
         def inv(x: dict) -> Invariant:
             dis = x.get("discharge")
             return Invariant(x["name"], x["statement"], Discharge(Strength[dis["strength"]], dis.get("pointer", "")) if dis else None,
                              tuple(x.get("assembled_from", ())))
 
         nodes = [Node(n["id"], n.get("intent", ""),
-                      tuple(Port(p["name"], p["direction"], p.get("type", ""), tuple(p.get("invariants", ()))) for p in n.get("ports", ())),
+                      tuple(Port(p["name"], p["direction"], p.get("type", ""), tuple(p.get("invariants", ())),
+                                 bool(p.get("many", False)), p.get("binds", "")) for p in n.get("ports", ())),
                       tuple(inv(i) for i in n.get("invariants", ())), tuple(n.get("owns", ())), bool(n.get("state", False)),
                       tuple(Preserve(x["ref"], Discharge(Strength[x["discharge"]["strength"]], x["discharge"].get("pointer", ""))
                                      if x.get("discharge") else None) for x in n.get("preserves", ())))
@@ -534,11 +616,13 @@ class Model:
 
 
 def diff(old: Model, new: Model, old_content: Mapping[str, str] | None = None,
-         new_content: Mapping[str, str] | None = None) -> Delta:
+         new_content: Mapping[str, str] | None = None, old_signatures: Mapping[str, str] | None = None,
+         new_signatures: Mapping[str, str] | None = None) -> Delta:
     """What changed between two models, in the two senses invalidation cares about."""
-    ok, nk = old.keys(old_content), new.keys(new_content)
+    ok, nk = old.keys(old_content, old_signatures), new.keys(new_content, new_signatures)
     ids = set(ok) | set(nk)
     return Delta(
         added=frozenset(set(nk) - set(ok)), removed=frozenset(set(ok) - set(nk)),
-        interface_changed=frozenset(i for i in ids if old.interface_digest(i) != new.interface_digest(i)),
+        interface_changed=frozenset(i for i in ids if old.interface_digest(i, old_signatures)
+                                    != new.interface_digest(i, new_signatures)),
         key_changed=frozenset(i for i in ids if ok.get(i) != nk.get(i)))
