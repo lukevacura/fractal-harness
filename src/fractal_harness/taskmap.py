@@ -22,19 +22,13 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from .behavior import dart_imports, dart_package, detect_runner, python_imports
+from . import interfaces
 from .cache import ClaimCache, dependencies
+from .interfaces import DEF_RXS
 from .regions import affects, build, governs, owner, placement, tracked_files
 from .store import Edge, tokens
 
 IDENT = re.compile(r"`?\b([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*|[a-z]+(?:[A-Z][a-z0-9]*)+|[a-z0-9]+_[a-z0-9_]+)\b`?")
-# Definitions, not uses: types; functions/methods with a declared return type (Dart, TS) or
-# `def` (Python); fields and top-level variables declared at class/module level (indent <= 2).
-DEF_RXS = [
-    re.compile(r"^\s*(?:abstract\s+|sealed\s+|final\s+|base\s+|interface\s+)*(?:class|enum|mixin|extension|typedef)\s+(\w+)", re.M),
-    re.compile(r"^\s*(?:static\s+|external\s+)?(?:Future|Stream|void|bool|int|double|String|num|dynamic|List|Map|Set|Iterable|[A-Z]\w*)(?:<[^>()]*>)?\??\s+(?:get\s+)?(\w+)\s*(?:\(|=>|\{)", re.M),
-    re.compile(r"^\s*(?:async\s+)?def\s+(\w+)", re.M),
-    re.compile(r"^ {0,2}(?:static\s+|late\s+)*(?:final|const|var)\s+(?:[\w<>?,\s]+\s+)?(\w+)\s*[=;]", re.M),
-]
 # A relative path the task writes; an absolute (`/tmp/x/y.out`) or home (`~/x/y.md`) path is outside the repo, so a
 # match may not start mid-path.
 NAMED_PATH = re.compile(r"(?<![\w./~-])[\w.-]+(?:/[\w.-]+)+\.\w+")
@@ -42,6 +36,8 @@ MAX_DEF_FILES = 6            # an identifier defined in more files than this is 
 MAX_REGIONS = 5
 MAX_CONTRACTS_PER_REGION = 4
 MAX_CHARS = 3500
+OMITTED_ROOM = len("\n(+9999 more lines omitted)")
+MAX_IFACE_CHARS = 1200       # what the neighbours' signatures may add to a map, all regions together
 
 
 @dataclass
@@ -51,6 +47,7 @@ class Region:
     why: list[str] = field(default_factory=list)
     contracts: list[Edge] = field(default_factory=list)       # tests directly exercising these files
     relies_on: dict[str, list[Edge]] = field(default_factory=dict)   # upstream file -> its contracts
+    interfaces: dict[str, list[str]] = field(default_factory=dict)   # upstream file -> signatures of what this region uses
     rules: list[Edge] = field(default_factory=list)
     facts: list[Edge] = field(default_factory=list)
 
@@ -91,6 +88,13 @@ def definition_index(root: Path, source: list[str]) -> dict[str, list[str]]:
             for name in set(rx.findall(text)):
                 index.setdefault(name, []).append(f)
     return index
+
+
+def _read(root: Path, rel: str) -> str:
+    try:
+        return (root / rel).read_text(errors="replace")
+    except OSError:
+        return ""
 
 
 def _test_count(e: Edge) -> str:
@@ -191,6 +195,10 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
                 if governs(reg.path, up):
                     continue
                 reg.relies_on[up] = [by_test[t] for t, imps in direct_tests.items() if up in imps][:2]
+        used = interfaces.usage(_read(root, f) for f in reg.files if f in fileset)
+        for up in reg.relies_on:
+            if sigs := interfaces.interface_lines(_read(root, up), used):
+                reg.interfaces[up] = sigs
         reg.facts = [e for e in facts if any(governs(reg.path, r) for r in e.reads)]
 
     rule_place = {e.id: placement(dependencies(e), files) for e in rules}
@@ -205,6 +213,8 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
     return TaskMap(ranked, downstream, weak)
 
 
+HEADER = ("TASK MAP: where this task sits in the repo's behavioral graph (tests = contracts, "
+          "verified against the current code).")
 HOW_TO = (
     "How to work from this map: (1) if the task changes behavior, change or add the contracts (tests) of the "
     "affected region first; (2) work region by region, relying only on the listed upstream contracts; for "
@@ -212,33 +222,61 @@ HOW_TO = (
     "(4) the downstream contracts must keep passing (`fractal behavior` runs exactly the affected ones). Enforced "
     "rules are human-owned: never work around them."
 )
+# Said only when signatures are shown: text that is not needed is tokens that are not saved.
+IFACE_NOTE = ("Signatures under 'relies on' are read from the current source (a word match: it can miss a use). "
+              "Open an upstream file only for what its signature does not show.")
 
 
 def render(m: TaskMap, budget: int = MAX_CHARS) -> str:
+    """The map as text. The static lines come first and task-specific lines follow. Over budget, whole lines
+    are dropped from the end (neighbour signatures first, then facts, then the rest), so trimming never cuts
+    the static start or a line in half. (Where a prompt hook's text lands in a request, a static start is not
+    a cache prefix: see measure.py.)"""
     if m.empty:
         return ""
-    lines = ["TASK MAP: where this task sits in the repo's behavioral graph (tests = contracts, "
-             "verified against the current code)."]
+    body: list[tuple[str, str]] = []           # (line, kind): kind decides what is dropped first
+    iface_chars = 0
     for i, reg in enumerate(m.regions, 1):
-        lines.append(f"{i}. {reg.path or '(repo root)'}: {'; '.join(reg.why[:3])}")
+        body.append((f"{i}. {reg.path or '(repo root)'}: {'; '.join(reg.why[:3])}", "core"))
         if reg.contracts:
             shown = ", ".join(f"{e.probe['file']} ({_test_count(e)})" for e in reg.contracts[:MAX_CONTRACTS_PER_REGION])
             more = len(reg.contracts) - MAX_CONTRACTS_PER_REGION
-            lines.append(f"   contracts (definition of done): {shown}" + (f" +{more} more" if more > 0 else ""))
+            body.append((f"   contracts (definition of done): {shown}" + (f" +{more} more" if more > 0 else ""), "core"))
         else:
-            lines.append("   contracts: NONE directly cover this region (weak spot: add a test for what you change)")
-        ups = [f"{up} [{', '.join(e.probe['file'] for e in es) or 'no direct contract'}]"
-               for up, es in list(reg.relies_on.items())[:4]]
-        if ups:
-            lines.append(f"   relies on: {'; '.join(ups)}")
+            body.append(("   contracts: NONE directly cover this region (weak spot: add a test for what you change)", "core"))
+        shown_ups = list(reg.relies_on.items())[:4]
+        if shown_ups:
+            ups = [f"{up} [{', '.join(e.probe['file'] for e in es) or 'no direct contract'}]" for up, es in shown_ups]
+            body.append((f"   relies on: {'; '.join(ups)}", "core"))
+            for up, _ in shown_ups:
+                for sig in reg.interfaces.get(up, ()):
+                    line = f"      {up}: {sig}"
+                    if iface_chars + len(line) > MAX_IFACE_CHARS:
+                        break
+                    iface_chars += len(line)
+                    body.append((line, "iface"))
         for e in reg.rules[:3]:
-            lines.append(f"   RULE (enforced): {e.post}")
+            body.append((f"   RULE (enforced): {e.post}", "core"))
         for e in reg.facts[:2]:
-            lines.append(f"   fact: {e.post}")
+            body.append((f"   fact: {e.post}", "fact"))
     if m.downstream:
         files = sorted({e.probe["file"] for e in m.downstream})
-        lines.append(f"Must not break: {len(files)} downstream contracts depend on these files "
-                     f"(e.g. {', '.join(files[:4])}).")
-    lines.append(HOW_TO)
-    text = "\n".join(lines)
-    return text if len(text) <= budget else text[:budget - 3] + "..."
+        body.append((f"Must not break: {len(files)} downstream contracts depend on these files "
+                     f"(e.g. {', '.join(files[:4])}).", "core"))
+
+    def head() -> list[str]:
+        return [HEADER, HOW_TO] + ([IFACE_NOTE] if any(k == "iface" for _, k in body) else [])
+
+    def size() -> int:
+        return len("\n".join(head() + [line for line, _ in body]))
+
+    for kind in ("iface", "fact"):
+        while size() > budget and any(k == kind for _, k in body):
+            body.pop(max(i for i, (_, k) in enumerate(body) if k == kind))
+    dropped = 0
+    if size() > budget:                         # still over: drop from the end, leaving room for the marker
+        while body and size() + OMITTED_ROOM > budget:
+            body.pop()
+            dropped += 1
+        body.append((f"(+{dropped} more lines omitted)", "core"))
+    return "\n".join(head() + [line for line, _ in body])

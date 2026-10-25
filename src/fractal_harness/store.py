@@ -222,7 +222,7 @@ class Store:
         return self._edge(row) if row else None
 
     def all(self) -> list[Edge]:
-        return [self._edge(r) for r in self.db.execute("SELECT * FROM edges ORDER BY created_at")]
+        return [self._edge(r) for r in self.db.execute("SELECT * FROM edges ORDER BY created_at, id")]
 
     def upsert(self, e: Edge) -> None:
         now = time.time()
@@ -380,7 +380,7 @@ class Store:
                 matched[eid] = matched.get(eid, 0) + 1
         query = " OR ".join(f'"{t}"' for t in terms)
         return [(row["id"], row["score"], matched.get(row["id"], 0)) for row in self.db.execute(
-            "SELECT id, bm25(edges_fts) AS score FROM edges_fts WHERE edges_fts MATCH ? ORDER BY score",
+            "SELECT id, bm25(edges_fts) AS score FROM edges_fts WHERE edges_fts MATCH ? ORDER BY score, id",
             (query,),
         ) if matched.get(row["id"], 0) >= min_matches]
 

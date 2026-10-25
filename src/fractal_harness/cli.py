@@ -91,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     it.add_argument("--limit", type=int, help="import at most N test files")
     mp = sub.add_parser("map", help="a task's footprint on the behavioral graph: regions, contracts, assumptions")
     mp.add_argument("task")
+    ij = sub.add_parser("injection", help="measure what the hooks would inject for prompts (size, shared start); no model, no telemetry")
+    ij.add_argument("prompts", nargs="+")
     bh = sub.add_parser("behavior", help="run behavioral claims: the ones current changes affect, or --all (baseline)")
     bh.add_argument("--all", action="store_true", help="run every behavioral claim (establishes the baseline)")
     bh.add_argument("--timeout", type=int, default=600)
@@ -295,6 +297,10 @@ def main(argv: list[str] | None = None) -> int:
         from .taskmap import render as render_map, task_map
         print(render_map(task_map(root, args.task), budget=20000) or "(no footprint: the task names nothing this "
               "repo's graph knows; explore normally)")
+        return 0
+    if args.cmd == "injection":
+        from .measure import stats
+        print(json.dumps(stats(root, args.prompts), indent=2))
         return 0
     if args.cmd == "behavior":
         from .behavior import baseline, gate

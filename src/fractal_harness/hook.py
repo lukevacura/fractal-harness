@@ -214,9 +214,9 @@ def _has_graph(root: Path) -> bool:
 
 
 def context_for(root: Path, prompt: str, session_id: str | None = None,
-                budget: int = MAX_CONTEXT_CHARS) -> str | None:
+                budget: int = MAX_CONTEXT_CHARS, log: bool = True) -> str | None:
     """With a behavioral graph, the task map (regions, contracts, assumptions, rules); otherwise
-    rules and facts. Either way, nothing on a miss."""
+    rules and facts. Either way, nothing on a miss. `log=False` asks without writing telemetry."""
     if not _has_store(root):
         return None
     if _has_graph(root):
@@ -224,9 +224,9 @@ def context_for(root: Path, prompt: str, session_id: str | None = None,
         text = render_map(task_map(root, prompt))
         rules, facts = [], []
     else:
-        rules, facts = select_context(root, prompt, session_id)
+        rules, facts = select_context(root, prompt, session_id, log)
         text = render(rules, facts, budget)
-    if text and _has_store(root):
+    if text and log and _has_store(root):
         cache = ClaimCache(root, run_slow=False)
         try:
             cache.store.log("context", None, session_id=session_id, chars=len(text), rules=len(rules),
