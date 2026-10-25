@@ -21,6 +21,7 @@ EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
 PRE_EDIT_HOOK = "fractal hook pre-edit"
 PRE_EDIT_MATCHER = "Edit|Write|MultiEdit"
 AGENT_HOOK = "fractal hook agent"
+SESSION_HOOK = "fractal hook session"
 CLI_PERMISSION = "Bash(fractal:*)"
 # Accepting or rejecting a rule is a human decision: deny these to agents even though the
 # rest of the CLI is allowed (deny wins over allow).
@@ -231,6 +232,7 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
         for event, command, matcher in (("UserPromptSubmit", PROMPT_HOOK, None), ("Stop", STOP_HOOK, None),
                                         ("PreToolUse", PRE_EDIT_HOOK, PRE_EDIT_MATCHER),
                                         ("SubagentStart", AGENT_HOOK, None),
+                                        ("SessionStart", SESSION_HOOK, None),
                                         ("PostToolUse", EDIT_HOOK, EDIT_MATCHER)):
             if not _has_hook(s, event, command):
                 group = {"hooks": [{"type": "command", "command": command}]}
@@ -311,6 +313,7 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
     checks.append((_has_hook(s, "Stop", STOP_HOOK), "Stop hook queues sessions for `fractal record`"))
     checks.append((_has_hook(s, "PreToolUse", PRE_EDIT_HOOK), "PreToolUse hook blocks edits that would violate rules"))
     checks.append((_has_hook(s, "SubagentStart", AGENT_HOOK), "SubagentStart hook gives started subagents the rules and facts"))
+    checks.append((_has_hook(s, "SessionStart", SESSION_HOOK), "SessionStart hook gives the static instructions once per session"))
     checks.append((_has_hook(s, "PostToolUse", EDIT_HOOK), "PostToolUse hook re-checks rules after edits"))
     deny = s.get("permissions", {}).get("deny", [])
     checks.append((all(r in deny for r in HUMAN_ONLY), "agents are denied `fractal accept`/`reject`"))
@@ -330,7 +333,7 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
         shared = _load_json(root / ".claude" / "settings.json") if (root / ".claude" / "settings.json").exists() else {}
         checks.append((not any(_has_hook(shared, ev, c) for ev, c in (
             ("UserPromptSubmit", PROMPT_HOOK), ("Stop", STOP_HOOK), ("PreToolUse", PRE_EDIT_HOOK),
-            ("SubagentStart", AGENT_HOOK), ("PostToolUse", EDIT_HOOK))),
+            ("SubagentStart", AGENT_HOOK), ("SessionStart", SESSION_HOOK), ("PostToolUse", EDIT_HOOK))),
             "no fractal hooks in the shared .claude/settings.json (re-run `fractal init` to move them)"))
 
     if git("rev-parse", "--git-dir").returncode == 0:

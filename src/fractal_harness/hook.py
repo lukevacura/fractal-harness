@@ -8,6 +8,8 @@
              blocked before it is written.
   edit       (PostToolUse) backstop after any edit: re-check the rules that scan the file,
              including command probes the in-memory check cannot run.
+  session    (SessionStart) the static instructions, once per session (and again after a compaction), so the
+             prompt hook repeats only what varies with the prompt.
   agent      (SubagentStart) subagents never see the prompt hook's output: give them the same RULES
              and FACTS, scoped to the paths their launch prompt names.
   stop       (Stop) queue the session for `fractal record`.
@@ -55,6 +57,8 @@ FACTS_HEADER = (
     "confirmed: do not re-read or re-search the cited lines to re-verify them; read those files only "
     "for details a fact does not state."
 )
+SHORT_RULES = "RULES (enforced; explained at session start):"
+SHORT_FACTS = "FACTS (verified now; explained at session start):"
 STALE_HEADER = (
     "STALE FACTS: these described the code before it changed and could not be re-verified "
     "automatically. They may be wrong: check the code before relying on them."
@@ -110,8 +114,8 @@ def evidence(e: Edge) -> str:
 def _linked_files(prompt: str, files: list[str], facts: list[Edge]) -> set[str]:
     """Files the task likely touches: named in the prompt (path or file name), or read by a matched fact."""
     import re
-    low = prompt.lower()
-    named = {f for f in files if f.lower() in low or (len(Path(f).name) >= 5 and Path(f).name.lower() in low)}
+    from .regions import names_file
+    named = {f for f in files if names_file(prompt, f, 5)}
     # paths the task mentions that may not exist yet ("a new module ledger/alerts.py")
     mentioned = {m.strip("`'\".,:;()") for m in re.findall(r"[\w.-]+(?:/[\w.-]+)+", prompt)}
     return named | mentioned | {r for e in facts for r in e.reads if not any(c in r for c in "*?[")}
@@ -189,11 +193,14 @@ def _fact_line(e: Edge) -> str:
     return f"- {_class_tag(e)}{pre}{e.post}\n  ✓ {evidence(e)}"
 
 
-def render(rules: list[Edge], facts: list[Edge], budget: int = MAX_CONTEXT_CHARS) -> str:
-    """Rules first, then facts, within a character budget (facts are dropped first)."""
+def render(rules: list[Edge], facts: list[Edge], budget: int = MAX_CONTEXT_CHARS, primed: bool = False) -> str:
+    """Rules first, then facts, within a character budget (facts are dropped first). `primed`: the session
+    already holds the long RULES/FACTS explanations, so they shrink to their labels."""
+    rules_header, facts_header = (SHORT_RULES, SHORT_FACTS) if primed else (RULES_HEADER, FACTS_HEADER)
+
     def build(rs: list[Edge], fs: list[Edge]) -> str:
-        parts = [RULES_HEADER, *(_rule_line(e) for e in rs)] if rs else []
-        for status, header in (("verified", FACTS_HEADER), ("trusted", TRUSTED_HEADER), ("stale", STALE_HEADER)):
+        parts = [rules_header, *(_rule_line(e) for e in rs)] if rs else []
+        for status, header in (("verified", facts_header), ("trusted", TRUSTED_HEADER), ("stale", STALE_HEADER)):
             group = [e for e in fs if e.status == status]
             if group:
                 parts += ([""] if parts else []) + [header, *(_fact_line(e) for e in group)]
@@ -213,19 +220,24 @@ def _has_graph(root: Path) -> bool:
         cache.close()
 
 
+def _mode(root: Path) -> str:
+    return "map" if _has_store(root) and _has_graph(root) else "rules"    # never creates a store
+
+
 def context_for(root: Path, prompt: str, session_id: str | None = None,
-                budget: int = MAX_CONTEXT_CHARS, log: bool = True) -> str | None:
+                budget: int = MAX_CONTEXT_CHARS, log: bool = True, primed: bool = False) -> str | None:
     """With a behavioral graph, the task map (regions, contracts, assumptions, rules); otherwise
-    rules and facts. Either way, nothing on a miss. `log=False` asks without writing telemetry."""
+    rules and facts. Either way, nothing on a miss. `log=False` asks without writing telemetry.
+    `primed=True` leaves out the instructions the session start already gave (see `session_hook`)."""
     if not _has_store(root):
         return None
     if _has_graph(root):
         from .taskmap import render as render_map, task_map
-        text = render_map(task_map(root, prompt))
+        text = render_map(task_map(root, prompt), primed=primed)
         rules, facts = [], []
     else:
         rules, facts = select_context(root, prompt, session_id, log)
-        text = render(rules, facts, budget)
+        text = render(rules, facts, budget, primed)
     if text and log and _has_store(root):
         cache = ClaimCache(root, run_slow=False)
         try:
@@ -241,6 +253,62 @@ def _is_notification(prompt: str) -> bool:
     return prompt.lstrip().startswith("<task-notification")
 
 
+# --- session start: the static instructions, once ------------------------------------------
+# A SessionStart hook's context lands before the first prompt (verified on a headless run), so it is in
+# every later request's cacheable start, and it fires again after a compaction. The prompt hook therefore
+# repeats the long instructions only for a session that was not primed with the mode it is now in; with no
+# SessionStart hook installed nothing changes. The marker lives in the store, never in the working tree.
+
+PRIMED_FILE = "primed.json"
+MAX_PRIMED = 200
+
+
+def session_text(mode: str) -> str:
+    """The instructions that do not vary with the prompt, for the mode ('map' or 'rules') the prompt hook is in."""
+    if mode == "map":
+        from .taskmap import HOW_TO, IFACE_NOTE
+        return f"{HOW_TO} {IFACE_NOTE}"
+    return f"{RULES_HEADER}\n\n{FACTS_HEADER}"
+
+
+def _primed_path(root: Path) -> Path:
+    return store_root(root) / STORE_DIR / PRIMED_FILE
+
+
+def _read_primed(root: Path) -> dict:
+    try:
+        data = json.loads(_primed_path(root).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def is_primed(root: Path, session_id: str | None, mode: str) -> bool:
+    return bool(session_id) and _read_primed(root).get(session_id) == mode
+
+
+def session_hook(stdin: str) -> str:
+    """SessionStart: returns the hook's stdout, the static instructions, and records that this session has them."""
+    if _disabled():
+        return ""
+    try:
+        data = json.loads(stdin or "{}")
+        root = _root(data)
+        sid = data.get("session_id")
+        if not sid or not _has_store(root):
+            return ""
+        mode = _mode(root)
+        primed = _read_primed(root)
+        primed.pop(sid, None)                       # re-insert last: the dict keeps the newest sessions
+        primed[sid] = mode
+        _primed_path(root).write_text(json.dumps(dict(list(primed.items())[-MAX_PRIMED:])))
+        text = session_text(mode)
+    except Exception as e:  # a broken cache must never block a session
+        print(f"fractal hook: {e}", file=sys.stderr)
+        return ""
+    return json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}})
+
+
 def prompt_hook(stdin: str) -> str:
     """UserPromptSubmit: returns the hook's stdout (possibly empty)."""
     if _disabled():
@@ -249,7 +317,9 @@ def prompt_hook(stdin: str) -> str:
         data = json.loads(stdin or "{}")
         if _is_notification(data.get("prompt", "")):
             return ""
-        ctx = context_for(_root(data), data.get("prompt", ""), data.get("session_id"))
+        root = _root(data)
+        ctx = context_for(root, data.get("prompt", ""), data.get("session_id"),
+                          primed=is_primed(root, data.get("session_id"), _mode(root)))
     except Exception as e:  # a broken cache must never block the user's prompt
         print(f"fractal hook: {e}", file=sys.stderr)
         return ""

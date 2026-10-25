@@ -19,7 +19,7 @@ from __future__ import annotations
 from math import ceil
 from pathlib import Path
 
-from .hook import _has_graph, _has_store, context_for
+from .hook import _has_graph, _has_store, _mode, context_for, session_text
 
 CHARS_PER_TOKEN = 4
 
@@ -62,16 +62,23 @@ def stats(root: Path, prompts: list[str], capacity: int = 1000) -> dict:
     gives the same text. Reads the store; writes no telemetry."""
     root = Path(root)
     texts = [context_for(root, p, log=False) or "" for p in prompts]
+    primed = [context_for(root, p, log=False, primed=True) or "" for p in prompts]
     again = [context_for(root, p, log=False) or "" for p in prompts]
     hits = [t for t in texts if t]
     shared = common_prefix(hits) if len(hits) > 1 else 0
     out = {
-        "injections": [{"prompt": p, "chars": len(t), "tokens_estimate": tokens_estimate(len(t)), "injected": bool(t)}
-                       for p, t in zip(prompts, texts)],
+        "injections": [{"prompt": p, "chars": len(t), "tokens_estimate": tokens_estimate(len(t)), "injected": bool(t),
+                        "primed_chars": len(pt)}
+                       for p, t, pt in zip(prompts, texts, primed)],
+        # What a SessionStart hook sends once, and what each later prompt then saves; the session pays off
+        # after ceil(session_chars / saved_per_prompt) injected prompts (counting only prompts that inject).
+        "session_chars": len(session_text(_mode(root))) if _has_store(root) else 0,
         "shared_start_chars": shared,
-        "shared_start_share": round(shared / min(len(t) for t in hits), 3) if len(hits) > 1 else 0.0,
+        "shared_start_share": round(shared / min(len(t) for t in hits), 3) if hits else 0.0,
         "repeatable": texts == again,
     }
+    saved = [len(t) - len(pt) for t, pt in zip(texts, primed) if t]
+    out["saved_per_prompt_chars"] = round(sum(saved) / len(saved)) if saved else 0
     sizes = [neighbour_sizes(root, p, capacity) for p in prompts] if _has_store(root) and _has_graph(root) else []
     out["neighbours"] = {k: sum(s[k] for s in sizes) for k in ("signature_chars", "neighbour_source_chars")}
     return out

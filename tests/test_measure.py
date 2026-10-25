@@ -142,3 +142,27 @@ def test_listing_order_breaks_creation_time_ties_by_id(tmp_path):
         c.store.db.execute("UPDATE edges SET created_at = 1")
     assert [e.id for e in c.store.all()] == sorted(ids)
     c.close()
+
+
+def test_the_shared_start_share_is_the_shared_chars_over_the_shortest_injection(monkeypatch):
+    from fractal_harness import measure
+    texts = {"p1": "abc" + "x" * 6, "p2": "abc" + "y" * 12, "p3": "", "p4": "abc" + "z" * 3}
+    monkeypatch.setattr(measure, "context_for", lambda root, prompt, log=True, primed=False: texts[prompt])
+    monkeypatch.setattr(measure, "_has_store", lambda root: False)
+    s = measure.stats(Path("."), ["p1", "p2"])
+    assert s["shared_start_chars"] == 3 and s["shared_start_share"] == 0.333                 # 3 / 9, rounded to three places
+    s = measure.stats(Path("."), ["p1", "p2", "p3", "p4"])                                    # a miss does not count as an injection
+    assert s["shared_start_chars"] == 3 and s["shared_start_share"] == 0.5                   # 3 / 6: the shortest hit, not the longest
+    assert [i["injected"] for i in s["injections"]] == [True, True, False, True]
+
+
+def test_stats_reports_what_the_session_start_costs_and_what_each_prompt_saves(repo):
+    from fractal_harness.hook import session_text
+    root = graph(repo)
+    s = stats(root, ["Make `quad` handle negative numbers", "update the marketing copy"])
+    hit, miss = s["injections"]
+    assert 0 < hit["primed_chars"] < hit["chars"] and miss["primed_chars"] == 0
+    assert hit["chars"] - hit["primed_chars"] >= len(HOW_TO)                     # at least the how-to is not repeated
+    assert s["saved_per_prompt_chars"] == hit["chars"] - hit["primed_chars"]     # misses inject nothing, so save nothing
+    assert s["session_chars"] == len(session_text("map")) > 0
+    assert stats(root, ["update the marketing copy"])["saved_per_prompt_chars"] == 0

@@ -35,7 +35,7 @@ TOKEN = re.compile(r"[A-Za-z_]\w*")
 MIN_NAME = 3
 MAX_SIGNATURE_CHARS = 140
 MAX_PER_FILE = 5
-MAX_SIGNATURE_LINES = 8
+MAX_WINDOW = 4 * MAX_SIGNATURE_CHARS     # how far past its first line a signature is followed
 
 
 def usage(texts: Iterable[str]) -> Counter:
@@ -46,35 +46,34 @@ def usage(texts: Iterable[str]) -> Counter:
     return used
 
 
-def _declarations(text: str) -> dict[str, set[int]]:
-    """name -> the start offsets of the lines that declare it."""
-    found: dict[str, set[int]] = {}
+def _scan(text: str) -> dict[str, list[tuple[int, int]]]:
+    """name -> (where the name is, where its line starts) for every declaration the patterns match."""
+    found: dict[str, list[tuple[int, int]]] = {}
     for rx in DEF_RXS:
         for m in rx.finditer(text):
-            found.setdefault(m.group(1), set()).add(text.rfind("\n", 0, m.start(0)) + 1)
+            pos = m.start(1)
+            found.setdefault(m.group(1), []).append((pos, text.rfind("\n", 0, pos) + 1))
     return found
 
 
 def defined_names(text: str) -> list[str]:
     """Names `text` defines, once each, in the order they first appear."""
-    first: dict[str, int] = {}
-    for rx in DEF_RXS:
-        for m in rx.finditer(text):
-            first[m.group(1)] = min(first.get(m.group(1), m.start(1)), m.start(1))
-    return [name for name, _ in sorted(first.items(), key=lambda kv: (kv[1], kv[0]))]
+    found = _scan(text)
+    return sorted(found, key=lambda name: min(pos for pos, _ in found[name]))
 
 
 def _cut(declaration: str) -> str:
-    """The declaration up to where its body or value begins: the first `{` outside parentheses (a brace inside
-    them is a named-parameter list), an expression body `=>`, a Python `:`, or a `;`."""
-    python = declaration.lstrip().startswith(("def ", "async def ", "class "))
+    """The declaration up to where it ends: the first `{` outside parentheses (a brace inside them is a
+    named-parameter list or a default), an expression body `=>`, a `;`, a Python `:`, or a line end outside
+    parentheses. Parentheses and brackets nest, so a signature that spans lines is kept whole."""
+    python = declaration.startswith(("def ", "async def ", "class "))
     depth = 0
     for i, ch in enumerate(declaration):
         if ch in "([":
             depth += 1
         elif ch in ")]":
             depth -= 1
-        elif depth == 0 and (ch in "{;" or (ch == ":" and python) or declaration.startswith("=>", i)):
+        elif depth == 0 and (ch in "{;\n" or (ch == ":" and python) or declaration.startswith("=>", i)):
             return declaration[:i]
     return declaration
 
@@ -82,17 +81,11 @@ def _cut(declaration: str) -> str:
 def signature(text: str, name: str) -> str | None:
     """`name`'s declaration as one line, without its body. None when `name` is not declared in `text`, or is
     declared on more than one line (overloads, or the same name in two classes): it is never guessed."""
-    starts = _declarations(text).get(name, set())
+    starts = {line_start for _, line_start in _scan(text).get(name, ())}
     if len(starts) != 1:
         return None
-    lines = text[next(iter(starts)):].splitlines()[:MAX_SIGNATURE_LINES]
-    parts, depth = [], 0
-    for line in lines:
-        parts.append(line.strip())
-        depth += sum(line.count(c) for c in "([") - sum(line.count(c) for c in ")]")
-        if depth <= 0 and line.rstrip().endswith((";", ":", "=>", "{")):
-            break
-    one = re.sub(r"\s+", " ", _cut(" ".join(parts))).strip()
+    start = next(iter(starts))
+    one = re.sub(r"\s+", " ", _cut(text[start:start + MAX_WINDOW].lstrip())).rstrip()
     if not one:
         return None
     return one if len(one) <= MAX_SIGNATURE_CHARS else one[:MAX_SIGNATURE_CHARS - 3].rstrip() + "..."

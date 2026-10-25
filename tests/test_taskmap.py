@@ -117,3 +117,148 @@ def test_an_unreadable_upstream_file_yields_no_signatures_and_no_crash(repo):
     core = next(r for r in again.regions if r.path == "pkg/core.py")
     assert "pkg/util.py" not in core.interfaces
     assert render(again).startswith(STATIC)
+
+
+# ---- render, pinned on hand-built maps ---------------------------------------------------------------------------
+
+from fractal_harness.store import Edge  # noqa: E402
+from fractal_harness.taskmap import Region, TaskMap  # noqa: E402
+
+
+def edge(post="p", file="tests/t.py", detail="3 passed"):
+    return Edge(id=post, kind="behavior", pre="", post=post, reads=[], writes=[], probe={"file": file}, status="verified",
+                fingerprint=None, hashes={}, detail=detail, parent_id=None, created_at=0, updated_at=0)
+
+
+def test_render_numbers_regions_from_one_names_the_root_and_caps_every_list():
+    big = Region("", why=["a", "b", "c", "d"], contracts=[edge(file=f"tests/t{i}.py") for i in range(6)],
+                 relies_on={f"up{i}.py": [edge(file=f"tests/u{i}.py"), edge(file="tests/x.py")] for i in range(6)},
+                 interfaces={"up0.py": ["sig0"], "up3.py": ["sig3"], "up4.py": ["sig4"]},
+                 rules=[edge(f"rule{i}") for i in range(5)], facts=[edge(f"fact{i}") for i in range(4)])
+    small = Region("pkg/b", why=["x"])
+    text = render(TaskMap([big, small], [edge(file=f"tests/d{i}.py") for i in range(7)], []), budget=10**6)
+    lines = text.split("\n")
+    assert "1. (repo root): a; b; c" in lines and "2. pkg/b: x" in lines            # numbered from 1, why capped at three
+    assert "   contracts (definition of done): " + ", ".join(f"tests/t{i}.py (3 tests)" for i in range(4)) + " +2 more" in lines
+    assert "   contracts: NONE directly cover this region (weak spot: add a test for what you change)" in lines
+    assert any(l.startswith("   relies on: up0.py [tests/u0.py, tests/x.py]; up1.py") and "up3.py" in l and "up4.py" not in l for l in lines)
+    assert "      up3.py: sig3" in lines and "      up0.py: sig0" in lines and not any("sig4" in l for l in lines)   # only shown upstreams
+    assert [l for l in lines if "RULE" in l] == [f"   RULE (enforced): rule{i}" for i in range(3)]
+    assert [l for l in lines if l.startswith("   fact:")] == ["   fact: fact0", "   fact: fact1"]
+    assert "Must not break: 7 downstream contracts depend on these files (e.g. tests/d0.py, tests/d1.py, tests/d2.py, tests/d3.py)." in lines
+
+
+def test_the_more_count_starts_at_one_extra_contract():
+    five = Region("p", contracts=[edge(file=f"tests/t{i}.py") for i in range(5)])
+    line = render(TaskMap([five], [], []), budget=10**6).split("contracts (definition of done):")[1].split("\n")[0]
+    assert line.endswith("tests/t3.py (3 tests) +1 more") and "tests/t4.py" not in line
+
+
+def test_a_contract_is_counted_by_its_tests_or_labelled_by_its_status_and_exactly_four_have_no_more_line():
+    r = Region("p", contracts=[edge(file="tests/a.py", detail="12 passed"), edge(file="tests/b.py", detail="boom")])
+    text = render(TaskMap([r], [], []), budget=10**6)
+    assert "tests/a.py (12 tests), tests/b.py (verified)" in text and "more)" not in text
+    four = Region("p", contracts=[edge(file=f"tests/t{i}.py") for i in range(4)])
+    assert " +" not in render(TaskMap([four], [], []), budget=10**6).split("contracts (definition of done):")[1].split("\n")[0]
+
+
+def test_signature_lines_stop_at_the_cap_exactly():
+    prefix = "      a.py: "
+    sigs = ["s%02d" % i + "x" * (100 - len(prefix) - 3) for i in range(20)]            # each rendered line is exactly 100 characters
+    assert all(len(prefix + g) == 100 for g in sigs)
+    reg = Region("p", contracts=[edge()], relies_on={"a.py": []}, interfaces={"a.py": sigs})
+    lines = render(TaskMap([reg], [], []), budget=10**6).split("\n")
+    shown = [l for l in lines if l.startswith(prefix)]
+    assert len(shown) == MAX_IFACE_CHARS // 100 == 12 and shown[0].startswith(prefix + "s00") and shown[-1].startswith(prefix + "s11")
+
+
+def test_budget_boundaries_are_exact_and_the_marker_counts_what_was_dropped():
+    core = Region("p", why=["w"], contracts=[edge()], relies_on={"up.py": [edge()]}, rules=[edge("rule one")])
+    m = TaskMap([core], [edge(file="tests/d.py")], [])
+    full = render(m, budget=10**6)
+    assert render(m, budget=len(full)) == full                                         # exactly at budget: nothing dropped
+    body = full.split("\n")[2:]
+    assert len(body) == 5 and "omitted" not in full
+    head = [HEADER, HOW_TO]
+    for kept in range(len(body)):
+        size = len("\n".join(head + body[:kept]))
+        got = render(m, budget=size + OMITTED_ROOM)                                   # exactly room for `kept` lines and the marker
+        assert got == "\n".join(head + body[:kept] + [f"(+{len(body) - kept} more lines omitted)"]), kept
+        assert render(m, budget=size + OMITTED_ROOM - 1).count("\n") < got.count("\n") + 1 or kept == 0
+
+
+def test_trimming_takes_the_last_signature_first_then_the_note_then_facts_then_the_rest():
+    reg = Region("p", why=["w"], contracts=[edge()], relies_on={"up.py": [edge()]},
+                 interfaces={"up.py": ["sig_one", "sig_two", "sig_three"]}, facts=[edge("fact one")], rules=[edge("rule one")])
+    m = TaskMap([reg], [], [])
+    full = render(m, budget=10**6)
+    gone = {}
+    for budget in range(len(full), 0, -1):
+        text = render(m, budget=budget)
+        for token in ("sig_three", "sig_two", "sig_one", IFACE_NOTE, "fact: fact one", "RULE (enforced)", "relies on", "contracts (definition of done)"):
+            if token not in text:
+                gone.setdefault(token, budget)
+    order = ["sig_three", "sig_two", "sig_one", "fact: fact one", "RULE (enforced)", "relies on", "contracts (definition of done)"]
+    assert [gone[t] for t in order] == sorted((gone[t] for t in order), reverse=True) and len(set(gone[t] for t in order)) == len(order)
+    assert gone[IFACE_NOTE] == gone["sig_one"]                                        # the note leaves with the last signature
+    assert render(m, budget=len(full)) == full and "sig_three" not in render(m, budget=len(full) - 1)   # signatures stay at exactly the budget
+
+
+def test_signatures_can_be_turned_off_for_a_comparison(repo, monkeypatch):
+    from fractal_harness import taskmap
+    assert "pkg/util.py: def double(x)" in render(_quad_map(repo))
+    monkeypatch.setattr(taskmap, "MAX_IFACE_CHARS", 0)
+    off = task_map(repo, "Make `quad` handle negative numbers", capacity=1)
+    assert next(r for r in off.regions if r.path == "pkg/core.py").interfaces == {}
+    text = render(off)
+    assert "def double" not in text and IFACE_NOTE not in text and "relies on: pkg/util.py" in text
+
+
+def test_the_signature_budget_comes_from_the_environment(monkeypatch):
+    import importlib
+    from fractal_harness import taskmap
+    try:
+        monkeypatch.setenv("FRACTAL_IFACE_CHARS", "0")
+        assert importlib.reload(taskmap).MAX_IFACE_CHARS == 0
+        monkeypatch.setenv("FRACTAL_IFACE_CHARS", "300")
+        assert importlib.reload(taskmap).MAX_IFACE_CHARS == 300
+        monkeypatch.delenv("FRACTAL_IFACE_CHARS")
+        assert importlib.reload(taskmap).MAX_IFACE_CHARS == 1200
+    finally:
+        monkeypatch.delenv("FRACTAL_IFACE_CHARS", raising=False)
+        importlib.reload(taskmap)
+
+
+def test_a_primed_map_repeats_only_its_header_and_the_task_specific_lines(repo):
+    from fractal_harness.taskmap import HEADER, HOW_TO
+    m = _quad_map(repo)
+    full, primed = render(m), render(m, primed=True)
+    assert HOW_TO in full and HOW_TO not in primed and IFACE_NOTE not in primed
+    assert primed.split("\n")[0] == HEADER
+    assert primed.split("\n")[1:] == full.split("\n")[3:]                 # the same regions, contracts and signatures
+    assert render(task_map(repo, "nothing relevant here at all", capacity=1), primed=True) == ""
+
+
+def test_a_file_name_only_counts_when_the_task_writes_it_as_a_whole_word(repo):
+    (repo / "pkg" / "check.py").write_text("def verify(x):\n    return x\n")
+    (repo / "pkg" / "graph_check.py").write_text("def walk(x):\n    return x\n")
+    seeded = lambda prompt: {f for r in task_map(repo, prompt, capacity=1).regions for f in r.files}
+    assert seeded("Fix graph_check.py so it walks deeper") == {"pkg/graph_check.py"}
+    assert seeded("Fix check.py so it verifies more") == {"pkg/check.py"}
+    assert seeded("Fix pkg/check.py and graph_check.py") == {"pkg/check.py", "pkg/graph_check.py"}
+    assert seeded("Fix check.pyc handling") == set()
+
+
+def test_names_file_boundaries():
+    from fractal_harness.regions import names_file
+    assert names_file("edit graph_check.py", "graph_check.py")
+    assert names_file("edit `src/a/graph_check.py`.", "src/a/graph_check.py")
+    assert names_file("edit a/graph_check.py", "src/a/graph_check.py")          # a partial path still names it
+    assert not names_file("edit graph_check.py", "check.py")
+    assert not names_file("edit my-check.py", "check.py")
+    assert not names_file("edit check.pyc", "check.py")
+    assert not names_file("edit s.py", "x/s.py")                                 # too short to route by name alone...
+    assert names_file("edit x/s.py", "x/s.py")                                   # ...but its path counts
+    assert names_file("edit short.py", "x/short.py") and not names_file("edit short.py", "x/short.py", min_name=9)
+    assert names_file("edit a_b.py", "x/a_b.py") and not names_file("edit a_b.py", "x/a_b.py", min_name=7)   # the limit is inclusive
+    assert names_file("edit src/foo.py", "Src/Foo.py")                           # case does not matter

@@ -37,6 +37,18 @@ def tracked_files(root: Path) -> list[str]:
     return sorted(f for f in files if not IGNORED_DIRS & set(PurePosixPath(f).parts))
 
 
+def names_file(prompt: str, rel: str, min_name: int = 6) -> bool:
+    """Whether `prompt` names the file `rel`: its repo path, or (when long enough to be specific) its file
+    name. A name only counts as a whole word: `check.py` is not named by `graph_check.py`, nor `a.py` by
+    `a.pyc`. A leading `/` is fine (a partial path), a leading word character, `-` or `.` is not."""
+    low = prompt.lower()
+    name = PurePosixPath(rel).name
+    for target in (rel, name if len(name) >= min_name else None):
+        if target and re.search(rf"(?<![\w.-]){re.escape(target.lower())}(?!\w)", low):
+            return True
+    return False
+
+
 def is_glob(p: str) -> bool:
     return any(c in p for c in "*?[")
 

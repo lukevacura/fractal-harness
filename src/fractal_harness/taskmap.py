@@ -17,6 +17,7 @@ first, keep every other contract holding, done = its region's contracts pass.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -25,7 +26,7 @@ from .behavior import dart_imports, dart_package, detect_runner, python_imports
 from . import interfaces
 from .cache import ClaimCache, dependencies
 from .interfaces import DEF_RXS
-from .regions import affects, build, governs, owner, placement, tracked_files
+from .regions import affects, build, governs, names_file, owner, placement, tracked_files
 from .store import Edge, tokens
 
 IDENT = re.compile(r"`?\b([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*|[a-z]+(?:[A-Z][a-z0-9]*)+|[a-z0-9]+_[a-z0-9_]+)\b`?")
@@ -37,7 +38,8 @@ MAX_REGIONS = 5
 MAX_CONTRACTS_PER_REGION = 4
 MAX_CHARS = 3500
 OMITTED_ROOM = len("\n(+9999 more lines omitted)")
-MAX_IFACE_CHARS = 1200       # what the neighbours' signatures may add to a map, all regions together
+# What the neighbours' signatures may add to a map, all regions together; 0 turns them off (for A/B arms).
+MAX_IFACE_CHARS = int(os.environ.get("FRACTAL_IFACE_CHARS") or 1200)
 
 
 @dataclass
@@ -113,9 +115,8 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
 
     # -- seeds: files the task is about -------------------------------------------------------
     seeds: dict[str, list[str]] = {}
-    low = prompt.lower()
     for f in files:
-        if f.lower() in low or (len(PurePosixPath(f).name) >= 6 and PurePosixPath(f).name.lower() in low):
+        if names_file(prompt, f):
             seeds.setdefault(f, []).append("named in the task")
     for m in NAMED_PATH.findall(prompt):
         if m not in fileset and ".." not in m.split("/"):   # a new file the task asks for: seed its directory's neighbours
@@ -195,10 +196,11 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
                 if governs(reg.path, up):
                     continue
                 reg.relies_on[up] = [by_test[t] for t, imps in direct_tests.items() if up in imps][:2]
-        used = interfaces.usage(_read(root, f) for f in reg.files if f in fileset)
-        for up in reg.relies_on:
-            if sigs := interfaces.interface_lines(_read(root, up), used):
-                reg.interfaces[up] = sigs
+        if MAX_IFACE_CHARS > 0:
+            used = interfaces.usage(_read(root, f) for f in reg.files if f in fileset)
+            for up in reg.relies_on:
+                if sigs := interfaces.interface_lines(_read(root, up), used):
+                    reg.interfaces[up] = sigs
         reg.facts = [e for e in facts if any(governs(reg.path, r) for r in e.reads)]
 
     rule_place = {e.id: placement(dependencies(e), files) for e in rules}
@@ -227,11 +229,12 @@ IFACE_NOTE = ("Signatures under 'relies on' are read from the current source (a 
               "Open an upstream file only for what its signature does not show.")
 
 
-def render(m: TaskMap, budget: int = MAX_CHARS) -> str:
+def render(m: TaskMap, budget: int = MAX_CHARS, primed: bool = False) -> str:
     """The map as text. The static lines come first and task-specific lines follow. Over budget, whole lines
     are dropped from the end (neighbour signatures first, then facts, then the rest), so trimming never cuts
     the static start or a line in half. (Where a prompt hook's text lands in a request, a static start is not
-    a cache prefix: see measure.py.)"""
+    a cache prefix: see measure.py.) `primed`: the session already holds the how-to (see hook.session_hook), so
+    only the one-line header is repeated."""
     if m.empty:
         return ""
     body: list[tuple[str, str]] = []           # (line, kind): kind decides what is dropped first
@@ -265,6 +268,8 @@ def render(m: TaskMap, budget: int = MAX_CHARS) -> str:
                      f"(e.g. {', '.join(files[:4])}).", "core"))
 
     def head() -> list[str]:
+        if primed:
+            return [HEADER]
         return [HEADER, HOW_TO] + ([IFACE_NOTE] if any(k == "iface" for _, k in body) else [])
 
     def size() -> int:

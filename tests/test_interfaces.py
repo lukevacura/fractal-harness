@@ -87,10 +87,38 @@ def test_long_signatures_are_cut_with_an_ellipsis_at_the_limit():
     assert len(sig) == I.MAX_SIGNATURE_CHARS and sig.endswith("...") and sig.startswith("def big(argument_number_0: int,")
 
 
-def test_a_signature_runaway_is_bounded_by_the_line_limit():
-    text = "def open_forever(\n" + "    a,\n" * 50
+def test_an_unterminated_signature_is_bounded_by_the_window_and_the_character_limit():
+    text = "def open_forever(\n" + "    a,\n" * 500
     sig = I.signature(text, "open_forever")
-    assert sig.count("a,") == I.MAX_SIGNATURE_LINES - 1
+    assert len(sig) == I.MAX_SIGNATURE_CHARS and sig.endswith("...") and sig.startswith("def open_forever( a, a, a,")
+
+
+def test_the_length_limit_is_inclusive_and_the_ellipsis_never_follows_a_space():
+    exact = "def f(" + "x" * (I.MAX_SIGNATURE_CHARS - 7) + ")"
+    assert len(exact) == I.MAX_SIGNATURE_CHARS and I.signature(exact + ":\n  pass\n", "f") == exact
+    over = "def f(" + "x" * (I.MAX_SIGNATURE_CHARS - 6) + ")"
+    cut = I.signature(over + ":\n  pass\n", "f")
+    assert len(cut) == I.MAX_SIGNATURE_CHARS and cut.endswith("xxx...") and cut.startswith("def f(xxx")
+    spaced = I.signature("def fff(" + "a, " * 60 + "):\n  pass\n", "fff")       # the cut lands on a space
+    assert spaced.endswith("a,...") and len(spaced) == I.MAX_SIGNATURE_CHARS - 1
+
+
+def test_a_declaration_is_found_on_the_first_line_after_blank_lines_and_indented():
+    assert I.signature("def f(x): pass", "f") == "def f(x)"
+    assert I.signature("\n\ndef f(x):\n    pass\n", "f") == "def f(x)"
+    assert I.signature("class K:\n        def deep(self, a):\n            pass\n", "deep") == "def deep(self, a)"
+
+
+def test_a_declaration_ends_at_its_line_when_nothing_else_ends_it():
+    assert I.signature("final int a = 1", "a") == "final int a = 1"                 # the minimum name length is interface_lines' rule
+    assert I.signature("const total = 5\nconst other = 6\n", "total") == "const total = 5"   # no semicolons: the next line is not part of it
+    assert I.signature("final int count = 1", "count") == "final int count = 1"
+    assert I.signature("Future<void> go(\n    int a,\n    int b,\n) async {\n  await x;\n}\n", "go") == "Future<void> go( int a, int b, ) async"
+
+
+def test_three_character_names_are_interface_and_two_character_names_are_not():
+    text = "def fun(x): pass\ndef go(x): pass\n"
+    assert I.interface_lines(text, Counter({"fun": 1, "go": 1})) == ["def fun(x)"]
 
 
 def test_interface_lines_keep_only_public_used_names_most_used_first():

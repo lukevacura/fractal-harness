@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from fractal_harness.cache import ClaimCache
-from fractal_harness.hook import prompt_hook, select, stop_hook
+from fractal_harness.hook import prompt_hook, select, session_hook, stop_hook
 from fractal_harness.record import pending
 
 
@@ -232,3 +232,93 @@ def test_task_notifications_inject_nothing(tmp_path: Path):
             "GPS distance filter finished\n</task-notification>")
     assert _ctx(root, note) == ""
     assert _ctx(root, "what GPS distance filter do we use?") != ""
+
+
+# --- the session start carries the static instructions; the prompt hook drops them ---------------
+
+def _session(root: Path, sid: str = "s1") -> dict:
+    out = session_hook(json.dumps({"session_id": sid, "cwd": str(root), "hook_event_name": "SessionStart"}))
+    return json.loads(out)["hookSpecificOutput"] if out else {}
+
+
+def _ctx_in(root: Path, prompt: str, sid: str | None) -> str:
+    out = prompt_hook(json.dumps({"prompt": prompt, "cwd": str(root), "session_id": sid}))
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else ""
+
+
+def test_session_start_gives_the_rules_instructions_once_and_later_prompts_drop_them(tmp_path):
+    from fractal_harness.hook import FACTS_HEADER, RULES_HEADER
+    root = _rules_repo(tmp_path)
+    out = _session(root)
+    assert out["hookEventName"] == "SessionStart"
+    assert RULES_HEADER in out["additionalContext"] and FACTS_HEADER in out["additionalContext"]
+    primed = _ctx_in(root, "what GPS distance filter do we use?", "s1")
+    full = _ctx_in(root, "what GPS distance filter do we use?", "never-started")
+    assert RULES_HEADER in full and RULES_HEADER not in primed
+    assert FACTS_HEADER in full and FACTS_HEADER not in primed
+    assert len(primed) < len(full) - 600
+    assert "no file imports legacy" in primed and "✓ holds now:" in primed and "✓ app.py:1: GPS_FILTER = 5" in primed
+    assert primed.index("RULES") < primed.index("FACTS")                       # the labels stay
+
+
+def test_a_session_that_was_not_started_keeps_the_full_text(tmp_path):
+    from fractal_harness.hook import RULES_HEADER
+    root = _rules_repo(tmp_path)
+    _session(root, "s1")
+    assert RULES_HEADER in _ctx_in(root, "anything about the build", "s2")       # another session
+    assert RULES_HEADER in _ctx_in(root, "anything about the build", None)       # no session id
+    assert RULES_HEADER not in _ctx_in(root, "anything about the build", "s1")
+
+
+def test_a_session_primed_for_one_mode_gets_the_full_text_in_the_other(tmp_path):
+    from fractal_harness.hook import RULES_HEADER, is_primed
+    root = _rules_repo(tmp_path)
+    _session(root)
+    assert is_primed(root, "s1", "rules") and not is_primed(root, "s1", "map")
+    assert not is_primed(root, None, "rules") and not is_primed(root, "s1", "other")
+
+
+def test_session_start_is_silent_without_a_store_a_session_or_in_the_recorder(tmp_path, monkeypatch):
+    assert _session(tmp_path) == {} and not (tmp_path / ".fractal").exists()
+    (tmp_path / "r").mkdir()
+    root = _rules_repo(tmp_path / "r")
+    assert session_hook(json.dumps({"cwd": str(root)})) == ""                  # no session id
+    assert session_hook("not json") == ""
+    monkeypatch.setenv("FRACTAL_NO_HOOKS", "1")
+    assert _session(root) == {}
+
+
+def test_starting_a_session_again_keeps_it_primed_and_the_marker_stays_bounded(tmp_path, monkeypatch):
+    import fractal_harness.hook as hook
+    root = _rules_repo(tmp_path)
+    monkeypatch.setattr(hook, "MAX_PRIMED", 3)
+    for sid in ("a", "b", "c", "a", "d"):                                      # `a` again (a compaction) moves it to newest
+        _session(root, sid)
+    kept = json.loads((root / ".fractal" / "primed.json").read_text())
+    assert list(kept) == ["c", "a", "d"]
+
+
+def test_session_start_gives_the_map_instructions_when_there_is_a_graph(tmp_path):
+    from fractal_harness.behavior import baseline, import_tests
+    from fractal_harness.taskmap import HOW_TO, IFACE_NOTE
+    root = _graph_repo(tmp_path)
+    assert HOW_TO in _session(root)["additionalContext"] and IFACE_NOTE in _session(root)["additionalContext"]
+    primed = _ctx_in(root, "Make `quad` handle negative numbers", "s1")
+    other = _ctx_in(root, "Make `quad` handle negative numbers", "unstarted")
+    assert HOW_TO not in primed and HOW_TO in other and primed.startswith("TASK MAP")
+    assert "tests/test_core.py" in primed
+
+
+def _graph_repo(tmp_path: Path) -> Path:
+    import subprocess
+    from fractal_harness.behavior import baseline, import_tests
+    for rel, text in {"pyproject.toml": "[project]\nname='demo'\n", "pkg/__init__.py": "",
+                      "pkg/util.py": "def double(x):\n    return 2 * x\n",
+                      "pkg/core.py": "from pkg.util import double\n\ndef quad(x):\n    return double(double(x))\n",
+                      "tests/test_core.py": "from pkg.core import quad\n\ndef test_quad():\n    assert quad(2) == 8\n"}.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(text)
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    import_tests(tmp_path)
+    baseline(tmp_path)
+    return tmp_path

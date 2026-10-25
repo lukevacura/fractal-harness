@@ -37,6 +37,7 @@ def test_init_default_leaves_misses_untouched(tmp_path: Path):
                                            "hooks": [{"type": "command", "command": "fractal hook pre-edit"}]}
     assert s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "fractal hook prompt"
     assert s["hooks"]["Stop"][0]["hooks"][0]["command"] == "fractal hook stop"
+    assert s["hooks"]["SessionStart"][0] == {"hooks": [{"type": "command", "command": "fractal hook session"}]}
     assert "enabledMcpjsonServers" not in s
 
 
