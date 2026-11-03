@@ -18,14 +18,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .authority import effective
 from .cache import ClaimCache, dependencies
 from .regions import affects, governs, placement, tracked_files
-from .store import GOOD, Edge
+from .store import GOOD, ROOT, Edge
 
 
 def _line(e: Edge) -> str:
     pre = f"{{{e.pre}}} ⟹ " if e.pre else ""
     tag = "" if e.status == "verified" else f" ({e.status})"
+    tag += f" [{e.layer}]" if e.enforced and e.layer != ROOT else ""      # a node-local rule says whose it is
     return f"- {pre}{e.post}{tag}  _({', '.join(e.reads) or '-'})_"
 
 
@@ -35,6 +37,7 @@ def manifest(root: Path, region: str = "") -> str:
     try:
         cache.update()
         claims = cache.store.all()
+        live = effective(cache, claims)[0]       # a higher layer's rule beats a conflicting lower one
         files = tracked_files(cache.root)
     finally:
         cache.close()
@@ -44,7 +47,7 @@ def manifest(root: Path, region: str = "") -> str:
     def related(e: Edge) -> bool:            # placed at an ancestor of, or inside, the region
         return governs(place[e.id], region) or governs(region, place[e.id])
 
-    rules = [e for e in claims if e.enforced and e.status in GOOD + ("failed",)
+    rules = [e for e in live if e.enforced and e.status in GOOD + ("failed",)
              and (related(e) or any(affects(dependencies(e), f) for f in in_region))]
     proposed = [e for e in claims if e.kind == "invariant" and e.rule_state == "proposed" and related(e)]
     facts = [e for e in claims if e.kind != "invariant" and e.status in GOOD]

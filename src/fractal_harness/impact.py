@@ -19,7 +19,7 @@ from pathlib import Path
 from .cache import ClaimCache
 from .nodes import parse_header
 from .refindex import RefIndex, is_test
-from .symbols import SymbolError, find, split_ref
+from .symbols import SymbolError, find, is_repo_ref, read_ref, split_ref
 
 
 def _git(root: Path, *args: str) -> str | None:
@@ -61,8 +61,9 @@ def _signature(text: str | None, ref: str) -> str | None:
 def changed_exports(root: Path, spec: str, base: str) -> list[Change]:
     """The node's exports whose definition differs, or is gone, between `base` and the working tree; and a
     `guarantee` change, which touches every export."""
-    now_spec = (root / spec).read_text(errors="replace") if (root / spec).is_file() else ""
-    old_spec = _git(root, "show", f"{base}:{spec}") or ""
+    now_spec = read_ref(root, spec, "")
+    # a spec under a named root is not in this repo's history: there is no `base` version of it to compare
+    old_spec = (_git(root, "show", f"{base}:{spec}") or "") if is_repo_ref(spec) else ""
     now_h, old_h = parse_header(now_spec), parse_header(old_spec) if old_spec else None
     refs = list(dict.fromkeys([*(old_h.exports if old_h else []), *(now_h.exports if now_h else [])]))
     out: list[Change] = []

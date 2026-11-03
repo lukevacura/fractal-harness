@@ -46,6 +46,22 @@ def at(root: Path, ref: str) -> Path:
         return root / ref
 
 
+def read_ref(root: Path, ref: str, default: str | None = None) -> str | None:
+    """THE one way to read a repo-or-root file: the text of a plain repo path or a `<root>:<path>` ref, or
+    `default` when it does not exist or is unreadable. A broken fractal.toml still raises (see `at`)."""
+    try:
+        f = at(root, ref)
+        return f.read_text(errors="replace") if f.is_file() else default
+    except OSError:
+        return default
+
+
+def is_repo_ref(ref: str) -> bool:
+    """Whether `ref` names a file in this repo (a plain path) rather than one under a named root."""
+    from .config import _REF
+    return not _REF.match(ref)
+
+
 def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 

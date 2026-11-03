@@ -26,6 +26,7 @@ import os
 import sys
 from pathlib import Path
 
+from .authority import effective, overrides_note
 from .cache import STORE_DIR, ClaimCache, dependencies, store_root
 from .probes import VACUOUS
 from .store import Edge, tokens
@@ -146,7 +147,7 @@ def select_context(root: Path, prompt: str, session_id: str | None = None,
                 if log and wanted:
                     cache.store.log("demand", None, session_id=session_id, ids=wanted)
         rules: list[Edge] = []
-        enforced = cache.invariants(("enforced",))
+        enforced = effective(cache, cache.invariants(("enforced",)))[0]   # a higher layer's rule beats a conflicting lower one
         if enforced:
             cache.resolve([e.id for e in enforced if e.status == "stale"])
             enforced = [cache.get(e.id) for e in enforced]
@@ -444,12 +445,15 @@ def _violation(e: Edge, detail: str, matches: list[tuple[str, int]], text_of) ->
     return "\n".join([f"- [{e.id}] {e.post}", f"    probe: {detail}", *where])
 
 
-def _governing_rules(cache: ClaimCache, rel: str) -> list[Edge]:
-    """Enforced rules with fast probes that scan `rel` (slow, behavioral ones run at turn end)."""
+def _governing_rules(cache: ClaimCache, rel: str, set_aside: dict | None = None) -> list[Edge]:
+    """Enforced rules with fast probes that scan `rel` (slow, behavioral ones run at turn end), by layer precedence:
+    a rule a higher layer soundly contradicts is left out; `set_aside` receives {governing id: the rules it beat}."""
     from .probes import is_slow
     from .regions import affects
-    return [e for e in cache.invariants(("enforced",))
-            if e.probe and not is_slow(e.probe) and affects(dependencies(e), rel)]
+    enforced, beat = effective(cache, cache.invariants(("enforced",)))
+    if set_aside is not None:
+        set_aside.update(beat)
+    return [e for e in enforced if e.probe and not is_slow(e.probe) and affects(dependencies(e), rel)]
 
 
 def edit_violations(root: Path, rel: str) -> tuple[int, list[str]]:
@@ -457,17 +461,23 @@ def edit_violations(root: Path, rel: str) -> tuple[int, list[str]]:
     from . import probes
     cache = ClaimCache(root, run_slow=False)
     try:
-        rules = _governing_rules(cache, rel)
+        beat: dict = {}
+        rules = _governing_rules(cache, rel, beat)
         messages = []
         for e in rules:
             result = probes.run(e.probe, cache.root)
             if not result.passed:
-                messages.append(_violation(e, result.detail, result.matches, lambda f: _read_lines(cache.root, f)))
+                messages.append(_violation(e, result.detail, result.matches, lambda f: _read_lines(cache.root, f))
+                                + _beat_note(beat, e))
             cache.check(e.id)
         cache.store.log("edit_check", None, file=rel, rules=len(rules), violations=len(messages))
         return len(rules), messages
     finally:
         cache.close()
+
+
+def _beat_note(beat: dict, e: Edge) -> str:
+    return ("\n" + overrides_note(beat[e.id])) if beat.get(e.id) else ""
 
 
 def _read_lines(root: Path, rel: str) -> list[str]:
@@ -500,14 +510,15 @@ def pre_edit_violations(root: Path, rel: str, content: str, generated: int = 0) 
     from . import probes
     cache = ClaimCache(root, run_slow=False)
     try:
-        rules = [e for e in _governing_rules(cache, rel) if _in_memory_checkable(e.probe)]
+        beat: dict = {}
+        rules = [e for e in _governing_rules(cache, rel, beat) if _in_memory_checkable(e.probe)]
         overlay = {rel: content}
         messages = []
         for e in rules:
             result = probes.run(e.probe, cache.root, overlay)
             if not result.passed:
                 text_of = lambda f: content.splitlines() if f == rel else _read_lines(cache.root, f)
-                messages.append(_violation(e, result.detail, result.matches, text_of))
+                messages.append(_violation(e, result.detail, result.matches, text_of) + _beat_note(beat, e))
         cache.store.log("pre_edit_check", None, file=rel, rules=len(rules), violations=len(messages),
                         blocked_chars=generated if messages else 0)
         return len(rules), messages

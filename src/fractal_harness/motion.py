@@ -33,10 +33,9 @@ MAX_SNAPSHOT_LINES = 20_000
 
 
 def _lines(root: Path, rel: str) -> list[str] | None:
-    try:
-        return (root / rel).read_text(errors="replace").splitlines()
-    except OSError:
-        return None
+    from .symbols import read_ref
+    text = read_ref(root, rel)
+    return None if text is None else text.splitlines()
 
 
 def line_hashes(root: Path, rel: str) -> list[str] | None:

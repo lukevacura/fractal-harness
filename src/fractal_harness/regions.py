@@ -165,8 +165,9 @@ class Region:
 
 
 def _lines(root: Path, rel: str) -> int:
+    from .symbols import at
     try:
-        with open(root / rel, "rb") as f:
+        with open(at(root, rel), "rb") as f:     # `at`: the one path resolver (a plain path is root / rel, as before)
             return sum(chunk.count(b"\n") for chunk in iter(lambda: f.read(1 << 16), b""))
     except OSError:
         return 0

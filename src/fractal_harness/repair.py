@@ -81,8 +81,11 @@ def _entry(e: Edge, kind: str) -> str:
 def candidates(cache: ClaimCache, ids: list[str] | None = None, everything: bool = False) -> list[tuple[Edge, str]]:
     """(edge, delta|keyframe) for claims needing repair: given ids, all, or demanded since last repair."""
     # Enforced invariants are human-owned: a failure is a violation to report, never to repair.
+    # Demanded repair needs the motion record (`e.repair`); an explicit id or --all also takes broken claims that
+    # carry none (blocked by an upstream claim, a failure with nothing to compare): those were silently skipped.
     broken = {e.id: e for e in cache.store.all()
-              if e.repair and e.status in ("failed", "stale") and not e.enforced and e.rule_state != "rejected"}
+              if (e.repair or ids or everything) and e.status in ("failed", "stale")
+              and not e.enforced and e.rule_state != "rejected"}
     if ids:
         chosen = [broken[i] for i in ids if i in broken]
     elif everything:
@@ -94,9 +97,44 @@ def candidates(cache: ClaimCache, ids: list[str] | None = None, everything: bool
     out = []
     for e in chosen:
         # rewrite / scene_cut / reassert always need a keyframe: the residual can't show what changed
-        delta = e.repair["kind"] in ("delta", "suspect") and e.delta_count < KEYFRAME_INTERVAL
+        delta = bool(e.repair) and e.repair["kind"] in ("delta", "suspect") and e.delta_count < KEYFRAME_INTERVAL
         out.append((e, "delta" if delta else "keyframe"))
     return out
+
+
+def reverify(root: Path) -> dict:
+    """The deterministic half of `repair --all`: re-run the probe of every descriptive claim that is stale or
+    failed, deps first, and report what cleared and what remains with the reason. No model, and no claim or
+    probe is edited, so a probe cannot be healed by weakening it: a claim clears only when its own, unchanged
+    probe passes against the current code. Enforced rules are human-owned: reported as violations, never touched.
+    SOUND: a verdict is the probe's result."""
+    root = root.resolve()
+    cache = ClaimCache(root)
+    try:
+        def broken():
+            return {e.id: e for e in cache.store.all() if e.status in ("failed", "stale") and e.rule_state != "rejected"}
+        todo = [i for i, e in broken().items() if not e.enforced]
+        cache.update()
+        cache.resolve(todo)
+        left = broken()
+        cleared = sorted(i for i in todo if i not in left)
+        remaining = []
+        for i in sorted(todo):
+            e = left.get(i)
+            if e is None:
+                continue
+            kind = (e.repair or {}).get("kind")
+            needs = ("claim or probe edit (agent): the probe fails against current code" if e.status == "failed"
+                     else "re-assertion (agent): no probe, sources changed" if kind == "reassert"
+                     else "judgment (agent): probe passes but the code around it moved" if kind in ("suspect", "rewrite")
+                     else "an upstream claim to clear first" if e.detail.startswith("blocked") else "re-verification")
+            remaining.append({"id": e.id, "status": e.status, "claim": e.post[:80], "why": e.detail[:200], "needs": needs})
+        violations = [{"id": e.id, "claim": e.post[:80], "why": e.detail[:200]}
+                      for e in sorted(broken().values(), key=lambda x: x.id) if e.enforced]
+        return {"checked": len(todo), "cleared": cleared, "remaining": remaining, "violations": violations,
+                "model_used": False}
+    finally:
+        cache.close()
 
 
 def repair(root: Path, ids: list[str] | None = None, everything: bool = False,

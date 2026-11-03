@@ -28,7 +28,7 @@ from .context import premises_of
 from .ledger import premise_change
 from .nodes import parse_header, spec_key
 from .regions import affects
-from .symbols import SymbolError, at, digest, split_ref
+from .symbols import SymbolError, at, digest, is_repo_ref, read_ref, split_ref
 
 KINDS = ("spec", "contract", "probe", "proposal", "survivor")
 
@@ -36,8 +36,9 @@ KINDS = ("spec", "contract", "probe", "proposal", "survivor")
 def owned_files(cache: ClaimCache, root: Path, node: str, info: dict) -> list[str]:
     """The code the node owns: the files its exports live in, plus the files its mutants were recorded on."""
     files: set[str] = {r["file"] for r in cache.store.mutants(node)}
-    if (spec := at(root, info["spec"])).is_file() and (h := parse_header(spec.read_text(errors="replace"))):
-        files |= {split_ref(r)[0] for r in h.exports if "::" in r}
+    if (text := read_ref(root, info["spec"])) is not None and (h := parse_header(text)):
+        # an export written `<root>:<path>::item` lives under a named root: not a file this repo owns
+        files |= {split_ref(r)[0] for r in h.exports if "::" in r and is_repo_ref(r)}
     return sorted(files)
 
 

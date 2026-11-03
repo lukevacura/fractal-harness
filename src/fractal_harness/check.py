@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .authority import effective
 from .cache import STORE_DIR, ClaimCache, store_root
 from .probes import VACUOUS
 
@@ -44,7 +45,7 @@ def check_message(root: Path, message_file: str) -> tuple[int, str]:
         return 0, ""
     cache = ClaimCache(root, run_slow=False)
     try:
-        edges = cache.store.all()
+        edges = effective(cache, cache.store.all())[0]      # a higher layer's rule beats a conflicting lower one
     finally:
         cache.close()
     bad, _ = gate_violations(edges, root, {"message": Path(message_file).read_text(errors="replace")})
@@ -63,7 +64,8 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
     cache = ClaimCache(root)
     try:
         cache.update()
-        edges = cache.store.all()
+        all_edges = cache.store.all()
+        edges, beat = effective(cache, all_edges)      # a higher layer's rule beats a conflicting lower one
     finally:
         cache.close()
     violations = [e for e in edges if e.enforced and e.status == "failed"]
@@ -76,7 +78,9 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
     from .setup import forbidden_staged
     own = forbidden_staged(staged or [])
     gate_bad, gate_proposed = gate_violations(edges, root, {"staged": staged})
-    lines = [f"note: enforced rule {e.id} checks nothing: {e.detail[len(VACUOUS):]}\n          {e.post}"
+    lines = [f"note: {e.layer}'s rule {e.id} is set aside where it conflicts with {hi.layer}'s rule {hi.id}: {e.post}"
+             for hi in all_edges for e in beat.get(hi.id, [])]
+    lines += [f"note: enforced rule {e.id} checks nothing: {e.detail[len(VACUOUS):]}\n          {e.post}"
              for e in edges if e.enforced and (e.detail or "").startswith(VACUOUS)]
     lines += [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}" for e in proposed_failing]
     lines += [f"note: proposed rule {e.id} would be violated (not enforced): {e.post}\n          probe: {d}"

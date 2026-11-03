@@ -188,3 +188,33 @@ def layers(cache: ClaimCache, root: Path) -> dict:
     return {"layer": dict(db.execute("SELECT node, layer FROM layer ORDER BY layer, node")),
             "cycles": [n for (n,) in db.execute("SELECT node FROM cyclic ORDER BY node")],
             "reaches": reach}
+
+
+def dag(cache: ClaimCache, root: Path) -> dict:
+    """The declared node graph without the code index: {nodes, uses, after, layer, cycles}. `uses` is the
+    `parents:` DAG (a contract relied on), `after` is sequencing only; the two are never merged. Sound over the
+    headers as written; a node whose spec is gone or has no header has no edges. Cheap: no word index."""
+    db = sqlite3.connect(":memory:")
+    db.executescript(SCHEMA.format(min_name=MIN_NAME, entries=", ".join(repr(e) for e in sorted(ENTRY_NAMES))))
+    nodes = cache.store.all_nodes()
+    seq = itertools.count()
+    for n, info in sorted(nodes.items()):
+        db.execute("INSERT INTO node VALUES (?)", (n,))
+        f = at(root, info["spec"])
+        try:
+            h = parse_header(f.read_text(errors="replace")) if f.is_file() else None
+        except Exception:        # an unparsable header is reported by `check`, not drawn
+            h = None
+        if h is not None:
+            db.executemany("INSERT INTO uses VALUES (?, ?, ?)", [(next(seq), n, p) for p in h.parents])
+            db.executemany("INSERT INTO after VALUES (?, ?)", [(n, p) for p in h.after])
+
+    def edges(table: str) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {n: [] for n in nodes}
+        for c, p in db.execute(f"SELECT child, parent FROM {table} ORDER BY child, parent"):
+            out[c].append(p)
+        return out
+
+    return {"nodes": sorted(nodes), "uses": edges("uses"), "after": edges("after"),
+            "layer": dict(db.execute("SELECT node, layer FROM layer")),
+            "cycles": [n for (n,) in db.execute("SELECT node FROM cyclic ORDER BY node")]}

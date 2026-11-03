@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS edges (
     anchors     TEXT NOT NULL DEFAULT '[]',  -- json keyframe: lines the probe matched, with context
     repair      TEXT,                        -- json {kind, residuals} when a repair is needed
     delta_count INTEGER NOT NULL DEFAULT 0,  -- delta repairs since the last full verification
-    rule_state  TEXT,                        -- invariants only: proposed | enforced | rejected
+    rule_state  TEXT,                        -- invariants only: proposed | enforced | rejected | overridden
+    authority   TEXT,                        -- enforced/overridden invariants: the node (or root) that holds the rule
+    provenance  TEXT,                        -- json: how it was accepted (authority.py)
     detail      TEXT NOT NULL DEFAULT '',
     parent_id   TEXT,
     created_at  REAL NOT NULL,
@@ -83,6 +85,15 @@ CREATE TABLE IF NOT EXISTS ledger_audit (   -- every change to recorded verdicts
     action TEXT NOT NULL,
     detail TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rule_history (   -- who changed an invariant's standing, when, why (authority.py)
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    edge_id TEXT NOT NULL,
+    action  TEXT NOT NULL,       -- migrate | accept | override | restore
+    who     TEXT NOT NULL,       -- root | human | a node id
+    reason  TEXT NOT NULL DEFAULT '',
+    detail  TEXT NOT NULL DEFAULT '{}'   -- json: states and authorities before/after, evidence class, audit
+);
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts      REAL NOT NULL,
@@ -97,6 +108,7 @@ CREATE TABLE IF NOT EXISTS events (
 # checked). failed: probe did not pass.
 STATUSES = ("verified", "trusted", "stale", "failed")
 GOOD = ("verified", "trusted")
+ROOT = "root"                      # the base layer: the human
 
 STOPWORDS = frozenset("""
 a an and are as at be but by can do does for from how i if in into is it its me my of on or
@@ -138,10 +150,17 @@ class Edge:
     repair: dict | None = None
     delta_count: int = 0
     rule_state: str | None = None
+    authority: str | None = None       # who holds an enforced/overridden rule: a node id, or ROOT (the human)
+    provenance: dict | None = None     # how it was accepted: {by, node, ts, evidence, policy, audit?}
 
     @property
     def enforced(self) -> bool:
         return self.kind == "invariant" and self.rule_state == "enforced"
+
+    @property
+    def layer(self) -> str:
+        """The layer a rule speaks for. A rule with no recorded authority is a human's (nothing loosens)."""
+        return self.authority or ROOT
 
     def to_dict(self) -> dict:
         return {
@@ -169,7 +188,8 @@ class Store:
         self.db.row_factory = sqlite3.Row
         cols = {r[1] for r in self.db.execute("PRAGMA table_info(edges)")}
         for col, ddl in (("anchors", "TEXT NOT NULL DEFAULT '[]'"), ("repair", "TEXT"),
-                         ("delta_count", "INTEGER NOT NULL DEFAULT 0"), ("rule_state", "TEXT")):
+                         ("delta_count", "INTEGER NOT NULL DEFAULT 0"), ("rule_state", "TEXT"),
+                         ("authority", "TEXT"), ("provenance", "TEXT")):
             if cols and col not in cols:  # stores created before this column existed
                 self.db.execute(f"ALTER TABLE edges ADD COLUMN {col} {ddl}")
                 if col == "rule_state":   # invariants predating the lifecycle stay binding
@@ -178,6 +198,7 @@ class Store:
         if fts_sql and "porter" not in fts_sql[0]:  # index built before stemming: rebuild it
             self.db.execute("DROP TABLE edges_fts")
         self.db.executescript(SCHEMA)
+        self.migrate_authority()
         n_edges = self.db.execute("SELECT count(*) FROM edges").fetchone()[0]
         n_fts = self.db.execute("SELECT count(*) FROM edges_fts").fetchone()[0]
         if n_edges != n_fts:  # stores created before search indexing existed
@@ -215,6 +236,8 @@ class Store:
             repair=json.loads(row["repair"]) if row["repair"] else None,
             delta_count=row["delta_count"],
             rule_state=row["rule_state"],
+            authority=row["authority"],
+            provenance=json.loads(row["provenance"]) if row["provenance"] else None,
         )
 
     def get(self, edge_id: str) -> Edge | None:
@@ -277,9 +300,41 @@ class Store:
                             (json.dumps(repair) if repair else None, edge_id))
 
     def set_rule_state(self, edge_id: str, state: str) -> None:
+        """The human's step. Enforcing makes the rule the root's; any other state releases its authority."""
         with self.db:
-            self.db.execute("UPDATE edges SET rule_state=?, updated_at=? WHERE id=? AND kind='invariant'",
-                            (state, time.time(), edge_id))
+            self.db.execute("UPDATE edges SET rule_state=?, authority=?, updated_at=? WHERE id=? AND kind='invariant'",
+                            (state, ROOT if state == "enforced" else None, time.time(), edge_id))
+
+    def set_authority(self, edge_id: str, state: str, authority: str | None, provenance: dict | None = None) -> None:
+        """Set state + authority together (a local accept, an override, a restore); keeps provenance when None."""
+        with self.db:
+            self.db.execute("UPDATE edges SET rule_state=?, authority=?, updated_at=? WHERE id=? AND kind='invariant'",
+                            (state, authority, time.time(), edge_id))
+            if provenance is not None:
+                self.db.execute("UPDATE edges SET provenance=? WHERE id=?", (json.dumps(provenance), edge_id))
+
+    def migrate_authority(self) -> int:
+        """Enforced rules with no recorded authority belong to the root (they were accepted by a human before
+        authority existed). Idempotent: a rule that has an authority is never touched."""
+        ids = [r[0] for r in self.db.execute(
+            "SELECT id FROM edges WHERE kind='invariant' AND rule_state='enforced' AND authority IS NULL")]
+        for i in ids:
+            with self.db:
+                self.db.execute("UPDATE edges SET authority=? WHERE id=?", (ROOT, i))
+            self.history_add(i, "migrate", ROOT, "enforced before authority existed", {"authority": ROOT})
+        return len(ids)
+
+    def history_add(self, edge_id: str, action: str, who: str, reason: str = "", detail: dict | None = None) -> None:
+        with self.db:
+            self.db.execute("INSERT INTO rule_history (ts, edge_id, action, who, reason, detail) VALUES (?, ?, ?, ?, ?, ?)",
+                            (time.time(), edge_id, action, who, reason, json.dumps(detail or {})))
+
+    def rule_history(self, edge_id: str | None = None) -> list[dict]:
+        q, a = "SELECT ts, edge_id, action, who, reason, detail FROM rule_history", ()
+        if edge_id:
+            q, a = q + " WHERE edge_id = ?", (edge_id,)
+        return [{**dict(zip(("ts", "edge_id", "action", "who", "reason"), r[:5])), "detail": json.loads(r[5])}
+                for r in self.db.execute(q + " ORDER BY id", a)]
 
     def put_snapshot(self, sha: str, line_hashes: list[str]) -> None:
         with self.db:

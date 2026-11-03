@@ -29,7 +29,7 @@ from .cache import ClaimCache
 from .executor import Job, run_all
 from .nodes import edit_header, parse_header
 from .refindex import RefIndex, load_trees
-from .symbols import SymbolError, split_ref
+from .symbols import SymbolError, at, read_ref, split_ref
 
 RUST_ITEM = r"pub(?:\([^)]*\))?\s+(?:async\s+|unsafe\s+|const\s+|extern\s+\"[^\"]*\"\s+)*(?:struct|enum|trait|fn|type|const|static|union)\s+"
 
@@ -115,14 +115,14 @@ def sweep(cache: ClaimCache, root: Path, classes: set[str], branches: bool = Fal
     nodes = cache.store.all_nodes()
     owner_spec = {}
     for n, info in nodes.items():
-        if (root / info["spec"]).is_file() and (h := parse_header((root / info["spec"]).read_text(errors="replace"))):
+        if (st := read_ref(root, info["spec"])) is not None and (h := parse_header(st)):
             for r in h.exports:
                 owner_spec.setdefault(r.partition("::")[0] + "::" + r.partition("::")[2].split("::")[0], (n, info["spec"]))
     if "metadata" in classes:
         for m in marks["missing"]:
             n = m["node"]
             spec = nodes[n]["spec"]
-            refs = [r for r in parse_header((root / spec).read_text(errors="replace")).exports
+            refs = [r for r in parse_header(read_ref(root, spec, "")).exports
                     if r.partition("::")[0] + "::" + r.partition("::")[2].split("::")[0] == m["symbol"]]
             for r in refs:
                 out.append(Candidate("metadata", r, f"{spec} exports it but the code no longer defines it", n, spec_remove=(spec, r)))
@@ -143,13 +143,13 @@ def sweep(cache: ClaimCache, root: Path, classes: set[str], branches: bool = Fal
                 c = Candidate("code", key, f"{kind} {node}".strip() + (", tested only" if d["tested_only"] else ""),
                               node, path, spans)
                 if spec:
-                    c.spec_remove = (spec, next((r for r in parse_header((root / spec).read_text(errors="replace")).exports
+                    c.spec_remove = (spec, next((r for r in parse_header(read_ref(root, spec, "")).exports
                                                  if r.partition("::")[0] + "::" + r.partition("::")[2].split("::")[0] == key), key))
                 c.gate = impact.callers(idx, name, path, unseen_only=False)
                 out.append(c)
     if "store" in classes:
         for n, info in sorted(nodes.items()):
-            if not (root / info["spec"]).is_file():
+            if read_ref(root, info["spec"]) is None:
                 out.append(Candidate("store", n, f"its spec {info['spec']} no longer exists", n, action="deregister"))
         for n in sorted(cache.store.verdict_nodes() - set(nodes)):    # evidence: listed, never proposed for deletion
             out.append(Candidate("store", n, "holds verdicts but is not registered; they are kept (re-register it with "
@@ -236,8 +236,8 @@ def apply(cache: ClaimCache, root: Path, cands: list[Candidate]) -> list[str]:
         f = root / path
         f.write_text(remove_spans(f.read_text(errors="replace"), spans))
     for spec, rem in spec_edits.items():
-        f = root / spec
-        f.write_text(edit_header(f.read_text(errors="replace"), remove=rem))
+        f = at(root, spec)
+        f.write_text(edit_header(read_ref(root, spec, ""), remove=rem))
     return done
 
 

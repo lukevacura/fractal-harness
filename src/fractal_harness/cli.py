@@ -40,6 +40,16 @@ def _fmt(e: Edge) -> str:
     return line
 
 
+def _authority_fields(e: Edge, last: dict) -> dict:
+    """JSON extras for a node-local or overridden rule (a plain root rule's output is unchanged)."""
+    if e.layer == "root" and e.rule_state != "overridden":
+        return {}
+    out = {"authority": e.layer, "provenance": e.provenance}
+    if e.id in last:
+        out["last_override"] = last[e.id]
+    return out
+
+
 def _emit(args: argparse.Namespace, edges: list[Edge]) -> None:
     if args.json:
         print(json.dumps([e.to_dict() for e in edges], indent=2))
@@ -76,12 +86,22 @@ def main(argv: list[str] | None = None) -> int:
     pr.add_argument("rule", help="the rule, stated so a violation is unambiguous")
     _probe_args(pr, "json probe that fails when the rule is violated")
     inv = sub.add_parser("invariants", help="list invariants by state: proposed, enforced, rejected")
-    inv.add_argument("--state", choices=["proposed", "enforced", "rejected"])
+    inv.add_argument("--state", choices=["proposed", "enforced", "rejected", "overridden"])
     inv.add_argument("--audit", action="store_true", help="show each rule's probe audit verdict")
     for name, verb in (("accept", "enforce"), ("reject", "reject")):
         a = sub.add_parser(name, help=f"(human) {verb} proposed invariants")
         a.add_argument("ids", nargs="+")
         a.add_argument("--yes", action="store_true", help="allow a non-interactive terminal (scripts)")
+        if name == "accept":
+            a.add_argument("--as", dest="as_node", metavar="NODE",
+                           help="accept as this node (no human): only a rule inside the node's own files, "
+                                "and only where accept_policy in fractal.toml allows it")
+    ov = sub.add_parser("override", help="demote an enforced rule (kept, with who/why; --undo restores it); higher layer only")
+    ov.add_argument("id")
+    ov.add_argument("--by", default="root", metavar="NODE|root", help="the layer overriding (default: root, the human)")
+    ov.add_argument("--reason", required=True)
+    ov.add_argument("--undo", action="store_true", help="restore an overridden rule")
+    ov.add_argument("--yes", action="store_true", help="allow a non-interactive terminal (scripts)")
     ck = sub.add_parser("check", help="pre-commit/CI gate: re-check claims; exit 1 if an enforced invariant is violated")
     ck.add_argument("--message", metavar="FILE", help="commit-msg hook mode: check only the rules over this commit message file")
     ck.add_argument("--strict", action="store_true", help="also fail when other claims need repair")
@@ -160,6 +180,13 @@ def main(argv: list[str] | None = None) -> int:
     vp.add_argument("--against", metavar="REV", help="judge staleness against this commit instead of the working tree")
     vp.add_argument("--with-arguments", action="store_true", help="include prior equivalence arguments")
     vp.add_argument("--no-diff", action="store_true")
+    st = sub.add_parser("status", help="a node's state, derived from verdicts and digests (done|due|stale|pending); never marked")
+    st.add_argument("node", nargs="?", help="one node (default: all)")
+    st.add_argument("--json", action="store_true")
+    st.add_argument("--marks", type=Path, help="a hand-maintained markdown table: show where its marks disagree (heuristic)")
+    dg = sub.add_parser("dag", help="the node graph, generated from specs and the ledger: state, summary, uses/after edges")
+    dg.add_argument("--format", choices=("md", "json"), default="md")
+    dg.add_argument("--out", type=Path, help="write to this file instead of stdout")
     sub.add_parser("activations", help="which nodes are due an agent (spec, contract, probe, proposal or survivor events)")
     oi = sub.add_parser("only-in", help="propose a single-ownership rule: a pattern or symbol kind appears only in given files")
     oi.add_argument("concept", help='what is owned once, e.g. "ranking expression"')
@@ -223,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     rp = sub.add_parser("repair", help="fix broken descriptive claims with minimal context (default: demanded ones)")
     rp.add_argument("ids", nargs="*")
     rp.add_argument("--all", action="store_true", help="every broken claim, not just demanded ones")
+    rp.add_argument("--agent", action="store_true", help="with --all: after re-verifying, hand what remains to a model")
     rp.add_argument("--model", default="sonnet")
     rp.add_argument("--dry-run", action="store_true", help="print the repair prompt, don't run it")
     rec = sub.add_parser("record", help="learn claims from queued (or given) session transcripts")
@@ -351,7 +379,9 @@ def main(argv: list[str] | None = None) -> int:
             counts = {v: sum(a.verdict == v for a in results) for v in ("ok", "partial", "weak", "n/a")}
             print(" ".join(f"{k}={v}" for k, v in counts.items()))
         return 1 if any(a.verdict == "weak" for a in results) else 0
-    if args.cmd in ("accept", "reject") and not (sys.stdin.isatty() or args.yes):
+    human_only = (args.cmd == "reject" or (args.cmd == "accept" and not args.as_node)
+                  or (args.cmd == "override" and args.by == "root"))
+    if human_only and not (sys.stdin.isatty() or args.yes):
         print(f"error: `fractal {args.cmd}` is a human decision; run it in an interactive terminal "
               "(or pass --yes from a script you control)", file=sys.stderr)
         return 2
@@ -364,15 +394,33 @@ def main(argv: list[str] | None = None) -> int:
             if not args.json and e.rule_state == "proposed":
                 print(f"{'':20}proposed; a human enforces it with: fractal accept {e.id}")
         elif args.cmd in ("accept", "reject"):
+            from . import authority
             state = "enforced" if args.cmd == "accept" else "rejected"
             for i in args.ids:
-                e = cache.set_rule(i, state)
+                if args.cmd == "accept" and args.as_node:
+                    from .config import load as load_config
+                    r = authority.accept_as(cache, root, i, args.as_node, load_config(root).accept_policy)
+                    e, state = r["edge"], f"enforced@{args.as_node}"
+                    for w in r["warnings"]:
+                        print(f"warning: {w}", file=sys.stderr)
+                    if r["audit"]:
+                        print(f"{'':20}audit (advisory): {r['audit']['verdict']} {'; '.join(r['audit']['findings'])}")
+                else:
+                    e = cache.set_rule(i, state)
+                    if args.cmd == "accept":
+                        authority.record_human_accept(cache, i)
                 print(f"{e.id}  {state}: {e.post}" + (f"  (currently {e.status}: {e.detail})"
                                                        if e.status != "verified" else ""))
+        elif args.cmd == "override":
+            from . import authority
+            from .config import load as load_config
+            e = authority.override(cache, args.id, args.by, args.reason, load_config(root).accept_policy, args.undo)
+            print(f"{e.id}  {e.rule_state}{'' if args.undo else ' (demoted, not deleted)'}: {e.post}")
         elif args.cmd == "invariants":
             from .ledger import mutation_checked
             from .probes import evidence_class, evidence_gap
-            rules = cache.invariants((args.state,) if args.state else ("proposed", "enforced", "rejected"))
+            rules = cache.invariants((args.state,) if args.state else ("proposed", "enforced", "rejected", "overridden"))
+            last = {h["edge_id"]: h for h in cache.store.rule_history() if h["action"] in ("override", "restore")}
             memo: dict[str, list[str]] = {}
 
             def checked(e):
@@ -384,14 +432,18 @@ def main(argv: list[str] | None = None) -> int:
                 from .audit import audit_edge
                 verdicts = {e.id: audit_edge(e, cache.root).verdict for e in rules}
             if args.json:
-                print(json.dumps([{**e.to_dict(), "audit": verdicts.get(e.id), "evidence": evidence_class(e.probe),
+                print(json.dumps([{**e.to_dict(), **_authority_fields(e, last), "audit": verdicts.get(e.id),
+                                   "evidence": evidence_class(e.probe),
                                    "gap": evidence_gap(e.probe), "mutation_checked": checked(e)} for e in rules], indent=2))
             else:
-                order = {"enforced": 0, "proposed": 1, "rejected": 2}
+                order = {"enforced": 0, "proposed": 1, "rejected": 2, "overridden": 3}
                 for e in sorted(rules, key=lambda e: (order[e.rule_state], e.post)):
                     audit_note = f" audit={verdicts[e.id]}" if e.id in verdicts else ""
                     print(f"{e.id}  [{e.rule_state:8}] [{e.status:8}] [{evidence_class(e.probe) or 'no probe':10}]"
-                          f"{audit_note} {e.post}")
+                          f"{audit_note}{f' @{e.layer}' if e.layer != 'root' else ''} {e.post}")
+                    if e.rule_state == "overridden" and e.id in last:
+                        h = last[e.id]
+                        print(f"{'':20}OVERRIDDEN by {h['who']}: {h['reason']}  (held by {e.layer}; `fractal override --undo` restores)")
                     if gap := evidence_gap(e.probe):
                         print(f"{'':20}gap: {gap}")
                     if by := checked(e):
@@ -399,7 +451,8 @@ def main(argv: list[str] | None = None) -> int:
                     if e.status != "verified":
                         print(f"{'':20}{e.detail}")
                 print(" ".join(f"{s}={sum(e.rule_state == s for e in rules)}"
-                               for s in ("enforced", "proposed", "rejected")))
+                               for s in ("enforced", "proposed", "rejected")
+                               + (("overridden",) if any(e.rule_state == "overridden" for e in rules) else ())))
                 if weak := [e for e in rules if e.rule_state == "enforced" and evidence_gap(e.probe)]:
                     print(f"{len(weak)} enforced rule(s) have an evidence gap (see `gap:` above)")
         elif args.cmd == "ledger":
@@ -530,6 +583,25 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(r, indent=2) if args.json else graph_check.render(r), end="")
             if args.strict and any(r.values()):
                 return 1
+        elif args.cmd == "status":
+            from . import status
+            rows = [status.derive(cache, root, args.node)] if args.node else list(status.derive_all(cache, root).values())
+            dis = None
+            if args.marks:
+                derived = {r["node"]: r for r in rows}
+                dis = status.disagreements(status.legacy_marks(args.marks.read_text(errors="replace"), set(derived)), derived)
+            if args.json:
+                print(json.dumps({"nodes": rows, **({"disagreements": dis} if dis is not None else {})}, indent=2, sort_keys=True))
+            else:
+                print(status.render(rows, dis, verbose=bool(args.node)), end="")
+        elif args.cmd == "dag":
+            from . import dag
+            d = dag.build(cache, root, args.out.resolve().parent if args.out else None)
+            text = dag.render(d, args.format)
+            if args.out:
+                args.out.write_text(text)
+            else:
+                print(text, end="")
         elif args.cmd == "activations":
             from . import activation
             found = activation.scan(cache, root)
@@ -596,9 +668,16 @@ def main(argv: list[str] | None = None) -> int:
                 if not out and not unchecked and not relink:
                     print("nothing changed")
         elif args.cmd == "repair":
-            from .repair import repair
-            r = repair(root, args.ids or None, args.all, args.model, args.dry_run)
-            print(r["prompt"] if args.dry_run and "prompt" in r else json.dumps(r, indent=2))
+            from .repair import repair, reverify
+            if args.all and not args.dry_run:      # no model unless --agent: re-run every probe, report what is left
+                r = reverify(root)
+                print(json.dumps(r, indent=2))
+                if args.agent and r["remaining"]:
+                    r = repair(root, [x["id"] for x in r["remaining"]], False, args.model, False)
+                    print(json.dumps(r, indent=2))
+            else:
+                r = repair(root, args.ids or None, args.all, args.model, args.dry_run)
+                print(r["prompt"] if args.dry_run and "prompt" in r else json.dumps(r, indent=2))
         elif args.cmd == "verify":
             _emit(args, cache.verify(args.ids or None))
         elif args.cmd == "stats":

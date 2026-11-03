@@ -18,7 +18,7 @@ from pathlib import Path
 from .cache import ClaimCache
 from .store import Edge
 from .nodes import BINDING_RE, Header, body, contract, lint, parse_header, spec_lint
-from .symbols import SymbolError, at, digest, section_of, split_ref, symbol_of
+from .symbols import SymbolError, at, digest, read_ref, section_of, split_ref, symbol_of
 
 DEFAULT_ID_PATTERN = r"\b[A-Z]{1,3}-?\d{1,3}\b"
 MAX_RULES = 12
@@ -88,14 +88,21 @@ def put_extracted(cache: ClaimCache, root: Path, *, section: str | None = None, 
 DECISION_DOCS = ("DECISIONS.md", "INVARIANTS.md", "docs/DECISIONS.md", "docs/INVARIANTS.md")
 
 
+def decision_docs(root: Path) -> list[str]:
+    """The decision docs to search: the repo's own, then the same names under each named root (`docs:DECISIONS.md`)."""
+    from .config import load
+    return [*DECISION_DOCS, *(f"{n}:{d}" for n in sorted(load(root).roots) for d in DECISION_DOCS)]
+
+
 def autoregister(cache: ClaimCache, root: Path, ids: list[str]) -> tuple[list[str], dict[str, str]]:
     """Create the `--section` claim for each ID that has a heading in a decisions/invariants doc and
     no claim yet. (the IDs registered, {id: why not} for the rest)"""
     done, failed = [], {}
+    docs = decision_docs(root)
     for i in ids:
         reasons = []
-        for doc in DECISION_DOCS:
-            if not (root / doc).is_file():
+        for doc in docs:
+            if read_ref(root, doc) is None:
                 continue
             try:
                 put_extracted(cache, root, section=f"{doc}::{i}")
@@ -105,7 +112,7 @@ def autoregister(cache: ClaimCache, root: Path, ids: list[str]) -> tuple[list[st
                 reasons.append(str(e))
         else:
             failed[i] = next((r for r in reasons if "no heading" not in r), "no heading in " + ", ".join(
-                d for d in DECISION_DOCS if (root / d).is_file()) if any((root / d).is_file() for d in DECISION_DOCS)
+                d for d in docs if read_ref(root, d) is not None) if any(read_ref(root, d) is not None for d in docs)
                 else "no DECISIONS.md or INVARIANTS.md")
     return done, failed
 
@@ -169,8 +176,8 @@ def unchecked_decisions(cache: ClaimCache, root: Path, id_pattern: str = DEFAULT
         files = subprocess.run(["git", "ls-files"], cwd=root, capture_output=True, text=True).stdout.splitlines()
     except FileNotFoundError:
         files = []
-    tests = "\n".join((root / f).read_text(errors="replace") for f in files
-                      if re.search(r"(^|/)(tests?|test_[^/]*|[^/]*_test\.\w+)(/|\.|$)", f) and (root / f).is_file())
+    tests = "\n".join(read_ref(root, f, "") for f in files
+                      if re.search(r"(^|/)(tests?|test_[^/]*|[^/]*_test\.\w+)(/|\.|$)", f))
     out = []
     for e in edges:
         if (e.probe or {}).get("type") != "section":
