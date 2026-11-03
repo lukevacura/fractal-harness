@@ -25,6 +25,27 @@ class SymbolError(ValueError):
     pass
 
 
+def resolve(root: Path, ref: str) -> Path:
+    """The file a path or `<named root>:<path>` ref names (strict: SymbolError for a bad root or an escape)."""
+    from .config import ConfigError, resolve_path
+    try:
+        return resolve_path(root, ref)
+    except ConfigError as e:
+        raise SymbolError(str(e)) from e
+
+
+def at(root: Path, ref: str) -> Path:
+    """Like `resolve`, but a ref that cannot be resolved gives a path that does not exist, so callers that
+    test `.is_file()` treat it as missing instead of raising."""
+    from .config import ConfigError, ConfigFileError, resolve_path
+    try:
+        return resolve_path(root, ref)
+    except ConfigFileError:
+        raise                       # a broken fractal.toml is an error to show, not a missing file
+    except ConfigError:
+        return root / ref
+
+
 def digest(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
@@ -40,7 +61,7 @@ def split_ref(ref: str) -> tuple[str, str]:
 
 
 def _read(root: Path, path: str) -> str:
-    f = root / path
+    f = resolve(root, path)
     if not f.is_file():
         raise SymbolError(f"no such file: {path}")
     return f.read_text(errors="replace")

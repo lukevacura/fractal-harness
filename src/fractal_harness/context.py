@@ -18,7 +18,7 @@ from pathlib import Path
 from .cache import ClaimCache
 from .store import Edge
 from .nodes import BINDING_RE, Header, body, contract, lint, parse_header, spec_lint
-from .symbols import SymbolError, digest, section_of, split_ref, symbol_of
+from .symbols import SymbolError, at, digest, section_of, split_ref, symbol_of
 
 DEFAULT_ID_PATTERN = r"\b[A-Z]{1,3}-?\d{1,3}\b"
 MAX_RULES = 12
@@ -277,7 +277,7 @@ def cited_sections(root: Path, spec: str, id_pattern: str = DEFAULT_ID_PATTERN) 
 
 def bundle(root: Path, spec_path: str, id_pattern: str = DEFAULT_ID_PATTERN) -> str:
     from .hook import RULES_HEADER, _agent_query, _rule_line, select_context
-    f = root / spec_path
+    f = at(root, spec_path)
     if not f.is_file():
         raise SymbolError(f"no such spec: {spec_path}")
     spec = f.read_text(errors="replace")

@@ -29,6 +29,7 @@ from .cache import ClaimCache
 from .graph_check import ENTRY_NAMES, MIN_NAME, _is_public, _public_patterns, _refs
 from .nodes import _symbol_keys, parse_header
 from .refindex import Index, is_test, load_trees
+from .symbols import at
 
 SCHEMA = """
 CREATE TABLE file(path TEXT, test INT);                 -- source files of this tree
@@ -129,8 +130,8 @@ def facts(cache: ClaimCache, root: Path) -> sqlite3.Connection:
     here = next((t for t in load_trees(root) if t.current), None)
     texts = here.texts if here else {}
     idx = here.index if here else Index({})
-    headers = {n: parse_header((root / i["spec"]).read_text(errors="replace"))
-               for n, i in nodes.items() if (root / i["spec"]).is_file()}
+    headers = {n: parse_header(at(root, i["spec"]).read_text(errors="replace"))
+               for n, i in nodes.items() if at(root, i["spec"]).is_file()}
     public = _public_patterns(root, headers)
     db.executemany("INSERT INTO file VALUES (?, ?)", [(p, is_test(p)) for p in texts])
     db.executemany("INSERT INTO node VALUES (?)", [(n,) for n in nodes])

@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .symbols import SymbolError, digest, split_ref, symbol_of
+from .symbols import SymbolError, at, digest, resolve, split_ref, symbol_of
 
 LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "planned", "public", "refines", "distinct", "joins")
 STR_FIELDS = ("guarantee", "condition", "oracle")
@@ -203,7 +203,7 @@ def _signature(root: Path, ref: str, h: "Header") -> str:
 def contract(root: Path, spec_path: str, exports: int | None = None) -> str:
     """The text a child may rely on: guarantee, condition, and the exports' current signatures
     (only the first `exports` of them when given)."""
-    f = root / spec_path
+    f = resolve(root, spec_path)
     if not f.is_file():
         raise SymbolError(f"no such spec: {spec_path}")
     h = parse_header(f.read_text(errors="replace"))
@@ -225,7 +225,7 @@ def contract_digest(root: Path, spec_path: str) -> str:
 def contract_parts(root: Path, spec_path: str) -> dict:
     """What a child's verdicts rest on, piece by piece: {claim: digest of guarantee+condition,
     exports: {ref: digest of its signature}}."""
-    h = parse_header((root / spec_path).read_text(errors="replace")) if (root / spec_path).is_file() else None
+    h = parse_header(at(root, spec_path).read_text(errors="replace")) if at(root, spec_path).is_file() else None
     if h is None or not h.guarantee:
         raise SymbolError(f"{spec_path} declares no `guarantee:`: nothing for a child to rely on")
     for ref in h.exports:
@@ -239,7 +239,7 @@ def contract_change(old, root: Path, spec_path: str) -> str | None:
     changes it (no child relied on them); changing the guarantee or condition, or removing or
     altering an export that was there, does."""
     if isinstance(old, str):          # recorded as one digest: unchanged, or only exports appended
-        n = len(parse_header((root / spec_path).read_text(errors="replace")).exports)
+        n = len(parse_header(at(root, spec_path).read_text(errors="replace")).exports)
         if any(digest(contract(root, spec_path, k)) == old for k in range(n, -1, -1)):
             return None
         return "its contract changed"
@@ -339,7 +339,7 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path,
     mine = _symbol_keys(h.exports)
     mine_forms, other_forms = _forms(h.exports), {}
     for other, info in nodes.items():
-        if other != node and (s := root / info["spec"]).is_file() and (oh := parse_header(s.read_text(errors="replace"))):
+        if other != node and (s := at(root, info["spec"])).is_file() and (oh := parse_header(s.read_text(errors="replace"))):
             other_forms.update(_forms(oh.exports))
     declared: set[str] = set()
     for pair in h.refines + h.distinct:
@@ -358,7 +358,7 @@ def ownership_lint(h: Header, node: str, nodes: dict[str, dict], root: Path,
         if decision not in (concepts or {}):
             continue
         for other, info in sorted(nodes.items()):
-            if other == node or not (s := root / info["spec"]).is_file():
+            if other == node or not (s := at(root, info["spec"])).is_file():
                 continue
             oh = parse_header(s.read_text(errors="replace"))
             if not oh or decision not in oh.implements:
@@ -426,14 +426,14 @@ def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str,
     parent_files: set[str] = set()
     for p in h.parents:
         info = nodes.get(p)
-        if info and (spec := root / info["spec"]).is_file():
+        if info and (spec := at(root, info["spec"])).is_file():
             ph = parse_header(spec.read_text(errors="replace"))
             parent_files |= {r.partition("::")[0] for r in (ph.exports if ph else [])}
     code = own_spec_text + "\n" + "\n".join((root / f).read_text(errors="replace") for f in own_files if (root / f).is_file())
     repo = _files(root)
     owner = {}
     for n, info in nodes.items():
-        if (s := root / info["spec"]).is_file() and (ph := parse_header(s.read_text(errors="replace"))):
+        if (s := at(root, info["spec"])).is_file() and (ph := parse_header(s.read_text(errors="replace"))):
             for r in ph.exports:
                 owner.setdefault(r.partition("::")[0], n)
     for mod, suffixes in sorted(_imported_modules(code).items()):

@@ -34,6 +34,7 @@ from pathlib import Path
 from .cache import ClaimCache
 from .nodes import _symbol_keys, parse_header
 from .refindex import Index, is_test, load_trees
+from .symbols import at
 
 MIN_NAME = 3
 ENTRY_NAMES = {"main", "run", "cli"}
@@ -98,7 +99,7 @@ def check(cache: ClaimCache, root: Path, only: str | None = None) -> dict:
     idx = here.index if here else Index({})
     headers = {}
     for n, info in nodes.items():
-        if (s := root / info["spec"]).is_file():
+        if (s := at(root, info["spec"])).is_file():
             headers[n] = parse_header(s.read_text(errors="replace"))
     public = _public_patterns(root, headers)
     dead, phantom, missing = [], [], []

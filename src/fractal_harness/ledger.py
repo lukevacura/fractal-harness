@@ -30,7 +30,7 @@ from .concepts import decision_ids
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
 from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint, spec_key, spec_lint, edit_header
 from .store import GOOD
-from .symbols import SymbolError, digest, symbol_of
+from .symbols import SymbolError, at, digest, resolve, symbol_of
 
 RESULTS = ("killed", "survived", "equivalent")
 MAX_DIFF_CHARS = 20_000
@@ -72,7 +72,7 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
     premises are exactly its declared `implements` decisions and `parents` contracts; without one
     (legacy) they are whatever the text cites. Re-run after the spec changes and the node has been
     re-verified. Parents must be registered first, so their contracts can be watched."""
-    f = root / spec
+    f = resolve(root, spec)
     if not f.is_file():
         raise SymbolError(f"no such spec: {spec}")
     text = f.read_text(errors="replace")
@@ -285,10 +285,10 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
     prose_changed = None
     oracle = ""
     if info:
-        if (sp := root / info["spec"]).is_file():
+        if (sp := at(root, info["spec"])).is_file():
             oh = parse_header(sp.read_text(errors="replace"))
             oracle = oh.oracle if oh else ""
-        spec = root / info["spec"]
+        spec = at(root, info["spec"])
         stext = spec.read_text(errors="replace") if spec.is_file() else None
         try:
             keyed = stext is not None and info["spec_sha"] in (digest(spec_key(stext)), digest(stext))

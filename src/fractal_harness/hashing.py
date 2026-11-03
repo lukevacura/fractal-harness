@@ -20,7 +20,13 @@ def canonical(obj: object) -> str:
 
 
 def file_hash(root: Path, rel: str) -> str:
-    path = root / rel
+    from .config import ConfigError, ConfigFileError, resolve_path
+    try:
+        path = resolve_path(root, rel)     # `<named root>:<path>` hashes that file's content, wherever it lives
+    except ConfigFileError:
+        raise
+    except ConfigError:
+        return MISSING
     if not path.is_file():
         return MISSING
     return sha(path.read_bytes())

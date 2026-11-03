@@ -28,7 +28,7 @@ from .context import premises_of
 from .ledger import premise_change
 from .nodes import parse_header, spec_key
 from .regions import affects
-from .symbols import SymbolError, digest, split_ref
+from .symbols import SymbolError, at, digest, split_ref
 
 KINDS = ("spec", "contract", "probe", "proposal", "survivor")
 
@@ -36,7 +36,7 @@ KINDS = ("spec", "contract", "probe", "proposal", "survivor")
 def owned_files(cache: ClaimCache, root: Path, node: str, info: dict) -> list[str]:
     """The code the node owns: the files its exports live in, plus the files its mutants were recorded on."""
     files: set[str] = {r["file"] for r in cache.store.mutants(node)}
-    if (spec := root / info["spec"]).is_file() and (h := parse_header(spec.read_text(errors="replace"))):
+    if (spec := at(root, info["spec"])).is_file() and (h := parse_header(spec.read_text(errors="replace"))):
         files |= {split_ref(r)[0] for r in h.exports if "::" in r}
     return sorted(files)
 
@@ -55,7 +55,7 @@ def blame(root: Path, e) -> list[str] | None:
 
 def events(cache: ClaimCache, root: Path, node: str, info: dict, failing: dict[str, list[str] | None]) -> list[dict]:
     out: list[dict] = []
-    spec = root / info["spec"]
+    spec = at(root, info["spec"])
     if not spec.is_file():
         return [{"kind": "spec", "detail": f"spec {info['spec']} is gone"}]
     text = spec.read_text(errors="replace")

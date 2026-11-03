@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from .cache import CacheError, ClaimCache
+from .config import ConfigError
 from .probes import ProbeError
 from .symbols import SymbolError
 from .store import Edge
@@ -602,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(args, cache.verify(args.ids or None))
         elif args.cmd == "stats":
             print(json.dumps(cache.stats(), indent=2))
-    except (CacheError, ProbeError, SymbolError, json.JSONDecodeError) as e:
+    except (CacheError, ProbeError, SymbolError, ConfigError, json.JSONDecodeError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     finally:

@@ -339,6 +339,9 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
     if git("rev-parse", "--git-dir").returncode == 0:
         checks += _worktree_checks(root)
 
+    from .config import doctor_checks
+    checks += doctor_checks(root)       # named roots that do not resolve (sound: presence check)
+
     cache = ClaimCache(root)
     try:
         s = cache.stats()
