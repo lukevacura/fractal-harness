@@ -324,9 +324,39 @@ def prompt_hook(stdin: str) -> str:
     except Exception as e:  # a broken cache must never block the user's prompt
         print(f"fractal hook: {e}", file=sys.stderr)
         return ""
+    note = _arbitration_notice(root)
+    ctx = "\n\n".join(x for x in (ctx, note) if x)
     if not ctx:
         return ""
     return json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": ctx}})
+
+
+def _arbitration_notice(root: Path) -> str | None:
+    """Arbitration requests no human has been shown yet, once each (marked surfaced). One indexed read; never raises."""
+    try:
+        import sqlite3
+        db_path = root / STORE_DIR / "edges.db"
+        if not db_path.exists():         # a linked worktree shares the main checkout's store (store_root runs git: slow path)
+            db_path = store_root(root) / STORE_DIR / "edges.db"
+            if not db_path.exists():
+                return None
+        db = sqlite3.connect(db_path, timeout=1)
+        try:
+            rows = db.execute("SELECT c.id, c.rule_id, c.reason, e.post FROM conflicts c LEFT JOIN edges e ON e.id = c.rule_id "
+                              "WHERE c.state='awaiting_human' AND c.surfaced=0").fetchall()
+            if not rows:
+                return None
+            with db:
+                db.executemany("UPDATE conflicts SET surfaced=1 WHERE id=?", [(r[0],) for r in rows])
+        finally:
+            db.close()
+        lines = [f"FRACTAL: {len(rows)} ARBITRATION REQUEST(S) need a human decision. An agent disputes a human-owned rule "
+                 "and has not acted on it. Tell the user now; they resolve it in a terminal with "
+                 "`fractal conflict arbitrate <id> --upheld|--revised --reason ...`."]
+        lines += [f"- {r[0]}: rule [{r[1]}] \"{(r[3] or '')[:90]}\": {r[2][:300]}" for r in rows]
+        return "\n".join(lines)
+    except Exception:       # no conflicts table yet, a locked db: nothing to show
+        return None
 
 
 # --- subagents: the prompt hook never fires for them --------------------------------------
@@ -505,9 +535,11 @@ def proposed_content(root: Path, rel: str, tool: str, inp: dict) -> str | None:
     return text
 
 
-def pre_edit_violations(root: Path, rel: str, content: str, generated: int = 0) -> tuple[int, list[str]]:
-    """Before an edit: run the enforced rules that scan `rel` against the edited content in memory."""
-    from . import probes
+def pre_edit_violations(root: Path, rel: str, content: str, generated: int = 0,
+                        log_blocks: bool = False) -> tuple[int, list[str]]:
+    """Before an edit: run the enforced rules that scan `rel` against the edited content in memory.
+    `log_blocks`: record each violated rule in the block log (heuristic friction signal; never raises)."""
+    from . import blocklog, probes
     cache = ClaimCache(root, run_slow=False)
     try:
         beat: dict = {}
@@ -519,6 +551,8 @@ def pre_edit_violations(root: Path, rel: str, content: str, generated: int = 0) 
             if not result.passed:
                 text_of = lambda f: content.splitlines() if f == rel else _read_lines(cache.root, f)
                 messages.append(_violation(e, result.detail, result.matches, text_of) + _beat_note(beat, e))
+                if log_blocks:
+                    blocklog.record(cache.store, e, rel, "pre-edit", root)
         cache.store.log("pre_edit_check", None, file=rel, rules=len(rules), violations=len(messages),
                         blocked_chars=generated if messages else 0)
         return len(rules), messages
@@ -552,7 +586,7 @@ def pre_edit_hook(stdin: str) -> tuple[int, str]:
             return 0, ""
         generated = len(inp.get("content") or "") if tool == "Write" else sum(
             len(e.get("new_string") or "") for e in (inp.get("edits") if tool == "MultiEdit" else [inp]) or [])
-        _, messages = pre_edit_violations(root, rel, content, generated)
+        _, messages = pre_edit_violations(root, rel, content, generated, log_blocks=True)
     except Exception as e:  # never break the agent's edit loop
         return 0, f"fractal hook: {e}"
     if not messages:
@@ -623,6 +657,10 @@ def stop_hook(stdin: str) -> tuple[int, str]:
             sid = data.get("session_id")
             blocks = sum(1 for e in cache.store.events("gate_block") if e.get("session_id") == sid)
             blocking = blocks < MAX_GATE_BLOCKS
+            from . import blocklog
+            for e in result["violations"]:      # enforced rules that stopped the turn (heuristic friction signal)
+                m = getattr(result["results"].get(e.id), "matches", None) or []
+                blocklog.record(cache.store, e, m[0][0] if m else "", "stop", root)
             if blocking:
                 cache.store.log("gate_block", None, session_id=sid, problems=[e.id for e in problems])
         finally:

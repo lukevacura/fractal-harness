@@ -69,6 +69,8 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
     finally:
         cache.close()
     violations = [e for e in edges if e.enforced and e.status == "failed"]
+    from .blocklog import record_many
+    record_many(root, [(e, "") for e in violations], "check")      # heuristic friction signal; never raises
     regressions = behavioral["regressions"]
     proposed_failing = [e for e in edges if e.kind == "invariant" and e.rule_state == "proposed"
                         and e.status == "failed"]
@@ -78,6 +80,7 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
     from .setup import forbidden_staged
     own = forbidden_staged(staged or [])
     gate_bad, gate_proposed = gate_violations(edges, root, {"staged": staged})
+    record_many(root, [(e, "") for e, _ in gate_bad], "check")
     lines = [f"note: {e.layer}'s rule {e.id} is set aside where it conflicts with {hi.layer}'s rule {hi.id}: {e.post}"
              for hi in all_edges for e in beat.get(hi.id, [])]
     lines += [f"note: enforced rule {e.id} checks nothing: {e.detail[len(VACUOUS):]}\n          {e.post}"

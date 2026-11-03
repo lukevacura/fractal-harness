@@ -102,6 +102,37 @@ def main(argv: list[str] | None = None) -> int:
     ov.add_argument("--reason", required=True)
     ov.add_argument("--undo", action="store_true", help="restore an overridden rule")
     ov.add_argument("--yes", action="store_true", help="allow a non-interactive terminal (scripts)")
+    cf = sub.add_parser("conflict", help="contradiction as the signal: a local rule that clashes with, or keeps blocking "
+                                         "work under, a higher layer is decided by the parent's agent (human only at root)")
+    cfs = cf.add_subparsers(dest="conflict_cmd", required=True)
+    cfl = cfs.add_parser("list", help="conflicts awaiting a decision (heuristic detection)")
+    cfl.add_argument("--all", action="store_true", help="also decided ones")
+    cfsh = cfs.add_parser("show", help="one conflict: why, block counts, decision history")
+    cfsh.add_argument("id")
+    cfr = cfs.add_parser("raise", help="the spec/premise behind a claim or rule is wrong or ambiguous: raise it on the parent "
+                                       "instead of weakening a probe (never edits the claim)")
+    cfr.add_argument("target", help="claim or rule id")
+    cfr.add_argument("--reason", required=True)
+    cfr.add_argument("--by", default="agent")
+    cfv = cfs.add_parser("resolve", help="decide a conflict: keep | narrow | override (the parent's agent; a human at root)")
+    cfv.add_argument("id")
+    cfv.add_argument("action", choices=["keep", "narrow", "override"])
+    cfv.add_argument("--reason", required=True)
+    cfv.add_argument("--exclude", action="append", default=[], help="narrow: path/glob the rule stops applying to (repeatable)")
+    cfv.add_argument("--as", dest="as_node", metavar="NODE|root", help="acting layer (default: the handler; root = a human)")
+    cfv.add_argument("--yes", action="store_true", help="allow a non-interactive terminal for a human decision")
+    cfe = cfs.add_parser("escalate", help="one layer up; for a root rule (or at root) an arbitration request for a human")
+    cfe.add_argument("id")
+    cfe.add_argument("--reason", required=True, help="why (written explanation, required)")
+    cfe.add_argument("--as", dest="as_node", metavar="NODE|root")
+    cfe.add_argument("--yes", action="store_true")
+    cfa = cfs.add_parser("arbitrate", help="(human) settle an arbitration request")
+    cfa.add_argument("id")
+    cfo = cfa.add_mutually_exclusive_group(required=True)
+    cfo.add_argument("--upheld", action="store_true", help="the root rule stands")
+    cfo.add_argument("--revised", action="store_true", help="the human is changing the rule (do it with fractal override)")
+    cfa.add_argument("--reason", required=True)
+    cfa.add_argument("--yes", action="store_true")
     ck = sub.add_parser("check", help="pre-commit/CI gate: re-check claims; exit 1 if an enforced invariant is violated")
     ck.add_argument("--message", metavar="FILE", help="commit-msg hook mode: check only the rules over this commit message file")
     ck.add_argument("--strict", action="store_true", help="also fail when other claims need repair")
@@ -229,6 +260,28 @@ def main(argv: list[str] | None = None) -> int:
     mu.add_argument("--timeout", type=int, default=600)
     mu.add_argument("--no-record", action="store_true", help="report only; record nothing in the ledger")
     mu.add_argument("--no-cache", action="store_true", help="ignore the memo")
+    br = sub.add_parser("brief", help="the prompt for an agent working on a node: repo root, why due, task, spec and premises, reporting")
+    br.add_argument("node")
+    br.add_argument("--out", type=Path, help="write to this file instead of stdout")
+    br.add_argument("--json", action="store_true")
+    rpt = sub.add_parser("report", help="file an agent's scratch report into the docs with provenance, or list filed reports")
+    rsub = rpt.add_subparsers(dest="report_cmd", required=True)
+    rfi = rsub.add_parser("file", help="copy a scratch report to its destination, with a provenance header")
+    rfi.add_argument("scratch")
+    rfi.add_argument("--node", required=True)
+    rfi.add_argument("--to", metavar="ROOT:PATH", help="destination (default: [brief] report_to); no file suffix = a directory")
+    rfi.add_argument("--force", action="store_true", help="replace an existing file")
+    rfi.add_argument("--json", action="store_true")
+    rli = rsub.add_parser("list", help="reports filed from this checkout's store")
+    rli.add_argument("--node")
+    rli.add_argument("--json", action="store_true")
+    rn = sub.add_parser("run", help="run a command at a commit on the configured backend (memoized); --detach and poll with `run status|log <id>`")
+    rn.add_argument("--node", help="run at this node's commit (default: HEAD)")
+    rn.add_argument("--backend", help="override [jobs] backend (local, ssh)")
+    rn.add_argument("--timeout", type=int, default=3600, metavar="S")
+    rn.add_argument("--detach", action="store_true", help="start it in the background and print the run id")
+    rn.add_argument("--tail", type=int, help="with `log`: only the last N lines")
+    rn.add_argument("words", nargs=argparse.REMAINDER, help="<command...>, or `status <id>` / `log <id>`; options go before the command")
     rf = sub.add_parser("refs", help="which files mention a symbol, on every live worktree (and --branches)")
     rf.add_argument("name")
     rf.add_argument("--branches", action="store_true", help="also local branch tips no worktree has checked out")
@@ -436,6 +489,8 @@ def main(argv: list[str] | None = None) -> int:
                                    "evidence": evidence_class(e.probe),
                                    "gap": evidence_gap(e.probe), "mutation_checked": checked(e)} for e in rules], indent=2))
             else:
+                from .conflict import awaiting, banner
+                print("\n".join(banner(awaiting(cache))), end="")
                 order = {"enforced": 0, "proposed": 1, "rejected": 2, "overridden": 3}
                 for e in sorted(rules, key=lambda e: (order[e.rule_state], e.post)):
                     audit_note = f" audit={verdicts[e.id]}" if e.id in verdicts else ""
@@ -566,6 +621,52 @@ def main(argv: list[str] | None = None) -> int:
             r = mutate.run(cache, root, args.node, items, cmd=cmd, build_cmd=args.build_cmd, env=env, commit=args.commit,
                            workers=args.jobs, timeout=args.timeout, record=not args.no_record, use_memo=not args.no_cache)
             print(json.dumps(r, indent=2) if args.json else mutate.render(r), end="")
+        elif args.cmd == "brief":
+            from . import brief
+            r = brief.build(cache, root, args.node)
+            brief.remember(root, args.node, r["digest"])
+            if args.out:
+                args.out.write_text(r["text"])
+            if args.json:
+                print(json.dumps(r, indent=2))
+            elif args.out:
+                print(f"wrote {args.out} (digest {r['digest']})")
+            else:
+                print(r["text"], end="")
+        elif args.cmd == "report":
+            from . import reports
+            if args.report_cmd == "file":
+                row = reports.file_report(cache, root, args.scratch, args.node, args.to, args.force)
+                print(json.dumps(row, indent=2) if args.json else f"filed {row['path']} (node {row['node']}, commit {row['commit'][:10]})")
+            else:
+                rows = reports.list_reports(root, args.node)
+                print(json.dumps(rows, indent=2) if args.json else reports.render(rows), end="")
+        elif args.cmd == "run":
+            from . import jobs
+            w = args.words[1:] if args.words and args.words[0] == "--" else args.words
+            if w and w[0] in ("status", "log") and args.words[0] != "--":
+                if len(w) != 2:
+                    raise CacheError(f"usage: fractal run {w[0]} <id>")
+                if w[0] == "log":
+                    print(jobs.log_text(root, w[1], args.tail), end="")
+                else:
+                    st = jobs.status(root, w[1])
+                    print(json.dumps(st, indent=2) if args.json else jobs.render(st), end="")
+            else:
+                if not w:
+                    raise CacheError("usage: fractal run [--node N] [--backend B] [--timeout S] [--detach] <command...>")
+                import shlex
+                run_id = jobs.create(cache, root, shlex.join(w) if len(w) > 1 else w[0], node=args.node,
+                                     backend=args.backend, timeout=args.timeout)
+                if args.detach:
+                    jobs.spawn(root, run_id)
+                    print(run_id if not args.json else json.dumps({"id": run_id}))
+                    print(f"poll with: fractal run status {run_id}", file=sys.stderr)
+                else:
+                    res = jobs.execute_run(root, run_id)
+                    st = jobs.status(root, run_id)
+                    print(json.dumps(st, indent=2) if args.json else jobs.render(st), end="")
+                    return 0 if res["status"] == "passed" else 1
         elif args.cmd == "refs":
             from .refindex import RefIndex, is_test
             idx = RefIndex.load(root, args.branches)
@@ -590,9 +691,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.marks:
                 derived = {r["node"]: r for r in rows}
                 dis = status.disagreements(status.legacy_marks(args.marks.read_text(errors="replace"), set(derived)), derived)
+            from .conflict import awaiting, banner
+            asked = awaiting(cache)
             if args.json:
-                print(json.dumps({"nodes": rows, **({"disagreements": dis} if dis is not None else {})}, indent=2, sort_keys=True))
+                print(json.dumps({"nodes": rows, **({"disagreements": dis} if dis is not None else {}),
+                                  **({"arbitrations": asked} if asked else {})}, indent=2, sort_keys=True))
             else:
+                print("\n".join(banner(asked)) + ("\n" if asked else ""), end="")
                 print(status.render(rows, dis, verbose=bool(args.node)), end="")
         elif args.cmd == "dag":
             from . import dag
@@ -602,6 +707,34 @@ def main(argv: list[str] | None = None) -> int:
                 args.out.write_text(text)
             else:
                 print(text, end="")
+        elif args.cmd == "conflict":
+            from . import conflict
+            human = sys.stdin.isatty() or getattr(args, "yes", False)
+            cc = args.conflict_cmd
+            if cc == "list":
+                items = conflict.pending(cache, root)
+                rows = [r for r in cache.store.conflict_all() if args.all or r["state"] in ("open", "awaiting_human")]
+                print(json.dumps({"pending": items, "decided": rows if args.all else []}, indent=2) if args.json
+                      else conflict.render_list(items, cache), end="")
+            elif cc == "show":
+                item = next((c for c in conflict.pending(cache, root) if c["id"] == args.id), None)
+                row = cache.store.conflict_get(args.id)
+                if not item and not row:
+                    raise CacheError(f"no conflict {args.id}")
+                print(json.dumps({"pending": item, "record": row}, indent=2) if args.json
+                      else conflict.render_show(cache, item, row), end="")
+            else:
+                if cc == "raise":
+                    r = conflict.raise_conflict(cache, root, args.target, args.reason, args.by)
+                elif cc == "resolve":
+                    r = conflict.resolve(cache, root, args.id, args.action, args.reason, as_node=args.as_node,
+                                         human=human, exclude=args.exclude)
+                elif cc == "escalate":
+                    r = conflict.escalate(cache, root, args.id, args.reason, as_node=args.as_node, human=human)
+                else:
+                    r = conflict.arbitrate(cache, args.id, "upheld" if args.upheld else "revised", args.reason, human=human)
+                print(json.dumps(r, indent=2) if args.json else
+                      f"{r['id']}  {r['state']}" + (f" (handler {r['handler']})" if r['state'] in ('open', 'awaiting_human') else ""))
         elif args.cmd == "activations":
             from . import activation
             found = activation.scan(cache, root)

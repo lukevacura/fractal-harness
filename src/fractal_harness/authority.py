@@ -92,6 +92,7 @@ def region_of(cache: ClaimCache, root: Path, node: str) -> set[str]:
 class Conflict:
     sound: bool
     why: str
+    kind: str = "grep"      # "unseen": a probe that is not a grep was involved, nothing was actually compared
 
 
 def _leaves(probe: dict | None) -> list[dict]:
@@ -139,7 +140,7 @@ def contradiction(hi: dict | None, lo: dict | None, files: list[str]) -> Conflic
                 return Conflict(False, f"{pat}: overlapping but not nested scopes with expectations "
                                 f"{a.get('expect', 'present')} and {b.get('expect', 'present')}; they may conflict")
     if unseen and any(True for _ in _leaves(hi)) and any(True for _ in _leaves(lo)):
-        return Conflict(False, "a non-grep probe is involved; conflicts are only compared between grep probes")
+        return Conflict(False, "a non-grep probe is involved; conflicts are only compared between grep probes", "unseen")
     return None
 
 

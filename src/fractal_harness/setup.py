@@ -341,6 +341,8 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
 
     from .config import doctor_checks
     checks += doctor_checks(root)       # named roots that do not resolve (sound: presence check)
+    from . import jobs, reports
+    checks += jobs.doctor_checks(root) + reports.doctor_checks(root)    # the [jobs] backend ([sound]); [brief] report_dir ([heuristic])
 
     cache = ClaimCache(root)
     try:

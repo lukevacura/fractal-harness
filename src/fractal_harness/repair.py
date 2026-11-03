@@ -21,10 +21,13 @@ import subprocess
 from pathlib import Path
 
 from .cache import ClaimCache
+from .conflict import cid_of
 from .record import NO_HOOKS_ENV
 from .store import Edge
 
 KEYFRAME_INTERVAL = 3
+SPEC_ROUTE = ("if the SPEC or premise is wrong or ambiguous (not the code), never weaken the probe: "
+              "`fractal conflict raise {id} --reason \"...\"` hands it to the parent node")
 
 PROMPT = """\
 You repair entries in this repo's claim cache. Each entry below is a claim whose probe
@@ -57,7 +60,11 @@ Probe format: {{"type":"grep","pattern":"<regex>","paths":["<glob>"],"expect":"p
 patterns anchored on identifiers over exact formatting, and "min" over exact "count", so
 harmless edits don't break them. The probe must still fail if the claim becomes false.
 
-Finish with one line per entry: `<id>: STILL_TRUE | CHANGED | REMOVED | VIOLATION - <why>`.
+- SPEC_CONFLICT: the probe fails because the spec or premise itself is wrong or ambiguous, not because the code
+  regressed. NEVER weaken or loosen a probe to make it pass. Leave the claim and probe as they are and raise it on the
+  parent node: `fractal conflict raise <id> --reason "<what is wrong or ambiguous>"`.
+
+Finish with one line per entry: `<id>: STILL_TRUE | CHANGED | REMOVED | VIOLATION | SPEC_CONFLICT - <why>`.
 
 Entries:
 {entries}
@@ -128,7 +135,12 @@ def reverify(root: Path) -> dict:
                      else "re-assertion (agent): no probe, sources changed" if kind == "reassert"
                      else "judgment (agent): probe passes but the code around it moved" if kind in ("suspect", "rewrite")
                      else "an upstream claim to clear first" if e.detail.startswith("blocked") else "re-verification")
-            remaining.append({"id": e.id, "status": e.status, "claim": e.post[:80], "why": e.detail[:200], "needs": needs})
+            entry = {"id": e.id, "status": e.status, "claim": e.post[:80], "why": e.detail[:200], "needs": needs}
+            if e.status == "failed":
+                entry["route"] = SPEC_ROUTE.format(id=e.id)
+                if (r := cache.store.conflict_get(cid_of("spec", e.id))) and r["state"] in ("open", "awaiting_human"):
+                    entry["conflict"] = r["id"]       # already raised on the parent: do not heal it meanwhile
+            remaining.append(entry)
         violations = [{"id": e.id, "claim": e.post[:80], "why": e.detail[:200]}
                       for e in sorted(broken().values(), key=lambda x: x.id) if e.enforced]
         return {"checked": len(todo), "cleared": cleared, "remaining": remaining, "violations": violations,
@@ -177,6 +189,7 @@ def repair(root: Path, ids: list[str] | None = None, everything: bool = False,
                        else "replaced" if not now and verdict == "CHANGED"
                        else "removed" if not now
                        else "violation" if verdict == "VIOLATION"
+                       else "conflict_raised" if now and cache.store.conflict_get(cid_of("spec", e.id))
                        else "unresolved")
             entries.append({"id": e.id, "kind": kind, "outcome": outcome, "verdict": verdicts.get(e.id)})
         added = [i for i in after if i not in before]
@@ -194,6 +207,6 @@ def _parse_verdicts(text: str) -> dict[str, str]:
     for line in text.splitlines():
         head, _, rest = line.strip().strip("-* `").partition(":")
         word = rest.strip().split(" ")[0].strip("*`") if rest else ""
-        if len(head) == 16 and word in ("STILL_TRUE", "CHANGED", "REMOVED", "VIOLATION"):
+        if len(head) == 16 and word in ("STILL_TRUE", "CHANGED", "REMOVED", "VIOLATION", "SPEC_CONFLICT"):
             out[head] = word
     return out

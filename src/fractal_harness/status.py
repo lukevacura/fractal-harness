@@ -6,7 +6,7 @@ events), computed the same way `activations` decides that a node is due:
 
   unregistered  the node is not in the ledger (no spec registered under that name)
   pending       registered but never verified: no verdicts recorded, or a required mutant is missing
-  due           an activation event is pending (spec, contract, probe, or an unresolved survivor: see activation.py)
+  due           an activation event is pending (spec, contract, probe, conflict, or an unresolved survivor: see activation.py)
   stale         no event is pending, but a recorded verdict no longer holds (lines of its span or a killing
                 test changed since the commit it was verified at)
   done          none of the above: verdicts recorded, all valid at the current premise digests, every
@@ -35,13 +35,13 @@ from .symbols import SymbolError
 STATES = ("done", "due", "stale", "pending", "unregistered")
 
 
-def gather(cache: ClaimCache, root: Path, node: str, failing: dict) -> dict:
+def gather(cache: ClaimCache, root: Path, node: str, failing: dict, conflicts: list[dict] | None = None) -> dict:
     """Every fact the state depends on, nothing decided yet."""
     info = cache.store.get_node(node)
     if info is None:
         return {"node": node, "registered": False}
     f: dict = {"node": node, "registered": True, "spec": info["spec"], "premises": premises_of(info),
-               "verdicts": len(cache.store.mutants(node)), "events": activation.events(cache, root, node, info, failing),
+               "verdicts": len(cache.store.mutants(node)), "events": activation.events(cache, root, node, info, failing, conflicts),
                "argued": [a["detail"] for a in activation.survivors(cache, node)[1]],
                "stale": [], "valid": [], "required": [], "node_reason": None}
     if f["verdicts"]:
@@ -103,8 +103,8 @@ def would_change(state: str, f: dict) -> list[str]:
     return out + ["an edit to lines a verdict covers, or a failing probe on its files, or a new surviving mutant"]
 
 
-def derive(cache: ClaimCache, root: Path, node: str, failing: dict | None = None) -> dict:
-    f = gather(cache, root, node, activation_failing(cache, root) if failing is None else failing)
+def derive(cache: ClaimCache, root: Path, node: str, failing: dict | None = None, conflicts: list[dict] | None = None) -> dict:
+    f = gather(cache, root, node, activation_failing(cache, root) if failing is None else failing, conflicts)
     state, reasons = classify(f)
     return {"node": node, "state": state, "reasons": reasons, "evidence": evidence(cache, root, f),
             "would_change": would_change(state, f)}
@@ -118,7 +118,9 @@ def derive_all(cache: ClaimCache, root: Path) -> dict[str, dict]:
     """{node: derived} for every registered node, ordered by name."""
     cache.update()
     failing = activation_failing(cache, root)
-    return {n: derive(cache, root, n, failing) for n in sorted(cache.store.all_nodes())}
+    from . import conflict
+    pend = conflict.pending(cache, root)
+    return {n: derive(cache, root, n, failing, pend) for n in sorted(cache.store.all_nodes())}
 
 
 # --- legacy hand-set marks (heuristic) ------------------------------------------------------

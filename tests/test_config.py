@@ -50,7 +50,7 @@ def test_malformed_config_is_a_clear_error_not_a_traceback(tmp_path, capsys):
 
 
 def test_unknown_tables_ignored_unknown_owned_keys_warned(tmp_path):
-    _cfg(tmp_path, '[jobs]\nwhatever = 1\n[policy]\naccept_policy = "local"\nbogus = 1\n')
+    _cfg(tmp_path, '[misc]\nwhatever = 1\n[policy]\naccept_policy = "local"\nbogus = 1\n')
     c = load(tmp_path)
     assert c.accept_policy == "local" and len(c.warnings) == 1 and "bogus" in c.warnings[0]
     assert any("bogus" in m and not ok for ok, m in doctor_checks(tmp_path))

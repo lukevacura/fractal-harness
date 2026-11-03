@@ -94,6 +94,36 @@ CREATE TABLE IF NOT EXISTS rule_history (   -- who changed an invariant's standi
     reason  TEXT NOT NULL DEFAULT '',
     detail  TEXT NOT NULL DEFAULT '{}'   -- json: states and authorities before/after, evidence class, audit
 );
+CREATE TABLE IF NOT EXISTS rule_blocks (   -- capped recent history of enforced rules blocking work (blocklog.py)
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      REAL NOT NULL,
+    edge_id TEXT NOT NULL,
+    authority TEXT NOT NULL,
+    file    TEXT NOT NULL DEFAULT '',
+    hook    TEXT NOT NULL,       -- pre-edit | check | stop
+    repeat  INTEGER NOT NULL DEFAULT 0   -- 1: the same rule blocked the same file earlier within the window
+);
+CREATE INDEX IF NOT EXISTS rule_blocks_by_edge ON rule_blocks(edge_id, ts);
+CREATE TABLE IF NOT EXISTS rule_block_stats (   -- per-rule counters; never pruned by the history cap
+    edge_id  TEXT PRIMARY KEY,
+    total    INTEGER NOT NULL,
+    repeats  INTEGER NOT NULL DEFAULT 0,
+    first_ts REAL NOT NULL,
+    last_ts  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conflicts (   -- a decision record per conflict; detection itself is derived (conflict.py)
+    id        TEXT PRIMARY KEY,
+    kind      TEXT NOT NULL,     -- overlap | friction | spec
+    rule_id   TEXT NOT NULL,     -- the subject: the local rule (overlap, friction) or the disputed claim/rule (spec)
+    other_id  TEXT,              -- overlap: the higher-layer rule it may contradict
+    handler   TEXT NOT NULL,     -- the node whose agent handles it; root = a human
+    state     TEXT NOT NULL,     -- open | awaiting_human | kept | narrowed | overridden | upheld | revised
+    reason    TEXT NOT NULL DEFAULT '',
+    detail    TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    surfaced  INTEGER NOT NULL DEFAULT 0   -- an arbitration request was shown once in the prompt hook
+);
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts      REAL NOT NULL,
@@ -109,6 +139,8 @@ CREATE TABLE IF NOT EXISTS events (
 STATUSES = ("verified", "trusted", "stale", "failed")
 GOOD = ("verified", "trusted")
 ROOT = "root"                      # the base layer: the human
+BLOCK_KEEP_PER_RULE = 50           # recent block rows kept per rule (the counters keep the totals)
+BLOCK_KEEP_TOTAL = 1000            # ...and overall
 
 STOPWORDS = frozenset("""
 a an and are as at be but by can do does for from how i if in into is it its me my of on or
@@ -305,6 +337,11 @@ class Store:
             self.db.execute("UPDATE edges SET rule_state=?, authority=?, updated_at=? WHERE id=? AND kind='invariant'",
                             (state, ROOT if state == "enforced" else None, time.time(), edge_id))
 
+    def set_probe(self, edge_id: str, probe: dict) -> None:
+        """Replace a rule's probe in place (conflict.py `narrow`: exclusions only; the id and reads stay)."""
+        with self.db:
+            self.db.execute("UPDATE edges SET probe=?, updated_at=? WHERE id=?", (json.dumps(probe), time.time(), edge_id))
+
     def set_authority(self, edge_id: str, state: str, authority: str | None, provenance: dict | None = None) -> None:
         """Set state + authority together (a local accept, an override, a restore); keeps provenance when None."""
         with self.db:
@@ -335,6 +372,65 @@ class Store:
             q, a = q + " WHERE edge_id = ?", (edge_id,)
         return [{**dict(zip(("ts", "edge_id", "action", "who", "reason"), r[:5])), "detail": json.loads(r[5])}
                 for r in self.db.execute(q + " ORDER BY id", a)]
+
+    # --- block log (heuristic signal; blocklog.py decides what to record) ---------
+
+    def block_add(self, edge_id: str, authority: str, file: str, hook: str, window: float, now: float | None = None) -> bool:
+        """Record one block; True when it follows an earlier block of the same rule on the same file within `window`
+        seconds. Bounded: per-rule and overall caps prune the oldest rows; the per-rule counters are kept."""
+        now = time.time() if now is None else now
+        repeat = bool(file) and self.db.execute(
+            "SELECT 1 FROM rule_blocks WHERE edge_id=? AND file=? AND ts>=? LIMIT 1", (edge_id, file, now - window)).fetchone()
+        with self.db:
+            self.db.execute("INSERT INTO rule_blocks (ts, edge_id, authority, file, hook, repeat) VALUES (?,?,?,?,?,?)",
+                            (now, edge_id, authority, file, hook, int(bool(repeat))))
+            self.db.execute("INSERT INTO rule_block_stats (edge_id, total, repeats, first_ts, last_ts) VALUES (?,1,?,?,?) "
+                            "ON CONFLICT(edge_id) DO UPDATE SET total=total+1, repeats=repeats+?, last_ts=?",
+                            (edge_id, int(bool(repeat)), now, now, int(bool(repeat)), now))
+            self.db.execute("DELETE FROM rule_blocks WHERE edge_id=? AND id NOT IN "
+                            "(SELECT id FROM rule_blocks WHERE edge_id=? ORDER BY id DESC LIMIT ?)",
+                            (edge_id, edge_id, BLOCK_KEEP_PER_RULE))
+            self.db.execute("DELETE FROM rule_blocks WHERE id NOT IN (SELECT id FROM rule_blocks ORDER BY id DESC LIMIT ?)",
+                            (BLOCK_KEEP_TOTAL,))
+        return bool(repeat)
+
+    def block_count(self, edge_id: str, since: float) -> int:
+        """Blocks of the rule at or after `since` still in the capped history."""
+        return self.db.execute("SELECT count(*) FROM rule_blocks WHERE edge_id=? AND ts>=?", (edge_id, since)).fetchone()[0]
+
+    def blocks(self, edge_id: str | None = None) -> list[dict]:
+        q, a = "SELECT ts, edge_id, authority, file, hook, repeat FROM rule_blocks", ()
+        if edge_id:
+            q, a = q + " WHERE edge_id=?", (edge_id,)
+        return [dict(r) for r in self.db.execute(q + " ORDER BY id", a)]
+
+    def block_stats(self, edge_id: str) -> dict | None:
+        r = self.db.execute("SELECT total, repeats, first_ts, last_ts FROM rule_block_stats WHERE edge_id=?", (edge_id,)).fetchone()
+        return dict(r) if r else None
+
+    # --- conflicts (decision records) ----------------------------------------------
+
+    def conflict_get(self, cid: str) -> dict | None:
+        r = self.db.execute("SELECT * FROM conflicts WHERE id=?", (cid,)).fetchone()
+        return {**dict(r), "detail": json.loads(r["detail"])} if r else None
+
+    def conflict_all(self) -> list[dict]:
+        return [{**dict(r), "detail": json.loads(r["detail"])} for r in self.db.execute("SELECT * FROM conflicts ORDER BY created_at, id")]
+
+    def conflict_put(self, c: dict) -> None:
+        now = time.time()
+        with self.db:
+            self.db.execute(
+                "INSERT INTO conflicts (id, kind, rule_id, other_id, handler, state, reason, detail, created_at, updated_at, surfaced) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,0) ON CONFLICT(id) DO UPDATE SET handler=excluded.handler, state=excluded.state, "
+                "reason=excluded.reason, detail=excluded.detail, updated_at=excluded.updated_at, "
+                "surfaced=CASE WHEN excluded.state='awaiting_human' AND conflicts.state!='awaiting_human' THEN 0 ELSE conflicts.surfaced END",
+                (c["id"], c["kind"], c["rule_id"], c.get("other_id"), c["handler"], c["state"], c.get("reason", ""),
+                 json.dumps(c.get("detail") or {}), now, now))
+
+    def conflict_mark_surfaced(self, ids: list[str]) -> None:
+        with self.db:
+            self.db.executemany("UPDATE conflicts SET surfaced=1 WHERE id=?", [(i,) for i in ids])
 
     def put_snapshot(self, sha: str, line_hashes: list[str]) -> None:
         with self.db:

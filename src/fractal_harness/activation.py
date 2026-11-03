@@ -8,6 +8,8 @@ of these events has happened since its verdicts were recorded, each decided by a
   probe     a failing, non-rejected claim whose probe points at files the node owns (a grep is attributed
             to the files with matching lines; a probe that cannot say falls back to what it depends on)
   survivor  a mutant survived with no equivalence argument and nothing since has killed it
+  conflict  a local rule of a child layer may contradict a higher layer's rule, was blocked repeatedly, or a spec was
+            declared ambiguous (conflict.py; HEURISTIC, an event only): raised on the PARENT of the rule's authority
 
 Two things are reported but are not activations. A proposed invariant waits on a human (an agent cannot
 accept it), so proposals are listed once, with the nodes they touch. A survivor that carries an equivalence
@@ -30,7 +32,7 @@ from .nodes import parse_header, spec_key
 from .regions import affects
 from .symbols import SymbolError, at, digest, is_repo_ref, read_ref, split_ref
 
-KINDS = ("spec", "contract", "probe", "proposal", "survivor")
+KINDS = ("spec", "contract", "probe", "proposal", "survivor", "conflict")
 
 
 def owned_files(cache: ClaimCache, root: Path, node: str, info: dict) -> list[str]:
@@ -54,7 +56,9 @@ def blame(root: Path, e) -> list[str] | None:
     return [] if r.passed else (sorted({f for f, _ in r.matches}) or None)
 
 
-def events(cache: ClaimCache, root: Path, node: str, info: dict, failing: dict[str, list[str] | None]) -> list[dict]:
+def events(cache: ClaimCache, root: Path, node: str, info: dict, failing: dict[str, list[str] | None],
+           conflicts: list[dict] | None = None) -> list[dict]:
+    """`conflicts`: the pending conflicts (conflict.pending); computed here when not given."""
     out: list[dict] = []
     spec = at(root, info["spec"])
     if not spec.is_file():
@@ -76,7 +80,10 @@ def events(cache: ClaimCache, root: Path, node: str, info: dict, failing: dict[s
         mine = [f for f in files if (f in pointed if pointed is not None else affects(dependencies(e), f))]
         if mine:
             out.append({"kind": "probe", "detail": f"{e.id} fails on {mine[0]}: {e.post[:80]}"})
-    return out + survivors(cache, node)[0]
+    from . import conflict
+    if conflicts is None:
+        conflicts = conflict.pending(cache, root)
+    return out + survivors(cache, node)[0] + conflict.events_for(conflicts, node)
 
 
 def failing_edges(cache: ClaimCache) -> list:
@@ -103,10 +110,12 @@ def scan(cache: ClaimCache, root: Path) -> dict:
     cache.update()
     failing = {e.id: blame(root, e) for e in failing_edges(cache)}
     nodes = sorted(cache.store.all_nodes().items())
+    from . import conflict
+    pend = conflict.pending(cache, root)
     rows, argued = [], []
     owned = {n: owned_files(cache, root, n, info) for n, info in nodes}
     for node, info in nodes:
-        if ev := events(cache, root, node, info, failing):
+        if ev := events(cache, root, node, info, failing, pend):
             rows.append({"node": node, "events": ev})
         argued += [{"node": node, **a} for a in survivors(cache, node)[1]]
     proposals = []
@@ -114,7 +123,10 @@ def scan(cache: ClaimCache, root: Path) -> dict:
         touched = [n for n, files in owned.items() if any(affects(dependencies(e), f) for f in files)]
         if touched:
             proposals.append({"id": e.id, "rule": e.post[:100], "nodes": touched})
-    return {"nodes": rows, "proposals": proposals, "argued": argued}
+    out = {"nodes": rows, "proposals": proposals, "argued": argued}
+    if pend:                      # absent when there is none: the default output is unchanged
+        out["conflicts"] = pend
+    return out
 
 
 def due(cache: ClaimCache, root: Path) -> list[dict]:
@@ -127,6 +139,14 @@ def render(r: dict) -> str:
     for row in r["nodes"]:
         out.append(f"{row['node']}")
         out += [f"  {e['kind']:9} {e['detail']}" for e in row["events"]]
+    asked = [c for c in r.get("conflicts", []) if c["state"] == "awaiting_human"]
+    if asked:
+        from .conflict import banner
+        out = banner(asked) + out
+    queue = [c for c in r.get("conflicts", []) if c["state"] == "open" and c["handler"] == "root"]
+    if queue:
+        out += ["", f"{len(queue)} conflict(s) in root's queue (a human decides: `fractal conflict resolve`):"]
+        out += [f"  {c['id']}  {c['kind']} on [{c['rule']}]: {c['why']}" for c in queue]
     if r["proposals"]:
         out += ["", f"{len(r['proposals'])} proposal(s) awaiting a human (`fractal invariants --state proposed`):"]
         out += [f"  {p['id']}  touches {len(p['nodes'])} node(s): {p['rule']}" for p in r["proposals"]]
