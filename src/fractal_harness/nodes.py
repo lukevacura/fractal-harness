@@ -422,7 +422,8 @@ def repo_lint(root: Path, h: Header, nodes: dict[str, dict], own_spec_text: str,
     for ref in h.exports:
         if "::" not in ref:
             notes.append(f"export `{ref}` names a whole file; children cannot resolve it. Export items: "
-                         f"`{ref}::<Type>` and `{ref}::<Type>::<method>`")
+                         f"`{ref}::<Type>` and `{ref}::<Type>::<method>`, or `{ref}::*` for a module made only of re-exports "
+                         f"(then any edit to the file changes the contract)")
             continue
         path, name = split_ref(ref)
         own_files.add(path)

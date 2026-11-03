@@ -273,3 +273,97 @@ def test_ignored_prose_is_reported_as_one_phrase():
     h = parse_header("---\nimplements: D18 the survivor filter's rules\nguarantee: g\n---\n")
     note = next(n for n in lint(h) if "implements" in n)
     assert 'the survivor filter\'s rules' in note and "D18" not in note.split("ignored")[1]
+
+
+# 8. `pub use` re-exports are definitions (a facade module can be exported) ---------------------
+
+SYNC = """#[cfg(loom)]
+pub use loom::sync::Arc;
+#[cfg(shuttle)]
+pub use shuttle::sync::Arc;
+#[cfg(not(any(loom, shuttle)))]
+pub use alloc::sync::Arc;
+#[cfg(loom)] pub use loom::sync::Mutex;
+pub use core::sync::atomic::{AtomicBool, AtomicU64 as Counter, Ordering};
+use std::fmt::Debug;
+pub mod thread {
+    pub use loom::thread::*;
+}
+"""
+
+
+def test_pub_use_defines_its_name_and_every_cfg_alternative_is_one_interface():
+    line, text = find(SYNC, "Arc")
+    assert line == 1
+    assert text.count("pub use") == 3 and "#[cfg(shuttle)]" in text and "alloc::sync::Arc" in text
+
+
+def test_same_line_attribute_aliases_and_groups():
+    assert find(SYNC, "Mutex") == (6, "#[cfg(loom)] pub use loom::sync::Mutex;")
+    for n in ("AtomicBool", "Counter", "Ordering"):
+        assert find(SYNC, n) == (7, "pub use core::sync::atomic::{AtomicBool, AtomicU64 as Counter, Ordering};")
+    with pytest.raises(SymbolError):
+        find(SYNC, "AtomicU64")                       # renamed away: only the alias is visible here
+
+
+def test_a_private_import_is_not_a_definition_and_a_glob_names_nothing():
+    with pytest.raises(SymbolError, match="no definition"):
+        find(SYNC, "Debug")
+    with pytest.raises(SymbolError, match="no definition"):
+        find(SYNC, "loom")            # a path segment, not a name the file makes visible
+
+
+def test_a_real_definition_beats_a_reexport_of_the_same_name():
+    text = "pub use other::Thing;\npub struct Thing {\n    x: u8,\n}\n"
+    assert find(text, "Thing")[1].startswith("pub struct Thing")
+
+
+def test_a_facade_module_of_only_reexports_includes_its_body_but_a_normal_module_does_not():
+    assert find(SYNC, "thread")[1] == "pub mod thread {\n    pub use loom::thread::*;\n}"
+    assert find("pub mod m {\n    pub fn f() {}\n}\n", "m")[1] == "pub mod m {"
+
+
+def test_star_exports_the_whole_file():
+    assert find(SYNC, "*") == (0, SYNC.rstrip())
+
+
+def test_a_node_can_export_and_be_depended_on_through_a_facade_module(tmp_path):
+    c = _repo(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "sync.rs").write_text(SYNC)
+    (tmp_path / "src" / "user.rs").write_text("use crate::sync::Arc;\npub fn go() {}\n")
+    (tmp_path / "slow.md").write_text(_spec(guarantee="g", exports="src/sync.rs::Arc, src/sync.rs::thread"))
+    (tmp_path / "user.md").write_text(_spec(parents="slow", guarantee="g", exports="src/user.rs::go"))
+    _git(tmp_path, "add", "-A")
+    ledger.register_node(c, tmp_path, "slow", "slow.md")          # was: export ... Arc is not defined
+    r = ledger.register_node(c, tmp_path, "user", "user.md")
+    assert set(r["premises"]["parents"]["slow"]["exports"]) == {"src/sync.rs::Arc", "src/sync.rs::thread"}
+    # editing one cfg alternative changes the contract a child watches
+    (tmp_path / "src" / "sync.rs").write_text(SYNC.replace("alloc::sync::Arc", "std::sync::Arc"))
+    from fractal_harness.nodes import contract_change
+    assert contract_change(r["premises"]["parents"]["slow"], tmp_path, "slow.md")
+
+
+def test_a_facade_node_can_export_star(tmp_path):
+    c = _repo(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "sync.rs").write_text(SYNC)
+    (tmp_path / "slow.md").write_text(_spec(guarantee="g", exports="src/sync.rs::*"))
+    _git(tmp_path, "add", "-A")
+    r = ledger.register_node(c, tmp_path, "slow", "slow.md")
+    assert not any("not defined" in n for n in r["lint"])
+    assert ledger.register_node(c, tmp_path, "slow", "slow.md")["declared"]
+
+
+def test_a_module_with_anything_but_reexports_exposes_only_its_signature():
+    text = "pub mod m {\n    pub use a::B;\n    pub fn f() {}\n}\n"
+    assert find(text, "m")[1] == "pub mod m {"
+
+
+def test_self_in_a_use_group_names_the_module_and_underscore_names_nothing():
+    text = "pub use a::b::{self, C, D as _};\n"
+    assert find(text, "b")[0] == 0 and find(text, "C")[0] == 0
+    with pytest.raises(SymbolError):
+        find(text, "D")
+    with pytest.raises(SymbolError):
+        find(text, "self")

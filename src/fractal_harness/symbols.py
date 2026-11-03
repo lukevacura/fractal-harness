@@ -157,9 +157,40 @@ def section_of(root: Path, ref: str) -> str:
 
 # --- code items ---------------------------------------------------------------------------
 
+_ATTRS = re.compile(r"^(?:#!?\[[^\]]*\]\s*)+")
+_REEXPORT = re.compile(r"^pub(?:\([^)]*\))?\s+use\s+(.*?)\s*;?\s*$")
+
+
+def _reexported(s: str) -> set[str] | None:
+    """The names a `pub use` line makes visible here (None when the line is not a re-export): the last path segment, the
+    `as` alias, or each item of a `{...}` group. A `*` glob names nothing. Private `use` is an import, not a definition."""
+    m = _REEXPORT.match(s)
+    if not m:
+        return None
+    path = m.group(1)
+    prefix = ""
+    if "{" in path:
+        prefix = path[:path.index("{")].rstrip(":").rpartition("::")[2].strip()   # `a::b::{self, C}`: `self` is `b`
+        inner = path[path.index("{") + 1:path.rindex("}")] if "}" in path else path[path.index("{") + 1:]
+        items = [i.strip() for i in inner.split(",")]
+    else:
+        items = [path]
+    names = set()
+    for it in items:
+        it = re.sub(r"\s+", " ", it)
+        name = it.rpartition(" as ")[2] if " as " in it else it.rpartition("::")[2]
+        if name == "self":
+            name = prefix
+        if re.fullmatch(r"\w+", name) and name != "_":
+            names.add(name)
+    return names
+
+
 def _is_def(line: str, name: str) -> str | None:
     """The declaring keyword if `line` declares `name`, '' for a C-style typed declaration."""
-    s = line.strip()
+    s = _ATTRS.sub("", line.strip())             # `#[cfg(loom)] pub use a::X;` on one line is still the `pub use`
+    if (names := _reexported(s)) is not None:
+        return "use" if name in names else None
     if not re.search(rf"\b{re.escape(name)}\b", s) or s.startswith(DOC_PREFIXES) or re.match(rf"(?:{'|'.join(NOT_DEFS)})\b", s):
         return None
     if m := re.search(rf"\b({'|'.join(DEF_KW)})\s+(?:<[^>]*>\s*)?(?:[\w.]+\.)?{re.escape(name)}\b", s):
@@ -173,6 +204,15 @@ def _indent(line: str) -> int:
     return len(line) - len(line.lstrip())
 
 
+def _is_doc(line: str) -> bool:
+    """A doc comment, comment or attribute line that belongs to the item below it (not a line of code that merely
+    begins with an attribute, like `#[cfg(loom)] pub use a::X;`)."""
+    t = line.strip()
+    if t.startswith("#[") or t.startswith("#!["):
+        return _ATTRS.sub("", t) == ""
+    return t.startswith(DOC_PREFIXES)
+
+
 def _enclosing(lines: list[str], i: int) -> str:
     """The nearest preceding line with less indentation: the block line `i` sits in."""
     return next((lines[j] for j in range(i - 1, -1, -1) if lines[j].strip() and _indent(lines[j]) < _indent(lines[i])), "")
@@ -183,6 +223,10 @@ def find(text: str, name: str) -> tuple[int, str]:
     comments, then the signature (plus the body of a struct/enum/trait/class-like item)."""
     qual, _, item = name.rpartition("::")
     lines = text.splitlines()
+    if name == "*":
+        # `path::*`: the whole file is the interface, for a module made only of re-exports (a facade). Weak by design:
+        # any edit to the file changes it, so a node should export named items where it can.
+        return 0, text.rstrip()
     hits = [(i, kw) for i, l in enumerate(lines) if (kw := _is_def(l, item)) is not None]
     if qual:
         q = qual.rpartition("::")[2]
@@ -206,6 +250,10 @@ def find(text: str, name: str) -> tuple[int, str]:
         hits = [h for h in hits if h[1] not in LOCAL_KW]    # a method or item, not a local binding of its name
     if len(hits) > 1 and any(kw != "impl" for _, kw in hits):
         hits = [h for h in hits if h[1] != "impl"]     # the type itself, not its impl blocks
+    if len(hits) > 1 and any(kw != "use" for _, kw in hits):
+        hits = [h for h in hits if h[1] != "use"]       # a real definition, not a re-export of the same name
+    if len(hits) > 1 and all(kw == "use" for _, kw in hits):
+        return _reexports(lines, [i for i, _ in hits])  # cfg alternatives of one name are one interface
     if not qual and len(hits) > 1:
         # a bare name means the free item when a method shares it: `distance_profile` is the function, and
         # `Type::distance_profile` is the method
@@ -219,7 +267,7 @@ def find(text: str, name: str) -> tuple[int, str]:
                           "qualify it as Type::name")
     i, kw = hits[0]
     start = i
-    while start > 0 and lines[start - 1].strip().startswith(DOC_PREFIXES):
+    while start > 0 and _is_doc(lines[start - 1]):
         start -= 1
     end, depth = i, 0
     for j in range(i, min(len(lines), i + MAX_BODY_LINES)):
@@ -236,6 +284,16 @@ def find(text: str, name: str) -> tuple[int, str]:
             end = j
             if braces <= 0:
                 break
+    elif kw == "mod" and "{" in lines[end] and "}" not in lines[end].split("{", 1)[1]:
+        braces, last = 0, end
+        for j in range(end, min(len(lines), end + MAX_BODY_LINES)):
+            braces += lines[j].count("{") - lines[j].count("}")
+            last = j
+            if braces <= 0:
+                break
+        inner = [l.strip() for l in lines[end + 1:last] if l.strip()]
+        if braces <= 0 and all(re.match(r"(?:pub(?:\([^)]*\))?\s+)?use\b|#\[|//", l) for l in inner):
+            end = last           # a facade module (only re-exports): its body is its interface
     elif kw == "def" and end + 1 < len(lines) and lines[end + 1].strip().startswith(('"""', "'''")):
         quote = lines[end + 1].strip()[:3]
         j = end + 1
@@ -245,6 +303,18 @@ def find(text: str, name: str) -> tuple[int, str]:
     block = lines[start:end + 1]
     indent = min((_indent(l) for l in block if l.strip()), default=0)
     return i, "\n".join(l[indent:].rstrip() for l in block)
+
+
+def _reexports(lines: list[str], idx: list[int]) -> tuple[int, str]:
+    """(first line, text) of several `pub use` lines that make the same name visible, each with the attribute lines
+    above it, so the interface is every alternative (a change to any `#[cfg(..)]` branch changes it)."""
+    blocks = []
+    for i in idx:
+        start = i
+        while start > 0 and _is_doc(lines[start - 1]):
+            start -= 1
+        blocks.append([l.strip() for l in lines[start:i + 1]])
+    return idx[0], "\n".join("\n".join(b) for b in blocks)
 
 
 def symbol_of(root: Path, ref: str) -> str:
