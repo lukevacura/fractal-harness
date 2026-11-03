@@ -30,7 +30,7 @@ from .concepts import decision_ids
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
 from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint, spec_key, spec_lint, edit_header
 from .store import GOOD
-from .symbols import SymbolError, at, digest, resolve, symbol_of
+from .symbols import SymbolError, at, at_commit, digest, resolve, symbol_of
 
 RESULTS = ("killed", "survived", "equivalent")
 MAX_DIFF_CHARS = 20_000
@@ -43,11 +43,35 @@ def _git(root: Path, *args: str) -> str:
     return p.stdout
 
 
+def _git_lines(root: Path, *args: str):
+    """The lines of a git command's output, streamed. A diff of a rewritten data file is hundreds of megabytes and
+    only its `---`/`+++`/`@@` lines matter, so it is read line by line and never held (or split) whole."""
+    import tempfile
+    with tempfile.TemporaryFile() as err:
+        p = subprocess.Popen(["git", *args], cwd=root, stdout=subprocess.PIPE, stderr=err, text=True, errors="replace")
+        try:
+            for line in p.stdout:
+                yield line.rstrip("\n")
+        finally:
+            p.stdout.close()
+            p.wait()
+        if p.returncode:                       # like `_git`: a failing command is an error, never an empty answer
+            err.seek(0)
+            raise SymbolError(err.read().decode(errors="replace").strip() or f"git {args[0]} failed")
+
+
 def resolve_commit(root: Path, rev: str = "HEAD") -> str:
     return _git(root, "rev-parse", "--verify", f"{rev}^{{commit}}").strip()
 
 
 # --- recording ----------------------------------------------------------------------------
+
+def branch_of(cache: ClaimCache, node: str) -> str | None:
+    """The branch registered with a node, if any."""
+    info = cache.store.get_node(node)
+    p = (info or {}).get("premises")
+    return p.get("branch") if isinstance(p, dict) else None
+
 
 def node_commit(cache: ClaimCache, root: Path, node: str, commit: str | None = None) -> str:
     """The commit a node's verdicts attach to: the one named, else the tip of the branch registered with
@@ -77,6 +101,20 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
         raise SymbolError(f"no such spec: {spec}")
     text = f.read_text(errors="replace")
     h = parse_header(text)
+    prev = cache.store.get_node(node)
+    b = branch or (premises_of(prev).get("branch") if prev else None)
+    if b:    # the node's code, and its parents' exports, live on its branch: check them there, not in this checkout
+        try:
+            commit = resolve_commit(root, f"refs/heads/{b}")
+        except SymbolError:
+            raise SymbolError(f"node {node}'s registered branch {b!r} does not exist")
+        with at_commit(root, commit):
+            return _register_rest(cache, root, node, spec, f, text, h, id_pattern, branch, fix, dry_run)
+    return _register_rest(cache, root, node, spec, f, text, h, id_pattern, branch, fix, dry_run)
+
+
+def _register_rest(cache: ClaimCache, root: Path, node: str, spec: str, f: Path, text: str, h, id_pattern: str,
+                   branch: str | None, fix: bool, dry_run: bool) -> dict:
     diff = ""
     if fix and h is not None:
         fixes: dict = {}
@@ -84,11 +122,12 @@ def register_node(cache: ClaimCache, root: Path, node: str, spec: str,
         if any(fixes["add"].values()) or any(fixes["remove"].values()):
             new = edit_header(text, fixes["add"], fixes["remove"])
             diff = "".join(difflib.unified_diff(text.splitlines(True), new.splitlines(True), f"a/{spec}", f"b/{spec}"))
-            if dry_run:
-                return {"spec": spec, "premises": {"decisions": [], "parents": {}}, "uncited": [], "declared": True,
-                        "lint": [], "autoregistered": [], "diff": diff, "dry_run": True}
-            f.write_text(new)
-            text, h = new, parse_header(new)
+            if not dry_run:
+                f.write_text(new)
+                text, h = new, parse_header(new)
+    if dry_run:           # a dry run changes nothing: not the spec, not the claims, and not the node's registration
+        return {"spec": spec, "premises": {"decisions": [], "parents": {}}, "uncited": [], "declared": h is not None,
+                "lint": [], "autoregistered": [], "diff": diff, "dry_run": True}
     edges = cache.store.all()
     registered: list[str] = []
     failed: dict[str, str] = {}
@@ -188,7 +227,7 @@ def hunks_since(root: Path, commit: str, against: str | None = None) -> dict[str
     pure insertion after old_start). A deleted or added file is {file: [(1, 10**9)]}."""
     out: dict[str, list[tuple[int, int]]] = {}
     cur = None
-    for line in _git(root, "diff", "-U0", "--no-color", "--no-renames", commit, *([against] if against else []), "--").splitlines():
+    for line in _git_lines(root, "diff", "-U0", "--no-color", "--no-renames", commit, *([against] if against else []), "--"):
         if line.startswith("--- "):
             old = line[4:]
             cur = None if old == "/dev/null" else old.removeprefix("a/")

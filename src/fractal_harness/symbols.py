@@ -8,8 +8,12 @@ they say so rather than guess.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import hashlib
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 MAX_SECTION_CHARS = 2000
@@ -17,7 +21,8 @@ MAX_BODY_LINES = 40
 TYPE_KW = ("struct", "enum", "trait", "interface", "impl", "protocol", "class", "object")
 DEF_KW = ("fn", "def", "func", "function", "type", "const", "static", "mod", "val", "var", "let") + TYPE_KW
 LOCAL_KW = ("let", "var", "val")
-NOT_DEFS = ("return", "new", "throw", "else", "if", "while", "for", "await", "yield", "assert")
+NOT_DEFS = ("return", "new", "throw", "else", "if", "while", "for", "await", "yield", "assert", "match", "switch",
+            "case", "catch", "loop", "do", "elif", "unless", "until", "with", "raise", "del", "print")
 DOC_PREFIXES = ("///", "//!", "//", "#", "*", "/**", "*/", "@")
 
 
@@ -25,9 +30,46 @@ class SymbolError(ValueError):
     pass
 
 
+_VIEW: "contextvars.ContextVar[tuple[Path, str, Path] | None]" = contextvars.ContextVar("fractal_view", default=None)
+
+
+@contextlib.contextmanager
+def at_commit(root: Path, commit: str):
+    """Within the block, a plain repo path (not a `<root>:` ref) is read as it is at `commit`, so a node on a branch
+    is checked against that branch's files and not whatever this checkout has. A file the commit lacks falls back to
+    the working tree. Only paths resolved through `resolve`/`at` (and so `read_ref`, `symbol_of`, `section_of`) see
+    it; a scan of the tree (`git ls-files`, a glob) still sees this checkout."""
+    with tempfile.TemporaryDirectory(prefix="fractal-view-") as tmp:
+        token = _VIEW.set((root.resolve(), commit, Path(tmp)))
+        try:
+            yield
+        finally:
+            _VIEW.reset(token)
+
+
+def _viewed(root: Path, ref: str) -> Path | None:
+    v = _VIEW.get()
+    if v is None or v[0] != root.resolve() or not is_repo_ref(ref):
+        return None
+    rel = ref.removeprefix("./")
+    if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+        return None
+    out = v[2] / rel
+    if out.is_file():
+        return out
+    r = subprocess.run(["git", "show", f"{v[1]}:{rel}"], cwd=root, capture_output=True)
+    if r.returncode:
+        return None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(r.stdout)
+    return out
+
+
 def resolve(root: Path, ref: str) -> Path:
     """The file a path or `<named root>:<path>` ref names (strict: SymbolError for a bad root or an escape)."""
     from .config import ConfigError, resolve_path
+    if (v := _viewed(root, ref)) is not None:
+        return v
     try:
         return resolve_path(root, ref)
     except ConfigError as e:
@@ -38,6 +80,8 @@ def at(root: Path, ref: str) -> Path:
     """Like `resolve`, but a ref that cannot be resolved gives a path that does not exist, so callers that
     test `.is_file()` treat it as missing instead of raising."""
     from .config import ConfigError, ConfigFileError, resolve_path
+    if (v := _viewed(root, ref)) is not None:
+        return v
     try:
         return resolve_path(root, ref)
     except ConfigFileError:
@@ -116,7 +160,7 @@ def section_of(root: Path, ref: str) -> str:
 def _is_def(line: str, name: str) -> str | None:
     """The declaring keyword if `line` declares `name`, '' for a C-style typed declaration."""
     s = line.strip()
-    if not re.search(rf"\b{re.escape(name)}\b", s) or s.startswith(DOC_PREFIXES) or s.startswith(NOT_DEFS):
+    if not re.search(rf"\b{re.escape(name)}\b", s) or s.startswith(DOC_PREFIXES) or re.match(rf"(?:{'|'.join(NOT_DEFS)})\b", s):
         return None
     if m := re.search(rf"\b({'|'.join(DEF_KW)})\s+(?:<[^>]*>\s*)?(?:[\w.]+\.)?{re.escape(name)}\b", s):
         return m.group(1)
@@ -127,6 +171,11 @@ def _is_def(line: str, name: str) -> str | None:
 
 def _indent(line: str) -> int:
     return len(line) - len(line.lstrip())
+
+
+def _enclosing(lines: list[str], i: int) -> str:
+    """The nearest preceding line with less indentation: the block line `i` sits in."""
+    return next((lines[j] for j in range(i - 1, -1, -1) if lines[j].strip() and _indent(lines[j]) < _indent(lines[i])), "")
 
 
 def find(text: str, name: str) -> tuple[int, str]:
@@ -141,8 +190,7 @@ def find(text: str, name: str) -> tuple[int, str]:
         for i, kw in hits:
             # the item's immediately enclosing block must be the qualifying type, so a local of the
             # same name inside a method (`let offset = ...`) is not a second definition
-            enclosing = next((lines[j] for j in range(i - 1, -1, -1)
-                              if lines[j].strip() and _indent(lines[j]) < _indent(lines[i])), "")
+            enclosing = _enclosing(lines, i)
             if re.search(rf"\b({'|'.join(TYPE_KW)})\b.*\b{re.escape(q)}\b", enclosing):
                 scoped.append((i, kw, enclosing))
         # `Type::m` written both in `impl Type` and in `impl Trait for Type`: the bare name means the inherent
@@ -158,6 +206,12 @@ def find(text: str, name: str) -> tuple[int, str]:
         hits = [h for h in hits if h[1] not in LOCAL_KW]    # a method or item, not a local binding of its name
     if len(hits) > 1 and any(kw != "impl" for _, kw in hits):
         hits = [h for h in hits if h[1] != "impl"]     # the type itself, not its impl blocks
+    if not qual and len(hits) > 1:
+        # a bare name means the free item when a method shares it: `distance_profile` is the function, and
+        # `Type::distance_profile` is the method
+        free = [h for h in hits if not re.search(rf"\b({'|'.join(TYPE_KW)})\b", _enclosing(lines, h[0]))]
+        if len(free) == 1:
+            hits = free
     if not hits:
         raise SymbolError(f"no definition of {name!r} found")
     if len(hits) > 1:

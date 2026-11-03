@@ -50,6 +50,21 @@ class Header:
     guarantee: str = ""
     condition: str = ""
     oracle: str = ""          # "equality": the tests compare two implementations; verify-plan then requires DEGENERATE_MUTANT
+    ignored: dict[str, list[str]] = field(default_factory=dict)   # field -> words dropped because they are prose, not entries
+
+
+def _entries(key: str, value: str) -> tuple[list[str], list[str]]:
+    """(entries, dropped words) of a list field. Parenthesised text is a comment. `implements` holds decision IDs
+    and `exports`/`planned` hold `path::item` refs or whole-file paths, so any other word is prose and is dropped, not read as an entry
+    (a stray word would otherwise match decision headings or name a symbol that does not exist)."""
+    words = [x for x in re.split(r"[,\s]+", re.sub(r"\([^)]*\)", " ", value)) if x]
+    if key == "implements":
+        ok = lambda w: bool(re.fullmatch(r"[\w.-]*\d[\w.-]*", w))    # an ID has a digit: D18, N11, T7, RFC-12
+    elif key in ("exports", "planned"):
+        ok = lambda w: "::" in w or bool(re.fullmatch(r"(?:[\w-]+:)?[\w./-]*(?:/|\.\w+)[\w./-]*", w))   # item, or a whole file
+    else:
+        return words, []
+    return [w for w in words if ok(w)], [w for w in words if not ok(w)]
 
 
 def parse_header(text: str) -> Header | None:
@@ -73,7 +88,10 @@ def parse_header(text: str) -> Header | None:
         raise SymbolError(f"unknown spec header field(s): {', '.join(unknown)}")
     h = Header()
     for k in LIST_FIELDS:
-        setattr(h, k, [x for x in re.split(r"[,\s]+", fields.get(k, "")) if x])
+        kept, dropped = _entries(k, fields.get(k, ""))
+        setattr(h, k, kept)
+        if dropped:
+            h.ignored[k] = dropped
     for k in STR_FIELDS:
         setattr(h, k, fields.get(k, ""))
     return h
@@ -84,7 +102,9 @@ def body(text: str) -> str:
 
 
 def lint(h: Header) -> list[str]:
-    notes = []
+    notes = [f"`{k}:` holds {'decision IDs' if k == 'implements' else 'path::item refs or file paths'} only; "
+             f"ignored the text \"{' '.join(w)}\" (put prose in parentheses or the spec body)"
+             for k, w in sorted(h.ignored.items())]
     if both := sorted(set(h.parents) & set(h.after)):
         notes.append(f"{', '.join(both)} listed in both `parents:` (uses) and `after:` (sequencing); keep one")
     if h.guarantee and CONDITIONAL_WORDS.search(h.guarantee) and not h.condition:

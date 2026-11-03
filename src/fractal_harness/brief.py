@@ -94,6 +94,39 @@ def section(root: Path, name: str, node: str) -> str:
     return _fill(text, node=node, root=str(root), report_path=str(rp), file_cmd=f"fractal report file {rp} --node {node}")
 
 
+def _git(root: Path, *args: str) -> str:
+    r = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def where_lines(cache: ClaimCache, root: Path, node: str) -> list[str]:
+    """Where the node's work lives: the branch registered with it (or `node-<name>`), its tip, and every worktree
+    checked out on that branch, plus whether this checkout is one of them. Read-only facts from git; the
+    answer to "which branch and which worktree do I work in?" so an agent does not guess."""
+    from .ledger import branch_of
+    branch = branch_of(cache, node)
+    registered = branch is not None
+    branch = branch or f"node-{node}"
+    tip = _git(root, "rev-parse", "--short", f"refs/heads/{branch}")
+    trees: list[tuple[str, str]] = []
+    path = None
+    for line in _git(root, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            path = line[9:]
+        elif line.startswith("branch ") and path:
+            trees.append((path, line[7:].removeprefix("refs/heads/")))
+    here = _git(root, "rev-parse", "--show-toplevel")
+    on = [p for p, b in trees if b == branch]
+    out = [f"- Branch: `{branch}` ({'registered with this node' if registered else 'default for this node; none registered'})"
+           + (f", tip {tip}." if tip else ", which does not exist yet.")]
+    if on:
+        out += [f"- Worktree on it: {', '.join(f'`{p}`' for p in sorted(on))}"
+                + (" (this checkout)." if here in on else f"; this checkout is `{here}` on `{dict(trees).get(here, 'a detached HEAD')}`.")]
+    else:
+        out += [f"- No worktree has `{branch}` checked out; this checkout is `{here}` on `{dict(trees).get(here, 'a detached HEAD')}`."]
+    return out
+
+
 def build(cache: ClaimCache, root: Path, node: str) -> dict:
     """{node, text, digest, state}. Raises SymbolError for an unregistered node or an unreadable spec."""
     from . import status
@@ -110,7 +143,7 @@ def build(cache: ClaimCache, root: Path, node: str) -> dict:
         raise SymbolError(f"{node}: spec {info['spec']} is not readable")
     d = status.derive(cache, root, node)
     out = [f"# Brief: node {node}", "", *root_block(root),
-           "## Why this node is due", "", f"State: {d['state']}.", *(f"- {r}" for r in d["reasons"]), "",
+           "## Why this node is due", "", f"State: {d['state']}.", *(f"- {r}" for r in d["reasons"]), *where_lines(cache, root, node), "",
            f"## {TITLES['task']}", "", section(root, "task", node), "",
            f"## Spec: {info['spec']}", "", body(spec).strip(), "",
            *premise_sections(cache, root, spec)]
