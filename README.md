@@ -1,12 +1,16 @@
 # fractal-harness
 
+A prototype harness based on [Explorers and Judges writing](https://lukevacura.com/blog/explorers_judges/).
+
 **Invariants as the tent-pole of agent alignment.** A coding agent is aligned with a codebase
 when it knows the rules that govern the code before it acts, is checked against them as it
 acts, and cannot commit a violation. fractal keeps those rules, and the verified facts agents
 need to work within them, in front of the right agent at the right moment, and keeps them
 true as the code changes.
 
-- **Rules (invariants)** are human-owned. Agents propose them; a human accepts them.
+- **Rules (invariants)** are layered. Agents propose them; a node's agent may accept a rule
+  inside its own files (if `fractal.toml` allows it); a parent layer can override it; the human
+  is the base case at the root and the arbiter when agents disagree.
 - **Facts** (knowledge, workflows, interfaces) are machine-maintained: learned from sessions,
   re-checked when their files change, repaired cheaply.
 - Every claim is tied to the files it depends on and checked by a deterministic **probe**.
@@ -30,9 +34,12 @@ claude
 Then review what the agent proposed and enforce the rules you agree with, in your own terminal:
 
 ```sh
-fractal invariants --audit  # proposed / enforced / rejected, with probe audit verdicts
-fractal accept <id>         # human only
+fractal invariants --audit  # proposed / enforced / rejected / overridden, with probe audit verdicts
+fractal accept <id>         # you, at the root (needs an interactive terminal, or --yes)
 ```
+
+Everything beyond the basics (named roots, accept policy, jobs, briefs) is optional and configured
+in `fractal.toml` at the repo root; with no file, behavior is the single-repo default.
 
 ## The alignment loop
 
@@ -66,22 +73,52 @@ exercise no repo code are reported as vacuous.
 ## The invariant lifecycle
 
 ```
-proposed (agent) ──human accepts──→ enforced ──code breaks it──→ violated
-                                        ↑                            │
-                                        └── fix the code, or change the rule deliberately
+proposed ──accept──→ enforced ──code breaks it──→ violated
+                        │  ↑                          │
+              override  │  └─ --undo                  └─ fix the code, or change the rule deliberately
+                        ↓
+                    overridden (kept, with who and why)
 ```
 
 ```sh
 fractal propose "core never imports from cmds" --read core/io.py \
   --probe '{"type":"grep","pattern":"^from cmds","paths":["core/**/*.py"],"expect":"absent"}'
-fractal accept <id>     # needs an interactive terminal; agents are denied it by init
+fractal accept <id>                   # the human at the root
+fractal accept <id> --as <node>       # a node's agent, for a rule inside that node's own files
+fractal override <id> --reason "..."  # a higher layer demotes a lower layer's rule (--by <node>|root, --undo)
 fractal reject <id>
 ```
 
-- Re-asserting a rule never changes the state a human gave it.
-- Repair never rewrites an enforced rule: a violation means the code or the rule is wrong,
-  and a human decides which.
+- **The human is the base case.** `--as <node>` accepts only a rule whose scope is inside the
+  node's files, whose probe runs and passes, and only where `accept_policy` in `fractal.toml` allows it
+  (`human_only` is the default; `local`, `local_with_audit`). Identity is not authenticated: `--as` is a
+  convention the policy gates, not a credential.
+- **Local rules can be overridden by parents.** A rule that survives unchallenged may simply not need challenging yet.
+  Root rules are paramount: precedence applies in the hooks, `check` and `manifest`.
+- Re-asserting a rule never changes the state it was given.
+- Repair never rewrites an enforced rule: a violation means the code or the rule is wrong, and the layer
+  above decides which.
 - A rule is only as strong as its probe: `fractal invariants --audit` mutation-tests each one.
+
+### Conflicts: contradiction as the signal
+
+When a local rule clashes with a higher layer, or keeps blocking work, that is information, not noise. Blocks are
+logged; a rule blocked `friction_threshold` times within `friction_window_days` raises a `conflict` event (a
+heuristic signal that only raises events). Exact grep contradictions with a higher-layer rule are caught at accept time
+(sound for that case only).
+
+```sh
+fractal conflict list               # awaiting a decision
+fractal conflict show <id>          # why, block counts, history
+fractal conflict raise ...          # the premise behind a claim is wrong: raise it on the parent, never weaken the probe
+fractal conflict resolve <id> keep|narrow|override   # the parent's agent decides
+fractal conflict escalate <id>      # one layer up; at the root it becomes an arbitration request for a human
+fractal conflict arbitrate <id>     # human only: settles a request
+```
+
+An agent resolves a conflict by default. Only a conflict that reaches the root, or one on a node listed in
+`human_nodes`, goes to the human. If the agent disagrees with a human rule it must explain why in a written
+arbitration request; it never overrides a root rule itself.
 
 ## Claims and probes
 
@@ -159,6 +196,13 @@ joins: engine_a, engine_b   # a join node: tests that these agree; each must be 
 ---
 ```
 
+- `implements:` holds decision IDs and `exports:`/`planned:` hold `path::item` refs or file paths. Prose there is not
+  split into words: it is ignored, with a note (put prose in parentheses or the spec body).
+- Rust `pub use` counts as a definition: `pub use a::X;`, `as` aliases and single-line `{A, B as C}` groups define
+  the names they expose, and cfg-gated alternatives of one name form a single interface (editing any branch changes
+  the contract). Private `use` and globs name nothing. A facade module can be exported as `path::*` (the whole file
+  is the interface, so any edit is a contract change; prefer naming items).
+- A node registers against its own branch (`refs/heads/<branch>`), and its parents' exports are read at that commit.
 - An export that does not exist yet is an error unless the spec lists it under `planned:`. A planned export has no
   signature, so a child sees it as "planned"; when the code appears the child's verdicts go stale once, with the reason
   "is now defined", and `ledger node --fix` drops it from `planned:`. `graph-check` does not call it stale.
@@ -227,6 +271,48 @@ Claims live on a capacity-bounded tree over the code's own address space (direct
 files): each claim sits at the smallest region containing everything it depends on, and a
 rule placed at a region governs everything beneath it. The tree answers "which rules govern
 this file?" for the hooks and places claims in manifests.
+
+## Roots, derived state and briefs
+
+`fractal.toml` (all optional):
+
+```toml
+[roots]                      # specs and decisions may live in another repo; refs are <root>:<path>
+docs = "../project-docs"
+
+[policy]
+accept_policy = "human_only" # human_only | local | local_with_audit
+friction_threshold = 5
+friction_window_days = 14
+human_nodes = ["core"]       # conflicts on these nodes are only ever decided by a human
+
+[jobs]
+backend = "local"            # or "ssh", with [jobs.ssh] host / dir / prefix
+
+[brief]
+report_dir = "docs/reports"  # where `fractal report file` copies scratch reports
+```
+
+Done is derived, never marked:
+
+```sh
+fractal status [node]        # unregistered | pending | due | stale | done, from verdicts and digests
+fractal dag [--format json]  # the node graph generated from specs and the ledger, one line per node
+fractal repair --all         # re-verify every broken claim without a model; add --agent to hand the rest to one
+```
+
+Handing a node to an agent:
+
+```sh
+fractal brief <node>         # deterministic prompt: repo root rules first, why the node is due (incl. its branch
+                             # and worktrees), task, spec, only that node's premises, reporting
+fractal report file <path>   # file a scratch report into the docs with a provenance header; `report list`
+fractal run --node <n> <cmd> # run a command at the node's commit on the [jobs] backend, memoized by tree hash
+fractal run --detach <cmd>   # start in the background; `run status <id>`, `run log <id> --tail N`
+```
+
+There are no job templates: a job is just a command. The ssh backend is implemented but has not been run
+against a real host.
 
 ## Real-use metrics
 
