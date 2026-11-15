@@ -21,6 +21,8 @@ the point of having one.
 from __future__ import annotations
 
 import re
+import atexit
+import functools
 import subprocess
 import difflib
 from pathlib import Path
@@ -29,6 +31,7 @@ from .cache import ClaimCache
 from .concepts import decision_ids
 from .context import DEFAULT_ID_PATTERN, _cited, autoregister, premises_of, section_claims
 from .nodes import DEGENERATE_MUTANT, contract_change, contract_parts, lint, parse_header, repo_lint, spec_key, spec_lint, edit_header
+from .hashing import scoped
 from .store import GOOD
 from .symbols import SymbolError, at, at_commit, digest, resolve, symbol_of
 
@@ -222,12 +225,40 @@ def deregister(cache: ClaimCache, node: str, forget_verdicts: bool = False) -> l
 
 # --- diffs --------------------------------------------------------------------------------
 
-def hunks_since(root: Path, commit: str, against: str | None = None) -> dict[str, list[tuple[int, int]]]:
+def hunks_since(root: Path, commit: str, against: str | None = None,
+                only: tuple[str, ...] | None = None) -> dict[str, list[tuple[int, int]]]:
     """{file: [(old_start, old_count)]} for changes from `commit` to the working tree (0 count =
-    pure insertion after old_start). A deleted or added file is {file: [(1, 10**9)]}."""
+    pure insertion after old_start). A deleted or added file is {file: [(1, 10**9)]}.
+
+    With `only`, hunks are computed for just those files (diffing every changed file means parsing millions of
+    lines of unrelated churn per commit); any other changed file is still listed, as wholly changed, which is
+    all a caller that never asks where in it needs. Within a read-only scan (`stable_files()`) results are shared."""
+    return scoped(("hunks", str(root), commit, against, only),
+                  lambda: _hunks_since(root, commit, against, only))
+
+
+def _hunks_since(root: Path, commit: str, against: str | None, only: tuple[str, ...] | None = None) -> dict[str, list[tuple[int, int]]]:
+    if only is not None:
+        # numstat, not name-only: the full parse never lists a binary file (`-\t-`) or a mode-only change (`0\t0`)
+        names = []
+        for rec in _git(root, "diff", "--numstat", "-z", "--no-renames", commit,
+                        *([against] if against else []), "--").split("\0"):
+            add, _, rest = rec.partition("\t")
+            dele, _, name = rest.partition("\t")
+            if name and (add, dele) not in (("-", "-"), ("0", "0")):
+                names.append(name)
+        out = {n: [(1, 10**9)] for n in names if n not in only}
+        wanted = [n for n in names if n in only]
+        if wanted:
+            out.update(_parse_hunks(root, commit, against, wanted))
+        return out
+    return _parse_hunks(root, commit, against, [])
+
+
+def _parse_hunks(root: Path, commit: str, against: str | None, paths: list[str]) -> dict[str, list[tuple[int, int]]]:
     out: dict[str, list[tuple[int, int]]] = {}
     cur = None
-    for line in _git_lines(root, "diff", "-U0", "--no-color", "--no-renames", commit, *([against] if against else []), "--"):
+    for line in _git_lines(root, "diff", "-U0", "--no-color", "--no-renames", commit, *([against] if against else []), "--", *paths):
         if line.startswith("--- "):
             old = line[4:]
             cur = None if old == "/dev/null" else old.removeprefix("a/")
@@ -344,7 +375,7 @@ def plan(cache: ClaimCache, root: Path, node: str, against: str | None = None) -
     by_commit: dict[str, dict[str, list[tuple[int, int]]] | str] = {}
     for c in {r["commit"] for r in rows}:
         try:
-            by_commit[c] = hunks_since(root, c, against)
+            by_commit[c] = hunks_since(root, c, against, tuple(sorted({r["file"] for r in rows if r["commit"] == c})))
         except SymbolError as e:
             by_commit[c] = str(e)
     stale, valid = [], []
@@ -398,15 +429,58 @@ def _narrow(root: Path, rows: list[dict], changed: tuple[str, str]) -> dict:
     return {"parent": parent, "ref": ref, "item": item, "near": near, "far": far, "signature": sig}
 
 
+@functools.lru_cache(maxsize=512)
+def _blob_at(root: str, commit: str, rel: str) -> str:
+    """A file's text at a commit ('' if absent). A commit's content never changes, so this is cached: it was one
+    `git show` per (test, changed file), thousands of subprocesses for a node with many mutants."""
+    return _cat_file(root).get(f"{commit}:{rel}")
+
+
+class _CatFile:
+    """One long-lived `git cat-file --batch` per repo: a blob costs a pipe round-trip, not a process spawn."""
+
+    def __init__(self, root: str):
+        self.p = subprocess.Popen(["git", "cat-file", "--batch"], cwd=root, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def get(self, spec: str) -> str:
+        try:
+            self.p.stdin.write(spec.encode() + b"\n")
+            self.p.stdin.flush()
+            head = self.p.stdout.readline().split()
+            if len(head) != 3 or head[1] != b"blob":
+                return ""                       # `<spec> missing`, or not a blob
+            data = self.p.stdout.read(int(head[2]) + 1)[:-1]
+            return data.decode(errors="replace")
+        except (OSError, ValueError):
+            return ""
+
+
+_CAT: dict[str, _CatFile] = {}
+
+
+def _cat_file(root: str) -> _CatFile:
+    c = _CAT.get(root)
+    if c is None or c.p.poll() is not None:
+        c = _CAT[root] = _CatFile(root)
+    return c
+
+
+@atexit.register
+def _close_cat_files() -> None:
+    for c in _CAT.values():
+        try:
+            c.p.stdin.close()
+            c.p.wait(timeout=2)
+        except Exception:
+            c.p.kill()
+
+
 def _file_defines(root: Path, rel: str, commit: str, test: str, hunks: list) -> bool:
     """Does a changed file mention the test (before or after the change)?"""
     f = root / rel
     now = f.read_text(errors="replace") if f.is_file() else ""
-    try:
-        before = _git(root, "show", f"{commit}:{rel}")
-    except SymbolError:
-        before = ""
-    return _word_in(test, now) or _word_in(test, before)
+    return _word_in(test, now) or _word_in(test, _blob_at(str(root), commit, rel))
 
 
 def _compared_with(root: Path, against: str | None) -> str:

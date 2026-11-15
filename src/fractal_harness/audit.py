@@ -48,16 +48,18 @@ def _grep_leaves(probe: dict) -> list[dict]:
     return [probe] if probe.get("type") == "grep" else []
 
 
+from .hashing import expand_glob
+
+
 def _files(root: Path, probe: dict) -> dict[str, str]:
     out = {}
     for leaf in _grep_leaves(probe):
         for glob in leaf["paths"]:
-            for p in root.glob(glob):
-                if p.is_file():
-                    try:
-                        out[p.relative_to(root).as_posix()] = p.read_text(errors="replace")
-                    except OSError:
-                        pass
+            for rel in expand_glob(root, glob):
+                try:
+                    out[rel] = (root / rel).read_text(errors="replace")
+                except OSError:
+                    pass
     return out
 
 

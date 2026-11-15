@@ -29,6 +29,7 @@ from pathlib import Path
 from . import activation, ledger
 from .cache import ClaimCache
 from .context import premises_of
+from .hashing import stable_files
 from .nodes import contract_digest
 from .symbols import SymbolError
 
@@ -117,10 +118,11 @@ def activation_failing(cache: ClaimCache, root: Path) -> dict:
 def derive_all(cache: ClaimCache, root: Path) -> dict[str, dict]:
     """{node: derived} for every registered node, ordered by name."""
     cache.update()
-    failing = activation_failing(cache, root)
-    from . import conflict
-    pend = conflict.pending(cache, root)
-    return {n: derive(cache, root, n, failing, pend) for n in sorted(cache.store.all_nodes())}
+    with stable_files(), cache.settled():
+        failing = activation_failing(cache, root)
+        from . import conflict
+        pend = conflict.pending(cache, root)
+        return {n: derive(cache, root, n, failing, pend) for n in sorted(cache.store.all_nodes())}
 
 
 # --- legacy hand-set marks (heuristic) ------------------------------------------------------

@@ -80,6 +80,37 @@ def capture(root: Path, matches: list[tuple[str, int]]) -> list[dict]:
     return anchors
 
 
+SCAN_WINDOWS = 300     # up to this many windows are all scored; beyond it only the best line-overlap candidates
+CANDIDATES = 24
+
+
+def _candidates(block: list[str], lines: list[str], n: int, hint: int) -> list[int]:
+    """Window starts ranked by how many of the block's (non-blank) lines they contain, via a sliding count."""
+    want: dict[str, int] = {}
+    for b in block:
+        if b.strip():
+            want[b] = want.get(b, 0) + 1
+    have: dict[str, int] = {}
+    score = 0
+    scores: list[tuple[int, int]] = []
+    last = len(lines) - n
+    for j in range(len(lines)):
+        ln = lines[j]
+        if ln in want:
+            have[ln] = have.get(ln, 0) + 1
+            score += have[ln] <= want[ln]
+        if j >= n and lines[j - n] in want:
+            old = lines[j - n]
+            score -= have[old] <= want[old]
+            have[old] -= 1
+        i = j - n + 1
+        if 0 <= i <= last:
+            scores.append((score, i))
+    scores.sort(key=lambda t: (-t[0], abs(t[1] - hint)))
+    out = [i for _, i in scores[:CANDIDATES]]
+    return sorted(set(out) | {min(max(hint, 0), max(last, 0))})
+
+
 def locate(block: list[str], lines: list[str], hint: int = 0) -> tuple[int, float]:
     """Best (start, similarity) for `block` in `lines`. Exact match first, then a scored scan."""
     n = len(block)
@@ -94,7 +125,10 @@ def locate(block: list[str], lines: list[str], hint: int = 0) -> tuple[int, floa
     best, best_ratio = -1, 0.0
     sm = difflib.SequenceMatcher(autojunk=False)
     sm.set_seq2(target)
-    for i in range(0, max(1, len(lines) - n + 1)):
+    starts = range(0, max(1, len(lines) - n + 1))
+    if len(starts) > SCAN_WINDOWS:   # a big rewritten file: score only the windows sharing the most lines (HEURISTIC)
+        starts = _candidates(block, lines, n, hint)
+    for i in starts:
         sm.set_seq1("\n".join(lines[i:i + n]))
         if sm.real_quick_ratio() <= best_ratio or sm.quick_ratio() <= best_ratio:
             continue

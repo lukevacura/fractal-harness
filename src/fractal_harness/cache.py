@@ -11,10 +11,12 @@ Trust rules:
 
 from __future__ import annotations
 
+import contextlib
+
 from pathlib import Path
 
 from . import CHECKER_VERSION, motion, probes
-from .hashing import edge_id, fingerprint, read_hashes
+from .hashing import edge_id, fingerprint, read_hashes, stable_files
 from .store import GOOD, STATUSES, Edge, Store
 
 STORE_DIR = ".fractal"
@@ -65,6 +67,7 @@ class ClaimCache:
         # run_slow=False and leave those claims to the turn-end gate and the commit gate.
         self.run_slow = run_slow
         self.store = Store(store_root(self.root) / STORE_DIR / "edges.db")
+        self._settled = False
         self.last_motion: dict[str, str] = {}  # edge id -> motion class of its latest check
 
     def close(self) -> None:
@@ -228,12 +231,21 @@ class ClaimCache:
         changed since they failed: the edit may have fixed the code (e.g. a reverted
         violation), and only a re-check can tell.
         """
+        with stable_files():
+            return self._refresh()
+
+    def _refresh(self) -> list[str]:
         stale = []
         memo: dict[str, str] = {}
+
+        def hashed(r: str) -> str:
+            if r not in memo:
+                memo[r] = read_hashes(self.root, [r])[r]
+            return memo[r]
         for e in self.store.all():
             if e.status not in GOOD and e.status != "failed":
                 continue
-            hashes = {r: memo.setdefault(r, read_hashes(self.root, [r])[r]) for r in dependencies(e)}
+            hashes = {r: hashed(r) for r in dependencies(e)}
             if fingerprint(hashes, e.probe, self.checker_version) != e.fingerprint:
                 changed = _changed(e.hashes, hashes) or ["checker version"]
                 self.store.set_status(e.id, "stale", "sources changed: " + ", ".join(changed))
@@ -264,6 +276,16 @@ class ClaimCache:
                 out.append((rel, frac))
         return out
 
+    @contextlib.contextmanager
+    def settled(self):
+        """After an `update()`, a read-only pass (`status` over every node) can call `update()` again freely: it
+        is a no-op, not another full invalidation scan and re-check per node."""
+        was, self._settled = self._settled, True
+        try:
+            yield
+        finally:
+            self._settled = was
+
     def update(self) -> dict[str, list[str]]:
         """After source edits: invalidate, re-check every stale claim, and classify the motion.
 
@@ -271,6 +293,8 @@ class ClaimCache:
         no model call. `clean`/`moved` cost nothing; `suspect`/`delta` need a cheap repair;
         `scene_cut` needs full re-verification.
         """
+        if self._settled:
+            return {}
         self.last_motion.clear()
         self.refresh()
         stale = [e.id for e in self.store.all() if e.status == "stale"]

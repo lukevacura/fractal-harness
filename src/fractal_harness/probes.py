@@ -290,13 +290,14 @@ def _expectation(expect: object) -> tuple[str, int]:
 
 def _scan(pattern: str, probe: dict, root: Path, overlay: dict[str, str] | None) -> tuple[int, list[tuple[str, int]]]:
     """(files scanned, every (file, 0-based line) matching `pattern`) over the probe's paths."""
+    from .hashing import expand_glob
     rx = re.compile(pattern)
     exclude = re.compile(probe["exclude"]) if probe.get("exclude") else None
     files: set[Path] = set()
     include = [g for g in probe["paths"] if not g.startswith("!")]
     skip = [*probe.get("exclude_paths", []), *(g[1:] for g in probe["paths"] if g.startswith("!"))]
     for glob in include:
-        files.update(p for p in root.glob(glob) if p.is_file())
+        files.update(root / f for f in expand_glob(root, glob))
     from .regions import matches
     if overlay:  # in-memory files (e.g. a Write creating a new file) count if a glob covers them
         files.update(root / rel for rel in overlay if any(matches(g, rel) for g in include))
