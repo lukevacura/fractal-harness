@@ -314,6 +314,22 @@ fractal run --detach <cmd>   # start in the background; `run status <id>`, `run 
 There are no job templates: a job is just a command. The ssh backend is implemented but has not been run
 against a real host.
 
+Cleaning up after agents. Agent worktrees pile up; `fractal worktrees` lists the ones whose work is already in the
+base (default: the main checkout's HEAD; `--into REV` to change it) and, with `--apply`, removes them:
+
+```sh
+fractal worktrees                    # dry run: what is removable, and why each other one is kept
+fractal worktrees --apply            # `git worktree remove` (no --force) on the removable ones
+fractal worktrees --apply --branches # also `git branch -d` the merged branch, unless a node registers it
+fractal worktrees --squashed         # also count squash/rebase merges, matched by patch id (HEURISTIC)
+```
+
+A worktree is removable only if its tip is an ancestor of the base (a git fact), it has work of its own (one
+sitting exactly at the base may be an agent that just started), it is not locked or your current checkout, and
+nothing would be lost: either it is clean, or every uncommitted change is already in the base byte for byte.
+Anything else is kept and the reason is printed. A branch a node registers is never deleted, since the ledger
+resolves that node's commit from it. Nothing is committed.
+
 ## Real-use metrics
 
 `fractal stats`: claims by status, prompts seen, hit rate, claims injected, sessions and

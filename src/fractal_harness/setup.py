@@ -260,6 +260,9 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
     return done
 
 
+MAX_WORKTREE_LINES = 5
+
+
 def _worktree_checks(root: Path) -> list[tuple[bool, str]]:
     """Per worktree: uncommitted changes against its own branch head, and leftover proptest-regressions/."""
     import subprocess
@@ -282,14 +285,20 @@ def _worktree_checks(root: Path) -> list[tuple[bool, str]]:
                             if "proptest-regressions/" in l})
         if dirty:
             bad += 1
-            out.append((False, f"worktree {path} ({name}): {len(dirty)} uncommitted change(s) against its branch head, "
-                               f"e.g. {dirty[0][3:]}"))
+            out.append((True, f"WARN worktree {path} ({name}): {len(dirty)} uncommitted change(s) against its branch head, "
+                              f"e.g. {dirty[0][3:]}"))
         if leftovers:
             bad += 1
-            out.append((False, f"worktree {path} ({name}): leftover {leftovers[0]}" +
-                               (f" (+{len(leftovers) - 1} more)" if len(leftovers) > 1 else "")))
+            out.append((True, f"WARN worktree {path} ({name}): leftover {leftovers[0]}" +
+                              (f" (+{len(leftovers) - 1} more)" if len(leftovers) > 1 else "")))
+    # Work in progress is normal while agents run in worktrees: this is information, never a failed setup
+    # (a doctor that exits 1 on it teaches people to ignore doctor), and a long list is collapsed.
+    if len(out) > MAX_WORKTREE_LINES:
+        extra = len(out) - MAX_WORKTREE_LINES
+        out = out[:MAX_WORKTREE_LINES] + [(True, f"WARN (+{extra} more worktree note(s); `fractal worktrees` lists what is "
+                                                  "already merged and removable)")]
     if len(trees) > 1 or bad:
-        out.append((bad == 0, f"{len(trees)} worktree(s), {'all clean' if not bad else f'{bad} problem(s)'}"))
+        out.append((True, f"{len(trees)} worktree(s), {'all clean' if not bad else f'{bad} with uncommitted changes or leftovers'}"))
     return out
 
 

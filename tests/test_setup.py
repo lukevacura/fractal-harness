@@ -160,6 +160,27 @@ def test_doctor_flags_dirty_worktrees_and_leftover_proptest_regressions(tmp_path
     (wt / "proptest-regressions").mkdir()
     (wt / "proptest-regressions" / "x.txt").write_text("seed\n")
     results = [(ok, m) for ok, m in doctor(main) if "worktree" in m]
-    assert any(not ok and "1 uncommitted" in m and "node-x" in m for ok, m in results)
-    assert any(not ok and "leftover proptest-regressions/x.txt" in m for ok, m in results)
-    assert results[-1] == (False, "2 worktree(s), 2 problem(s)")
+    assert any("WARN" in m and "1 uncommitted" in m and "node-x" in m for ok, m in results)
+    assert any("WARN" in m and "leftover proptest-regressions/x.txt" in m for ok, m in results)
+    assert results[-1] == (True, "2 worktree(s), 2 with uncommitted changes or leftovers")
+    assert all(ok for ok, _ in results)                  # in-progress work never fails `doctor`
+
+
+def test_doctor_collapses_many_dirty_worktrees(tmp_path: Path):
+    import subprocess
+    def git(cwd, *a):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, check=True, capture_output=True)
+    main = tmp_path / "main"
+    main.mkdir()
+    git(main, "init", "-q")
+    (main / "a.txt").write_text("1\n")
+    git(main, "add", "-A")
+    git(main, "commit", "-qm", "c1")
+    for i in range(9):
+        wt = tmp_path / f"wt{i}"
+        git(main, "worktree", "add", "-q", "-b", f"b{i}", str(wt))
+        (wt / "a.txt").write_text(f"{i + 2}\n")
+    msgs = [m for _, m in doctor(main) if "worktree" in m]
+    assert len([m for m in msgs if m.startswith("WARN worktree ")]) == 5
+    assert any("(+4 more worktree note(s)" in m and "fractal worktrees" in m for m in msgs)
+    assert msgs[-1] == "10 worktree(s), 9 with uncommitted changes or leftovers"
