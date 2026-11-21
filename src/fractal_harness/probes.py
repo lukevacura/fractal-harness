@@ -5,6 +5,7 @@ Probe shapes:
   {"type": "grep", "pattern": "auth_middleware", "paths": ["src/**/*.py", "!src/legacy.py"],  # `!` excludes
    "exclude": "^\\s*(#|//)",  # optional: skip lines matching this (e.g. comments)
    "exclude_paths": ["src/legacy/*.py"],  # optional: files the rule does not cover
+   "skip_tests": true,  # optional: test code is not counted (test files, Rust #[cfg(test)] items; see test_lines)
    "expect": "present" | "absent" | {"count": 3} | {"min": 1}}
 
   {"type": "only_in", "pattern": "fn rank_key", "paths": ["src/**/*.rs"], "files": ["src/rank.rs"],
@@ -12,7 +13,7 @@ Probe shapes:
   {"type": "only_in", "kind": "struct", "name": "Nearest\\w*", "paths": ["src/**/*.rs"], "files": ["src/nearest.rs"]}
       # the same claim for a symbol kind (struct|enum|trait|class|fn|def): every definition whose
       # name matches `name` is in `files`. `decision` (an ID or a list) names the decisions the concept owns:
-      # the ownership lint on nodes' exports applies to those IDs only (IDs in `concept` count too). Optional `exclude`/`exclude_paths` as for grep. Passes when
+      # the ownership lint on nodes' exports applies to those IDs only (IDs in `concept` count too). Optional `exclude`/`exclude_paths`/`skip_tests` as for grep. Passes when
       # there is at least one match in `files` (`"min": 0` allows none) and none elsewhere.
 
   {"type": "paths", "paths": ["**/proptest-regressions/**"], "expect": "absent"}
@@ -156,8 +157,41 @@ def evidence_gap(probe: dict | None) -> str | None:
     return None
 
 
+_COMMON_KEYS = {"type", "behavioral", "evidence", "debt_target", "concept"}
+KEYS = {
+    "grep": {"pattern", "paths", "expect", "exclude", "exclude_paths", "skip_tests"},
+    "only_in": {"pattern", "kind", "name", "paths", "files", "exclude", "exclude_paths", "min", "decision", "skip_tests"},
+    "paths": {"paths", "expect", "unless_name", "unique"},
+    "command": {"run", "expect_exit", "timeout"},
+    "test": {"runner", "file"},
+    "section": {"ref", "sha"},
+    "symbol": {"ref", "sha"},
+    "staged_paths": {"forbid", "only", "frozen"},
+    "commit_message": {"forbid", "require"},
+    "all": {"probes"},
+}
+
+
+def _check_keys(probe: dict, kind) -> None:
+    """A key the probe does not read is an error: a misspelled `expect` would leave the default in force, and the
+    rule would pass while checking something other than what its author wrote."""
+    if kind not in KEYS:
+        return
+    allowed = KEYS[kind] | _COMMON_KEYS
+    if unknown := sorted(set(probe) - allowed):
+        import difflib
+        hint = ""
+        if near := difflib.get_close_matches(unknown[0], sorted(allowed), n=1):
+            hint = f" (did you mean {near[0]!r}?)"
+        elif unknown[0] in ("absent", "present"):
+            hint = f' (did you mean "expect": "{unknown[0]}"?)'
+        raise ProbeError(f"{kind} probe does not read {', '.join(repr(k) for k in unknown)}{hint}; "
+                         f"its keys are {', '.join(sorted(KEYS[kind]))}")
+
+
 def validate(probe: dict) -> None:
     kind = probe.get("type")
+    _check_keys(probe, kind)
     if kind in ("grep", "only_in", "paths") and isinstance(probe.get("paths"), list):
         bad = [g for g in probe["paths"] if isinstance(g, str) and not g.startswith("!")
                and (g.startswith("/") or g.endswith("/"))]
@@ -166,6 +200,8 @@ def validate(probe: dict) -> None:
                              f"(for a directory, use 'dir/**')")
     if not isinstance(probe.get("behavioral", False), bool):
         raise ProbeError('"behavioral" must be true or false')
+    if not isinstance(probe.get("skip_tests", False), bool):
+        raise ProbeError('"skip_tests" must be true or false')
     declared = probe.get("evidence")
     if declared is not None and not (declared == "exact" and kind == "grep" or declared == "proxy" and kind == "command"):
         raise ProbeError('"evidence" may only be "exact" on a grep probe or "proxy" on a command probe')
@@ -290,8 +326,31 @@ def run(probe: dict, root: Path, overlay: dict[str, str] | None = None,
     return _run_grep(probe, root, overlay)
 
 
+_PATHLIKE = re.compile(r"[\w.-]+(?:/[\w.-]+)+|[\w-]+\.[A-Za-z]\w*")
+
+
+def _absent_here(run: str, root: Path) -> list[str]:
+    """Paths the command names that this checkout lacks but the main checkout has: ignored files, which a git
+    worktree does not get. The command cannot run here, which says nothing about the rule."""
+    import shlex
+    try:
+        words = shlex.split(run, comments=True)
+    except ValueError:
+        words = run.split()
+    missing = [w for w in words if _PATHLIKE.fullmatch(w) and not (root / w).exists()]
+    if not missing:
+        return []
+    from .cache import store_root
+    main = store_root(root)
+    return [w for w in missing if (main / w).exists()]
+
+
 def _run_command(probe: dict, root: Path) -> ProbeResult:
     expect = probe.get("expect_exit", 0)
+    if absent := _absent_here(probe["run"], root):
+        return ProbeResult(True, f"{VACUOUS}not applicable in this worktree: {', '.join(absent)} "
+                           f"{'is' if len(absent) == 1 else 'are'} only in the main checkout (ignored files are not checked out here); the main checkout checks it",
+                           vacuous=True)
     try:
         proc = subprocess.run(
             probe["run"],
@@ -381,17 +440,66 @@ def _run_paths(probe: dict, root: Path, overlay: dict[str, str] | None = None) -
                            + (f": {', '.join(counted[:5])}" if counted and not ok else ""), hits)
 
 
+TEST_FILE = re.compile(r"(?:^|/)(?:tests?|__tests__)/|(?:^|/)(?:test_[^/]*\.py|conftest\.py|tests\.rs)$"
+                       r"|_test\.\w+$|\.(?:test|spec)\.\w+$")
+_CFG_TEST = re.compile(r"^\s*#\[cfg\(test\)\]")
+_RUST_NOISE = re.compile(r"//.*$|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])'")
+
+
+def test_lines(rel: str, text: str) -> set[int] | None:
+    """The 0-based lines of `text` that are test code by convention, or None when the whole file is: a file under
+    a `test/`, `tests/` or `__tests__/` folder or named like a test (`test_*.py`, `*_test.*`, `*.test.*`,
+    `*.spec.*`, `conftest.py`, Rust `tests.rs`); in a Rust file, the item a `#[cfg(test)]` attribute marks, to
+    its closing brace (braces in strings, chars and `//` comments not counted)."""
+    if TEST_FILE.search(rel):
+        return None
+    out: set[int] = set()
+    if not rel.endswith(".rs") or "cfg(test)" not in text:
+        return out
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        if not _CFG_TEST.match(lines[i]):
+            i += 1
+            continue
+        depth, parens, opened, j = 0, 0, False, i
+        while j < len(lines):
+            code = _RUST_NOISE.sub("", lines[j]) if j > i else ""
+            for ch in code:
+                if ch == "{":
+                    depth, opened = depth + 1, True
+                elif ch == "}":
+                    depth -= 1
+                elif ch in "([":
+                    parens += 1
+                elif ch in ")]":
+                    parens -= 1
+            if not opened and depth < 0:          # the enclosing block closed: the item (a field, an arm) ended before
+                j -= 1
+                break
+            if opened and depth <= 0 or not opened and parens <= 0 and code.rstrip().endswith((";", ",")):
+                break
+            j += 1
+        out.update(range(i, min(j, len(lines) - 1) + 1))
+        i = j + 1
+    return out
+
+
 def _scan(pattern: str, probe: dict, root: Path, overlay: dict[str, str] | None) -> tuple[int, list[tuple[str, int]]]:
     """(files scanned, every (file, 0-based line) matching `pattern`) over the probe's paths."""
     rx = re.compile(pattern)
     exclude = re.compile(probe["exclude"]) if probe.get("exclude") else None
+    skip_tests = bool(probe.get("skip_tests"))
     files = _selected(probe, root, overlay)
     from .hashing import scoped
     hits: list[tuple[str, int]] = []
 
     def scan_text(rel: str, text: str) -> list[tuple[str, int]]:
+        tests = test_lines(rel, text) if skip_tests else set()
+        if tests is None:
+            return []
         return [(rel, i) for i, line in enumerate(text.splitlines())
-                if rx.search(line) and not (exclude and exclude.search(line))]
+                if rx.search(line) and not (exclude and exclude.search(line)) and i not in tests]
 
     def scan_file(path: Path, rel: str) -> list[tuple[str, int]]:
         try:
@@ -403,7 +511,8 @@ def _scan(pattern: str, probe: dict, root: Path, overlay: dict[str, str] | None)
         if overlay and rel in overlay:
             hits.extend(scan_text(rel, overlay[rel]))
         else:       # within a stable_files() scope a file on disk is scanned once per pattern
-            hits.extend(scoped(("scan", str(root), pattern, probe.get("exclude"), rel), lambda: scan_file(path, rel)))
+            hits.extend(scoped(("scan", str(root), pattern, probe.get("exclude"), skip_tests, rel),
+                               lambda: scan_file(path, rel)))
     return len(files), hits
 
 

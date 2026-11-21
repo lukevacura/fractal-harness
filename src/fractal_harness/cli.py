@@ -322,6 +322,12 @@ def main(argv: list[str] | None = None) -> int:
     ln.add_argument("--fix", action="store_true", help="write the missing parents/exports the header lint computes "
                     "into the spec (prints the diff; the spec is yours to commit)")
     ln.add_argument("--dry-run", action="store_true", help="with --fix: print the diff, change nothing")
+    li = lsub.add_parser("import", help="register every spec not registered yet, parents first (leaves "
+                         "registered nodes alone)")
+    li.add_argument("globs", nargs="*", help="spec globs (default: the folders of the registered specs, else "
+                    "docs/specs/*.md or specs/*.md)")
+    li.add_argument("--id-pattern")
+    li.add_argument("--dry-run", action="store_true", help="print what would be registered, in order; change nothing")
     lx = lsub.add_parser("rm", help="deregister a node that left the DAG (it stops counting as a child)")
     lx.add_argument("node")
     lx.add_argument("--forget-verdicts", action="store_true", help="also delete its recorded verdicts")
@@ -366,6 +372,8 @@ def main(argv: list[str] | None = None) -> int:
     oi.add_argument("--in", dest="files", action="append", required=True, help="the owner file or glob (repeatable)")
     oi.add_argument("--paths", action="append", required=True, help="where to look (glob, repeatable)")
     oi.add_argument("--exclude", help="skip lines matching this regex")
+    oi.add_argument("--skip-tests", action="store_true", help="do not count test code (test files, Rust "
+                    "#[cfg(test)] items)")
     oi.add_argument("--decision", action="append", default=[], metavar="ID",
                     help="a decision this concept owns (repeatable); the ownership lint applies to these IDs only")
     wt = sub.add_parser("worktrees", help="list linked worktrees whose work is already merged into the base; "
@@ -723,10 +731,12 @@ def main(argv: list[str] | None = None) -> int:
             rules = cache.invariants((args.state,) if args.state else ("proposed", "enforced", "rejected", "overridden"))
             last = {h["edge_id"]: h for h in cache.store.rule_history() if h["action"] in ("override", "restore")}
             memo: dict[str, list[str]] = {}
+            plans: dict = {}            # every node planned once, for all the rules
 
             def checked(e):
                 if e.id not in memo:
-                    memo[e.id] = mutation_checked(cache, root, e.probe) if evidence_class(e.probe) == "test" else []
+                    memo[e.id] = (mutation_checked(cache, root, e.probe, plans) if evidence_class(e.probe) == "test"
+                                  else [])
                 return memo[e.id]
             verdicts = {}
             if args.audit:
@@ -782,6 +792,17 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  registered claims for: {', '.join(r['autoregistered'])}")
                 for note in r["lint"]:
                     print(f"  note: {note}")
+            elif args.ledger_cmd == "import":
+                from .context import DEFAULT_ID_PATTERN
+                r = ledger.import_specs(cache, root, args.globs, args.id_pattern or DEFAULT_ID_PATTERN, args.dry_run)
+                verb = "would register" if args.dry_run else "registered"
+                for n, spec, notes in r["registered"]:
+                    print(f"{verb} {n}  ({spec}){f'  [{len(notes)} note(s): fractal ledger node {n} --spec {spec} --dry-run]' if notes else ''}")
+                for n, why in r["skipped"].items():
+                    print(f"skipped {n}: {why}")
+                print(f"{len(r['registered'])} {verb}, {len(r['skipped'])} skipped"
+                      + ("  (dry run: nothing written)" if args.dry_run else ""))
+                return 1 if r["skipped"] and not r["registered"] else 0
             elif args.ledger_cmd == "reattribute":
                 n = ledger.reattribute(cache, root, args.node, args.old, args.to, args.reason, args.force)
                 print(f"re-attributed {n} verdict(s) of {args.node}: {args.old} -> "
@@ -822,6 +843,8 @@ def main(argv: list[str] | None = None) -> int:
                     probe["name"] = args.name
             if args.exclude:
                 probe["exclude"] = args.exclude
+            if args.skip_tests:
+                probe["skip_tests"] = True
             if args.decision:
                 probe["decision"] = args.decision
             from . import probes

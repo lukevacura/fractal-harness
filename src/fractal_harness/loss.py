@@ -121,26 +121,33 @@ def _bounds(leaf: dict) -> tuple[float, float]:
 COUNTED = "counted"
 
 
+def _lines_key(leaf: dict):
+    """Which lines of the selected files a grep/only_in counts, as one comparable value: the `exclude` regex, and
+    with `skip_tests` the pair (regex, True). None is every line; equal values are the same lines; anything else
+    is not compared (`_absorbs_atom` and `contradiction` require None or equality)."""
+    return (leaf.get("exclude"), True) if leaf.get("skip_tests") else leaf.get("exclude")
+
+
 def _atoms(leaf: dict) -> list[dict] | None:
     """The comparable parts of one probe leaf, or None when it has none (not provable)."""
     t = leaf.get("type")
     inc, skip = _split(leaf) if "paths" in leaf else ([], [])
     if t == "grep":
         lo, hi = _bounds(leaf)
-        return [{"form": COUNTED, "key": ("grep", leaf["pattern"]), "exclude": leaf.get("exclude"),
+        return [{"form": COUNTED, "key": ("grep", leaf["pattern"]), "exclude": _lines_key(leaf),
                  "inc": inc, "skip": skip, "lo": lo, "hi": hi}]
     if t == "only_in":
         from .probes import only_in_pattern
         key = ("grep", only_in_pattern(leaf))
         files = as_region(leaf["files"])             # read with `matches`: a literal file entry may be a directory
-        out = [{"form": COUNTED, "key": key, "exclude": leaf.get("exclude"), "inc": inc,
+        out = [{"form": COUNTED, "key": key, "exclude": _lines_key(leaf), "inc": inc,
                 "skip": [*skip, *files], "lo": 0, "hi": 0}]
         need = leaf.get("min", 1)
         # inside: the probe counts lines in (paths - skips) ∩ files. As something that forbids (absorbing others),
         # the atom says "at least min over all of files": true, files is a superset. As something lost, only a
         # subset of the counted files may stand for it ("lower_inc"): the entries known to lie inside the paths
         sub = [f.rstrip("/") for f in leaf["files"] if any(glob_covers(i, f.rstrip("/")) for i in inc)]
-        out.append({"form": COUNTED, "key": key, "exclude": leaf.get("exclude"), "inc": files, "skip": [],
+        out.append({"form": COUNTED, "key": key, "exclude": _lines_key(leaf), "inc": files, "skip": [],
                     "lo": need, "hi": INF, "lower_inc": sub, "lower_skip": skip})
         return out
     if t == "paths":

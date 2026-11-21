@@ -23,6 +23,7 @@ the mutant ledger watches, so a parent's contract changing stales exactly its ch
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ from .symbols import SymbolError, at, digest, resolve, split_ref, symbol_of
 
 LIST_FIELDS = ("parents", "after", "implements", "see", "exports", "planned", "public", "refines", "distinct", "joins")
 STR_FIELDS = ("guarantee", "condition", "oracle")
+INFO_FIELDS = ("status",)     # for people: kept in the header, read by nothing
 CONDITIONAL_WORDS = re.compile(r"\b(only (?:when|if|for)|provided|unless|assuming|as long as|given that)\b", re.I)
 
 
@@ -51,6 +53,7 @@ class Header:
     condition: str = ""
     oracle: str = ""          # "equality": the tests compare two implementations; verify-plan then requires DEGENERATE_MUTANT
     ignored: dict[str, list[str]] = field(default_factory=dict)   # field -> words dropped because they are prose, not entries
+    extra: dict[str, str] = field(default_factory=dict)           # fields fractal does not read (kept, not checked)
 
 
 def _entries(key: str, value: str) -> tuple[list[str], list[str]]:
@@ -83,10 +86,14 @@ def parse_header(text: str) -> Header | None:
             fields[key] = kv.group(2).strip()
         elif key and line[0] in " \t":
             fields[key] = f"{fields[key]} {line.strip()}".strip()
-    unknown = sorted(set(fields) - set(LIST_FIELDS) - set(STR_FIELDS))
-    if unknown:
-        raise SymbolError(f"unknown spec header field(s): {', '.join(unknown)}")
+    known = set(LIST_FIELDS) | set(STR_FIELDS) | set(INFO_FIELDS)
     h = Header()
+    for k in sorted(set(fields) - known):
+        # a near-miss of a field fractal reads would silently drop a premise or an export: refuse it.
+        # Anything else is a note for people, kept and ignored like `status:`
+        if near := difflib.get_close_matches(k, sorted(set(LIST_FIELDS) | set(STR_FIELDS)), n=1, cutoff=0.75):
+            raise SymbolError(f"unknown spec header field {k!r} (did you mean {near[0]!r}?)")
+        h.extra[k] = fields[k]
     for k in LIST_FIELDS:
         kept, dropped = _entries(k, fields.get(k, ""))
         setattr(h, k, kept)
@@ -105,6 +112,7 @@ def lint(h: Header) -> list[str]:
     notes = [f"`{k}:` holds {'decision IDs' if k == 'implements' else 'path::item refs or file paths'} only; "
              f"ignored the text \"{' '.join(w)}\" (put prose in parentheses or the spec body)"
              for k, w in sorted(h.ignored.items())]
+    notes += [f"`{k}:` is not a field fractal reads; it is kept as a note and checked by nothing" for k in sorted(h.extra)]
     if both := sorted(set(h.parents) & set(h.after)):
         notes.append(f"{', '.join(both)} listed in both `parents:` (uses) and `after:` (sequencing); keep one")
     if h.guarantee and CONDITIONAL_WORDS.search(h.guarantee) and not h.condition:

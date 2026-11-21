@@ -123,7 +123,13 @@ That works because every probe reads the same files: the repo's files, meaning t
 doesn't ignore. Nothing under a git-ignored directory is read (even by `build/**`: such a rule checks nothing, and
 `check` says so), and nothing under a symlinked directory. In `paths` a literal names one file; in skips (`!`,
 `exclude_paths`), `only_in` files and commit gates it names that file or the directory under it. Paths are
-repo-relative, with no leading or trailing `/`.
+repo-relative, with no leading or trailing `/`. A probe key fractal does not read is an error (`"absent": true`
+would otherwise leave `expect` at its default and the rule passing). `"skip_tests": true` on a grep or `only_in`
+leaves test code uncounted: files under `test/`, `tests/` or `__tests__/` or named like tests, and the item a
+Rust `#[cfg(test)]` marks. It compares soundly: a rule that skips tests forbids less than one that doesn't.
+
+In a git worktree, a `command` probe that names a file only the main checkout has (an ignored file, which
+worktrees don't get) is not applicable there: it passes vacuously and says so, and the main checkout checks it.
 
 One law decides who may make a change (`accept --as`, `override --by`, `retire`, `narrow`, `ratchet`, `change --by`):
 
@@ -270,8 +276,13 @@ distinct: Other=Nearest     # ...or is a separate concept (silences the ownershi
 oracle: equality        # tests compare two implementations: verify-plan requires the
                         # "every output entry is NONE/empty" mutant to be recorded killed
 joins: engine_a, engine_b   # a join node: tests that these agree; each must be a parent (contract watched)
+status: building        # for people: kept, read by nothing (any field that isn't a near-miss of one above)
 ---
 ```
+
+Parents register before children. `fractal ledger import` registers every spec not yet registered, parents first
+(`--dry-run` shows the order); registered nodes are left alone. A parent with no spec has no contract to watch:
+list it under `after:`.
 
 - `implements:` holds decision IDs and `exports:`/`planned:` hold `path::item` refs or file paths. Prose there is not
   split into words: it is ignored, with a note (put prose in parentheses or the spec body).

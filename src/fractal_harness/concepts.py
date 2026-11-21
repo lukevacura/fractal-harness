@@ -33,7 +33,7 @@ def decisions_of(leaf: dict, concept: str) -> list[str]:
 def decision_ids(cache: ClaimCache) -> dict[str, list[str]]:
     """{decision ID: [concept names]} for every decision a concept claim names. Ownership lints only apply to these."""
     out: dict[str, list[str]] = {}
-    for e in cache.store.all():
+    for e in filter(_live, cache.store.all()):
         for leaf in _leaves(e.probe):
             concept = leaf.get("concept") or e.post.splitlines()[0]
             for d in decisions_of(leaf, concept):
@@ -43,9 +43,14 @@ def decision_ids(cache: ClaimCache) -> dict[str, list[str]]:
     return out
 
 
+def _live(e) -> bool:
+    """A rejected or overridden rule claims nothing: it is not in the registry, and no lint reads its decisions."""
+    return e.rule_state not in ("rejected", "overridden")
+
+
 def registry(cache: ClaimCache) -> list[dict]:
     rows = []
-    for e in cache.store.all():
+    for e in filter(_live, cache.store.all()):
         for leaf in _leaves(e.probe):
             concept = leaf.get("concept") or e.post.splitlines()[0]
             rows.append({"concept": concept, "decisions": decisions_of(leaf, concept),

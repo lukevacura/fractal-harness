@@ -142,7 +142,8 @@ def _register_rest(cache: ClaimCache, root: Path, node: str, spec: str, f: Path,
         unregistered = [n for n in h.parents if n not in nodes]
         if unregistered:
             raise SymbolError(f"parents not registered yet: {', '.join(unregistered)} "
-                              "(`fractal ledger node <parent> --spec <its spec>` first)")
+                              "(`fractal ledger node <parent> --spec <its spec>` first, or `fractal ledger import` for "
+                              "all of them; a parent with no spec belongs under `after:`)")
         if node in h.parents:
             raise SymbolError(f"{node} cannot be its own parent")
         found, missing = section_claims(edges, h.implements)
@@ -165,6 +166,64 @@ def _register_rest(cache: ClaimCache, root: Path, node: str, spec: str, f: Path,
                   for i in missing]
     return {"spec": spec, "premises": premises, "uncited": [] if h else missing, "declared": h is not None,
             "lint": notes, "autoregistered": registered, "diff": diff}
+
+
+def spec_dirs(cache: ClaimCache, root: Path) -> list[str]:
+    """Where this repo keeps its specs: the folders of the registered nodes' specs, else `docs/specs` or
+    `specs`, whichever exists."""
+    dirs = sorted({str(Path(n["spec"]).parent) for n in cache.store.all_nodes().values() if n.get("spec")})
+    if dirs:
+        return dirs
+    return [d for d in ("docs/specs", "specs") if (root / d).is_dir()][:1]
+
+
+def import_specs(cache: ClaimCache, root: Path, globs: list[str] | None = None, id_pattern: str = DEFAULT_ID_PATTERN,
+                 dry_run: bool = False) -> dict:
+    """Register every spec whose node (the file name without `.md`) is not registered yet, parents before
+    children, so a spec tree written before fractal arrived can be taken in at once. Registered nodes are left
+    alone: re-registering one would bless verdicts given under its old spec. Files named TEMPLATE or starting
+    with `_` are not nodes. Returns {"registered": [(node, spec, notes)], "skipped": {node: why}} in order."""
+    globs = globs or [f"{d}/*.md" for d in spec_dirs(cache, root)]
+    nodes = cache.store.all_nodes()
+    todo: dict[str, tuple[str, list[str]]] = {}
+    skipped: dict[str, str] = {}
+    for g in globs:
+        for f in sorted(root.glob(g)):
+            node, rel = f.stem, f.relative_to(root).as_posix()
+            if node in nodes or node.startswith("_") or node.upper() == "TEMPLATE" or node in todo:
+                continue
+            try:
+                h = parse_header(f.read_text(errors="replace"))
+            except SymbolError as e:
+                skipped[node] = str(e)
+                continue
+            todo[node] = (rel, h.parents if h else [])
+    done: list = []
+    known = set(nodes)
+    while todo:
+        ready = [n for n, (_, parents) in todo.items() if all(p in known for p in parents)]
+        if not ready:
+            break
+        for n in sorted(ready):
+            spec, _ = todo.pop(n)
+            if dry_run:
+                known.add(n)
+                done.append((n, spec, []))
+                continue
+            try:
+                r = register_node(cache, root, n, spec, id_pattern)
+            except SymbolError as e:
+                skipped[n] = str(e)
+                continue
+            known.add(n)
+            done.append((n, spec, r["lint"]))
+    for n, (spec, parents) in todo.items():      # what is left waits on a parent that has no spec, or on a cycle
+        missing = [p for p in parents if p not in known and p not in todo]
+        skipped[n] = (f"parent(s) {', '.join(missing)} have no spec, so no contract to watch: write their spec, "
+                      "or list them under `after:` (sequencing only)" if missing
+                      else f"waits on {', '.join(p for p in parents if p in todo)}, which wait on it or on a "
+                           "parent with no spec")
+    return {"registered": done, "skipped": dict(sorted(skipped.items()))}
 
 
 def record(cache: ClaimCache, root: Path, node: str, *, file: str, span: str, mutant: str, result: str,
@@ -315,10 +374,11 @@ def premise_change(cache: ClaimCache, root: Path, pre: dict) -> tuple[str | None
     return None, None
 
 
-def mutation_checked(cache: ClaimCache, root: Path, probe: dict | None) -> list[str]:
+def mutation_checked(cache: ClaimCache, root: Path, probe: dict | None, memo: dict | None = None) -> list[str]:
     """Nodes whose still-valid `killed` verdicts name a test this probe runs: evidence that the test fails
     when the code it guards is broken, not just that it passes. Heuristic: a test is matched by name against
-    the probe's test file or command, so a renamed test drops out rather than counts."""
+    the probe's test file or command, so a renamed test drops out rather than counts. Pass the same `memo` dict
+    for many probes: each node is planned once (one update, then read-only), not once per probe."""
     texts: list[str] = []
     stack = [probe] if probe else []
     while stack:
@@ -330,12 +390,19 @@ def mutation_checked(cache: ClaimCache, root: Path, probe: dict | None) -> list[
         elif p.get("type") == "test":
             f = root / p["file"]
             texts.append(p["file"] + "\n" + (f.read_text(errors="replace") if f.is_file() else ""))
+    memo = {} if memo is None else memo
+    if "\0valid" not in memo:
+        cache.update()
+        valid_of: dict[str, list] = {}
+        with cache.settled():
+            for node in sorted(cache.store.verdict_nodes()):
+                try:
+                    valid_of[node] = plan(cache, root, node)["valid"]
+                except SymbolError:
+                    continue
+        memo["\0valid"] = valid_of
     out = []
-    for node in sorted(cache.store.verdict_nodes()):
-        try:
-            valid = plan(cache, root, node)["valid"]
-        except SymbolError:
-            continue
+    for node, valid in memo["\0valid"].items():
         if any(r["result"] == "killed" and any(_word_in(t, x) for t in r["tests"] for x in texts) for r in valid):
             out.append(node)
     return out

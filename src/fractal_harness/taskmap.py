@@ -33,6 +33,9 @@ IDENT = re.compile(r"`?\b([A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*|[a-z]+(?:[A-Z][a-z0
 # A relative path the task writes; an absolute (`/tmp/x/y.out`) or home (`~/x/y.md`) path is outside the repo, so a
 # match may not start mid-path.
 NAMED_PATH = re.compile(r"(?<![\w./~-])[\w.-]+(?:/[\w.-]+)+\.\w+")
+RUST_DEF = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:async|unsafe|const|extern(?:\s+"[^"]*")?)\s+)*'
+                      r"(?:fn|struct|enum|trait|type|union|mod|const|static|macro_rules!)\s+(\w+)", re.M)
+SOURCE_EXT = (".dart", ".py", ".ts", ".tsx", ".js", ".rs")
 MAX_DEF_FILES = 6            # an identifier defined in more files than this is too generic to route by
 MAX_REGIONS = 5
 MAX_CONTRACTS_PER_REGION = 4
@@ -86,10 +89,27 @@ def definition_index(root: Path, source: list[str]) -> dict[str, list[str]]:
             text = (root / f).read_text(errors="replace")
         except OSError:
             continue
-        for rx in DEF_RXS:
-            for name in set(rx.findall(text)):
-                index.setdefault(name, []).append(f)
+        for name in set(RUST_DEF.findall(text)) if f.endswith(".rs") else {n for rx in DEF_RXS for n in rx.findall(text)}:
+            index.setdefault(name, []).append(f)
     return index
+
+
+def _node_seeds(root: Path, nodes: dict, prompt: str, fileset: set[str]) -> dict[str, list[str]]:
+    """Files exported by the registered nodes the task names: a node name is a deliberate reference."""
+    from .nodes import parse_header
+    seeds: dict[str, list[str]] = {}
+    for name, n in nodes.items():
+        if not ("-" in name or len(name) >= 5) or not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", prompt):
+            continue
+        try:
+            h = parse_header((root / n["spec"]).read_text(errors="replace"))
+        except Exception:
+            continue
+        for ref in (h.exports + h.planned) if h else []:
+            f = ref.split("::")[0].split(":")[-1] if "::" in ref else ref
+            if f in fileset:
+                seeds.setdefault(f, []).append(f"node {name} named in the task")
+    return seeds
 
 
 def _read(root: Path, rel: str) -> str:
@@ -110,7 +130,7 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
     fileset = set(files)
     language = _language(root)
     package = dart_package(root) if language == "dart" else None
-    source = [f for f in files if f.endswith((".dart", ".py", ".ts", ".tsx", ".js")) and not f.startswith("test")
+    source = [f for f in files if f.endswith(SOURCE_EXT) and not f.startswith("test")
               and "/test" not in f]
 
     # -- seeds: files the task is about -------------------------------------------------------
@@ -136,6 +156,8 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
     cache = ClaimCache(root, run_slow=False)
     try:
         claims = cache.store.all()
+        for f, why in _node_seeds(root, cache.store.all_nodes(), prompt, fileset).items():
+            seeds.setdefault(f, []).extend(why)
         behavior = [e for e in claims if e.kind == "behavior"]
         rules = [e for e in claims if e.enforced]
         facts = []
@@ -172,7 +194,7 @@ def task_map(root: Path, prompt: str, capacity: int = 1000) -> TaskMap:
         """Evidence strength: named in the task 3, defines a type the task names 2, anything else 1."""
         total = 0
         for w in r.why:
-            if w.startswith(("named in the task", "new file named")):
+            if w.startswith(("named in the task", "new file named", "node ")):
                 total += 3
             elif w.startswith("defines `") or (w.startswith("defines ") and w[8:9].isupper()):
                 total += 2
