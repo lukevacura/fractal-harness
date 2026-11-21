@@ -336,12 +336,17 @@ def test_override_requires_a_higher_layer_and_a_reason(tmp_path):
         authority.override(c, e.id, "root", " ", "local")
     with pytest.raises(AuthorityError, match="does not outrank"):
         authority.override(c, e.id, "side", "no", "local")               # a sibling
-    with pytest.raises(AuthorityError, match="does not outrank"):
-        authority.override(c, e.id, "mid", "no", "local")               # not itself
+    with pytest.raises(AuthorityError, match="global loss"):
+        authority.override(c, e.id, "mid", "no", "local")               # itself: only losslessly (the law)
     with pytest.raises(AuthorityError, match="human_only"):
         authority.override(c, e.id, "top", "no", "human_only")          # a node needs the policy
-    # top is mid's parent: it may override mid's rule
+    # top is mid's parent, but dropping mid's rule is a global loss: refused unless another rule still forbids it
+    with pytest.raises(AuthorityError, match="global loss"):
+        authority.override(c, e.id, "top", "superseded", "local")
+    keeper = _propose(c, "f is defined in mid", {**HAS_DEF})
+    c.set_rule(keeper.id, "enforced")
     assert authority.override(c, e.id, "top", "superseded", "local").rule_state == "overridden"
+    authority.override(c, keeper.id, "root", "test cleanup", "human_only")
     # but a node may not touch a root rule
     r = _propose(c, "no legacy in src", NO_LEGACY)
     c.set_rule(r.id, "enforced")
@@ -360,6 +365,10 @@ def test_override_is_a_human_step_without_by_a_node(tmp_path, monkeypatch):
     c.close()
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     assert main(["--root", str(tmp_path), "override", e.id, "--reason", "x"]) == 2
+    assert main(["--root", str(tmp_path), "override", e.id, "--by", "top", "--reason", "x"]) == 1   # a global loss
+    c = ClaimCache(tmp_path)
+    c.set_rule(_propose(c, "f is defined in mid", {**HAS_DEF}).id, "enforced")       # now absorbed
+    c.close()
     assert main(["--root", str(tmp_path), "override", e.id, "--by", "top", "--reason", "x"]) == 0
 
 

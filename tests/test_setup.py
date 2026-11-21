@@ -33,7 +33,7 @@ def test_init_default_leaves_misses_untouched(tmp_path: Path):
     assert s["permissions"]["deny"] == ["Bash(fractal accept:*)", "Bash(fractal reject:*)"]
     assert s["hooks"]["PostToolUse"][0] == {"matcher": "Edit|Write|MultiEdit|NotebookEdit",
                                             "hooks": [{"type": "command", "command": "fractal hook edit"}]}
-    assert s["hooks"]["PreToolUse"][0] == {"matcher": "Edit|Write|MultiEdit",
+    assert s["hooks"]["PreToolUse"][0] == {"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
                                            "hooks": [{"type": "command", "command": "fractal hook pre-edit"}]}
     assert s["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"] == "fractal hook prompt"
     assert s["hooks"]["Stop"][0]["hooks"][0]["command"] == "fractal hook stop"

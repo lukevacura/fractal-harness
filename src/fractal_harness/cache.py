@@ -15,7 +15,7 @@ import contextlib
 
 from pathlib import Path
 
-from . import CHECKER_VERSION, motion, probes
+from . import CHECKER_VERSION, motion, probes, rules
 from .hashing import edge_id, fingerprint, read_hashes, stable_files
 from .store import GOOD, STATUSES, Edge, Store
 
@@ -38,7 +38,7 @@ def dependencies(e: Edge) -> list[str]:
         p = stack.pop()
         if p.get("type") == "all":
             stack.extend(p["probes"])
-        elif p.get("type") in ("grep", "only_in"):
+        elif p.get("type") in ("grep", "only_in", "paths"):
             paths.update(g for g in p["paths"] if not g.startswith("!"))     # `!` paths exclude: nothing to watch
         elif p.get("type") in ("section", "symbol"):
             paths.add(p["ref"].partition("::")[0])
@@ -111,6 +111,7 @@ class ClaimCache:
             parent_id=parent_id, created_at=0, updated_at=0, depends_on=depends_on,
             delta_count=delta_count, rule_state=rule_state,
         )
+        rules.guard_put(existing, edge)   # a ruled-on rule's probe and reads are part of what was ruled on
         if existing and not check:   # keep the last verdict until the claim is re-run
             edge.status, edge.fingerprint, edge.hashes, edge.detail = (
                 existing.status, existing.fingerprint, existing.hashes, existing.detail)
@@ -140,14 +141,9 @@ class ClaimCache:
         return self._require(eid)
 
     def set_rule(self, eid: str, state: str) -> Edge:
-        """Human step: accept (enforce) or reject a proposed invariant."""
-        if state not in ("enforced", "rejected", "proposed"):
-            raise CacheError(f"bad rule state {state!r}")
-        e = self._require(eid)
-        if e.kind != "invariant":
-            raise CacheError(f"{eid} is a {e.kind} claim, not an invariant")
-        self.store.set_rule_state(eid, state)
-        self.store.log("rule", eid, state=state)
+        """Human step: accept (enforce), reject or reopen an invariant. Recorded through the door (rules.py)."""
+        self._require(eid)
+        rules.human_set(self, eid, state)
         return self._require(eid)
 
     def invariants(self, states: tuple[str, ...] = ("proposed", "enforced", "rejected")) -> list[Edge]:
@@ -156,7 +152,7 @@ class ClaimCache:
     def delete(self, eid: str) -> list[str]:
         """Remove an edge; its dependents become stale (blocked)."""
         dependents = self.store.dependents(eid)
-        self.store.delete(eid)
+        rules.delete_guarded(self.store, self._require(eid))
         self.store.log("delete", eid)
         for d in dependents:
             self.store.set_status(d, "stale", f"upstream {eid} was deleted")

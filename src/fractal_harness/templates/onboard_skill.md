@@ -45,7 +45,12 @@ fractal propose "<the rule, stated so a violation is unambiguous>" --read <file>
 - A rule's probe must **fail when the rule is violated**. Rules are usually `absent`
   probes (the forbidden thing never appears) or presence probes over every file the rule
   covers (`"paths": ["src/commands/*.py"], "expect": {"min": 1}` per required element).
-- Propose only rules the code **already follows**: the probe must pass now.
+- If the code **already breaks** a rule worth having, do not drop it: propose it with
+  `--debt` (an absent/max rule is kept at today's count, and `fractal ratchet <id>` lowers
+  it as violations are fixed). Mention each debt rule and its count in your report.
+- `fractal propose` tells you when a proposal is **violated now** or **contradicts**
+  another rule. Keep both rules and report the contradiction to the user; do not weaken a
+  probe to make the conflict go away.
 - A rule describes what must stay true, not how the code currently happens to work. If
   breaking it would be fine, it is a fact, not a rule.
 - **Never run `fractal accept` or `fractal reject`.** Those are the user's decisions.
@@ -82,7 +87,16 @@ fractal put "<fact>" --read <file> [--read <file> ...] --probe '<json>'
   - `{"type":"grep","pattern":"router\\.add\\(","paths":["api/**/*.py"],"expect":{"min":1}}`
   - `{"type":"grep","pattern":"\\beval\\(","paths":["src/**/*.py"],"expect":"absent","exclude":"^\\s*#"}`
   - `{"type":"all","probes":[ ... ]}` when a claim has several checkable parts.
+  - `{"type":"only_in","pattern":"UnsafeCell","paths":["src/**/*.rs"],"files":["src/sync.rs"]}`
+    when something must appear in one place and nowhere else.
+  - `{"type":"paths","paths":["**/proptest-regressions/**"],"expect":"absent"}` for files that
+    must (not) exist; `"unless_name":"<regex>"` for a naming convention, `"unique":"<regex>"`
+    for a key no two files share (e.g. a migration number).
+  - `{"type":"staged_paths","frozen":["db/migrations/*.sql"]}` for files that may be added but
+    never changed (checked at commit).
   - `--run "npm test -- --silent"` for a command that must exit 0 (read-only and fast only).
+    Use a command only when no typed probe above can say it: a shell command cannot be
+    reasoned about, so every change to its rule needs the user.
 - **Every checkable statement in the claim must be covered by the probe**; a claim that
   says more than its probe checks overstates what is known. Split it, or leave the
   unprobed part out.
@@ -94,8 +108,10 @@ fractal put "<fact>" --read <file> [--read <file> ...] --probe '<json>'
 ## 4. Finish
 
 Report to the user:
-- the rules you **proposed** (with their audit verdicts), and ask them to review with
-  `fractal invariants --audit` and enforce the ones they agree with using
+- the rules you **proposed** (with their audit verdicts), including debt rules with their
+  counts and any contradictions `fractal propose` reported, and ask them to review with
+  `fractal queue` (what each proposal newly enforces, and which add nothing) and
+  `fractal invariants --audit`, and enforce the ones they agree with using
   `fractal accept <id>` in their own terminal;
 - how many facts you recorded, `verified` vs `trusted`, any that `failed` and why;
 - which areas you left at coarse zoom.

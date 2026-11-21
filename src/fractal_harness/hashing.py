@@ -78,8 +78,9 @@ def scoped(key: tuple, compute):
     return _SCOPE[key]
 
 
-def _ignored_dirs(root: Path) -> list[str]:
-    """Directories git ignores (`bench/data/`, a venv, `target/`), repo-relative with a trailing slash."""
+def _ignored(root: Path) -> tuple[list[str], set[str]]:
+    """(directories, files) git ignores and does not track, repo-relative (directories with a trailing slash): the
+    complement of the repo's files. A tracked file is never in it, whatever .gitignore says."""
     import subprocess
     key = ("ignored", str(root))
     if _SCOPE is not None and key in _SCOPE:
@@ -88,18 +89,41 @@ def _ignored_dirs(root: Path) -> list[str]:
         out = subprocess.run(["git", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"],
                              cwd=root, capture_output=True, check=True).stdout
     except (subprocess.CalledProcessError, FileNotFoundError, NotADirectoryError):
-        return []
-    dirs = [d for d in out.decode(errors="replace").split("\0") if d.endswith("/")]
+        return [], set()
+    entries = [d for d in out.decode(errors="replace").split("\0") if d]
+    got = ([d for d in entries if d.endswith("/")], {d for d in entries if not d.endswith("/")})
     if _SCOPE is not None:
-        _SCOPE[key] = dirs
-    return dirs
+        _SCOPE[key] = got
+    return got
+
+
+def _ignored_dirs(root: Path) -> list[str]:
+    return _ignored(root)[0]
+
+
+def _through_symlink(root: Path, rel: str) -> bool:
+    """Does `rel` lie under a symlinked directory (a link git stores as a link, not as the files behind it)?"""
+    parts = rel.split("/")[:-1]
+    p = root
+    for part in parts:
+        p = p / part
+        if p.is_symlink():
+            return True
+    return False
+
+
+def in_repo(root: Path, rel: str, ignored: tuple | None = None) -> bool:
+    """Is `rel` one of the repo's files: tracked, or untracked and not ignored, and not under a symlinked
+    directory? Every probe selects from these and only these (one universe: what the proofs in loss.py assume)."""
+    dirs, files = ignored or _ignored(root)
+    return rel not in files and not any(rel.startswith(d) for d in dirs) and not _through_symlink(root, rel)
 
 
 def expand_glob(root: Path, pattern: str) -> list[str]:
-    """Repo-relative files matching `pattern`. It walks only the glob's literal prefix (`fuzz/` for
-    `fuzz/**/*.rs`) and does not descend into directories git ignores (build output, venvs, generated data:
-    100k+ files in a real repo) unless the glob itself points into one (`bench/data/**`). A single recursive
-    `Path.glob` over such a repo took ~20s per probe; this takes milliseconds."""
+    """The repo's files (in_repo) matching `pattern`. It walks only the glob's literal prefix (`fuzz/` for
+    `fuzz/**/*.rs`) and never descends into a directory git ignores (build output, venvs, generated data: 100k+
+    files in a real repo), even when the glob points into one: such a rule checks nothing (and says so). A single
+    recursive `Path.glob` over such a repo took ~20s per probe; this takes milliseconds."""
     key = ("expand", str(root), pattern)
     if _SCOPE is not None and key in _SCOPE:
         return _SCOPE[key]
@@ -109,24 +133,34 @@ def expand_glob(root: Path, pattern: str) -> list[str]:
     return out
 
 
+def visible(root: Path, pattern: str, rel: str) -> bool:
+    """Would `expand_glob(root, pattern)` list `rel` if it existed? (For files that exist only in memory: a pending
+    edit is selected by the same rules as the walk.)"""
+    from .regions import glob_match
+    return glob_match(pattern, rel) and in_repo(root, rel)
+
+
 def _walk_glob(root: Path, pattern: str) -> list[str]:
     import os
     from .regions import _literal_prefix, glob_match
     prefix = _literal_prefix(pattern).strip("/")
     start = root / prefix if prefix else root
+    ign = _ignored(root)
+    if prefix and (not in_repo(root, prefix, ign) or not in_repo(root, prefix + "/", ign)):
+        return []                                    # inside an ignored or symlinked directory, or ignored itself
     if not start.is_dir():
         return [prefix] if prefix and start.is_file() and glob_match(pattern, prefix) else []
-    skip = [d for d in _ignored_dirs(root) if not (prefix + "/").startswith(d)]
-    skip_set = {d.rstrip("/") for d in skip}
+    dirs, ignored_files = ign
+    skip_set = {d.rstrip("/") for d in dirs}
     out = []
-    for dirpath, dirnames, filenames in os.walk(start):
+    for dirpath, dirnames, filenames in os.walk(start):          # does not follow symlinked directories
         rel_dir = Path(dirpath).relative_to(root).as_posix()
         rel_dir = "" if rel_dir == "." else rel_dir
         dirnames[:] = [d for d in dirnames
                        if d != ".git" and (f"{rel_dir}/{d}" if rel_dir else d) not in skip_set]
         for f in filenames:
             rel = f"{rel_dir}/{f}" if rel_dir else f
-            if glob_match(pattern, rel) and (root / rel).is_file():
+            if rel not in ignored_files and glob_match(pattern, rel) and (root / rel).is_file():
                 out.append(rel)
     return sorted(out)
 

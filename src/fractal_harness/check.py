@@ -19,11 +19,35 @@ def staged_paths(root: Path) -> list[str] | None:
     """Paths staged for commit (None outside a git repo)."""
     import subprocess
     try:
-        out = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd=root,
+        out = subprocess.run(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z"], cwd=root,
+                             capture_output=True, check=True).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    return [p for p in out.decode(errors="surrogateescape").split("\0") if p]     # -z: no quoting of odd names
+
+
+def staged_status(root: Path) -> dict[str, str] | None:
+    """{path: A|M|D|R} for each change staged for commit (a rename is reported under its old path as R and its new
+    path as A). None outside a git repo."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "diff", "--cached", "--name-status", "-M", "-z"], cwd=root,
                              capture_output=True, text=True, check=True).stdout
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
-    return [l for l in out.splitlines() if l]
+    parts, res, i = out.split("\0"), {}, 0
+    while i < len(parts) and parts[i]:
+        how = parts[i][0]
+        if how in "RC":
+            old, new = parts[i + 1], parts[i + 2]
+            if how == "R":
+                res[old] = "R"
+            res[new] = "A"
+            i += 3
+        else:
+            res[parts[i + 1]] = how if how in "AMD" else "M"
+            i += 2
+    return res
 
 
 def gate_violations(edges: list, root: Path, ctx: dict) -> tuple[list, list]:
@@ -66,6 +90,8 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
         cache.update()
         all_edges = cache.store.all()
         edges, beat = effective(cache, all_edges)      # a higher layer's rule beats a conflicting lower one
+        from .rules import drifted
+        drift = drifted(cache.store, all_edges)        # enforced rules changed outside the door (rules.py)
     finally:
         cache.close()
     violations = [e for e in edges if e.enforced and e.status == "failed"]
@@ -79,7 +105,7 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
     staged = staged_paths(root)
     from .setup import forbidden_staged
     own = forbidden_staged(staged or [])
-    gate_bad, gate_proposed = gate_violations(edges, root, {"staged": staged})
+    gate_bad, gate_proposed = gate_violations(edges, root, {"staged": staged, "staged_status": staged_status(root)})
     record_many(root, [(e, "") for e, _ in gate_bad], "check")
     lines = [f"note: {e.layer}'s rule {e.id} is set aside where it conflicts with {hi.layer}'s rule {hi.id}: {e.post}"
              for hi in all_edges for e in beat.get(hi.id, [])]
@@ -94,6 +120,16 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
                      + "\n         unstage them (`git restore --staged <path>`); `fractal init` keeps them out of git")
     for e in violations:
         lines.append(f"VIOLATION {e.id}: {e.post}\n          probe: {e.detail}")
+    from .config import load as load_config
+    policy_drift = load_config(root).policy_drift
+    for k, v in policy_drift.items():
+        lines.append(f"POLICY fractal.toml [policy] {k} = {v['file']!r} is not pinned; the pinned {v['pinned']!r} "
+                     "applies. Changing who may change rules is a human decision: a human runs `fractal pin` to take "
+                     "the edit, or restores fractal.toml")
+    for e, pinned in drift:
+        lines.append(f"CHANGED {e.id}: this enforced rule was changed outside the fractal CLI (its content is not "
+                     f"revision {pinned}, which was accepted): {e.post}\n          rules change only through "
+                     "`fractal` (accept, override, conflict); restore the store, or a human re-accepts the rule")
     if needs_repair:
         kinds: dict[str, int] = {}
         for e in needs_repair:
@@ -105,12 +141,12 @@ def check(root: Path, strict: bool = False) -> tuple[int, str]:
         lines.append(f"REGRESSION {e.id}: {e.probe['file']} passed before and fails now: "
                      f"{behavioral['results'][e.id].detail}")
     if violations or gate_bad:
-        lines.append(f"fractal: {len(violations) + len(gate_bad)} invariant(s) violated. Fix the code, or if the rule "
-                     "itself changed, update the claim deliberately (`fractal rm` / `fractal put`).")
+        lines.append(f"fractal: {len(violations) + len(gate_bad)} invariant(s) violated. Fix the code. If the rule itself "
+                     "should change, that is a human decision: propose the new version and ask the user.")
     if regressions:
         lines.append(f"fractal: {len(regressions)} behavioral regression(s). Fix the code, or update the test "
                      "if the behavior change is intended.")
-    code = 1 if violations or gate_bad or own or regressions or (strict and needs_repair) else 0
+    code = 1 if violations or gate_bad or own or regressions or drift or policy_drift or (strict and needs_repair) else 0
     if code == 0 and behavioral["results"]:    # this state is about to be committed: new reference
         from .behavior import promote_baseline
         cache = ClaimCache(root)

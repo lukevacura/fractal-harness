@@ -19,7 +19,10 @@ STOP_HOOK = "fractal hook stop"
 EDIT_HOOK = "fractal hook edit"
 EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit"
 PRE_EDIT_HOOK = "fractal hook pre-edit"
-PRE_EDIT_MATCHER = "Edit|Write|MultiEdit"
+# Bash and NotebookEdit reach the pre-edit hook only for the store guard (store_guard.py): the rule
+# store is written only through the CLI. Earlier versions installed "Edit|Write|MultiEdit"; init upgrades it.
+PRE_EDIT_MATCHER = "Edit|Write|MultiEdit|NotebookEdit|Bash"
+GUARDED_BY_PRE_EDIT = ("Bash", "NotebookEdit")
 AGENT_HOOK = "fractal hook agent"
 SESSION_HOOK = "fractal hook session"
 CLI_PERMISSION = "Bash(fractal:*)"
@@ -118,6 +121,39 @@ def _add_unique(items: list, value: object) -> bool:
 def _has_hook(settings: dict, event: str, command: str) -> bool:
     return any(h.get("command") == command
                for g in settings.get("hooks", {}).get(event, []) for h in g.get("hooks", []))
+
+
+def _hook_matchers(settings: dict, event: str, command: str) -> list[str | None]:
+    return [g.get("matcher") for g in settings.get("hooks", {}).get(event, [])
+            if any(h.get("command") == command for h in g.get("hooks", []))]
+
+
+def _matcher_covers(matcher: str | None, tool: str) -> bool:
+    import re
+    if matcher in (None, "", "*"):
+        return True
+    try:
+        return re.fullmatch(matcher, tool) is not None
+    except re.error:
+        return tool in matcher.split("|")
+
+
+def _ensure_hook(settings: dict, event: str, command: str, matcher: str | None) -> None:
+    """Install `command` on `event` with `matcher`; an install with an older matcher is upgraded
+    (its own group re-matched, or moved out of a group it shares with other hooks)."""
+    groups = settings.setdefault("hooks", {}).setdefault(event, [])
+    ours = [g for g in groups if any(h.get("command") == command for h in g.get("hooks", []))]
+    if ours and (matcher is None or all(g.get("matcher") == matcher for g in ours)):
+        return
+    for g in ours:
+        if all(h.get("command") == command for h in g.get("hooks", [])):
+            groups.remove(g)
+        else:
+            g["hooks"] = [h for h in g["hooks"] if h.get("command") != command]
+    group = {"hooks": [{"type": "command", "command": command}]}
+    if matcher:
+        group = {"matcher": matcher, **group}
+    groups.append(group)
 
 
 COMMIT_MSG_HOOK = """#!/bin/sh
@@ -234,11 +270,7 @@ def init(root: Path, settings: bool = True, git_hook: bool = False) -> list[str]
                                         ("SubagentStart", AGENT_HOOK, None),
                                         ("SessionStart", SESSION_HOOK, None),
                                         ("PostToolUse", EDIT_HOOK, EDIT_MATCHER)):
-            if not _has_hook(s, event, command):
-                group = {"hooks": [{"type": "command", "command": command}]}
-                if matcher:
-                    group = {"matcher": matcher, **group}
-                s.setdefault("hooks", {}).setdefault(event, []).append(group)
+            _ensure_hook(s, event, command, matcher)
         if json.dumps(s, sort_keys=True) != before:
             _write_json(local_path, s)
             done.append(f"settings   {LOCAL_SETTINGS} (untracked: prompt/subagent hooks inject rules and facts, "
@@ -321,6 +353,10 @@ def doctor(root: Path) -> list[tuple[bool, str]]:
     checks.append((_has_hook(s, "UserPromptSubmit", PROMPT_HOOK), "UserPromptSubmit hook injects claims"))
     checks.append((_has_hook(s, "Stop", STOP_HOOK), "Stop hook queues sessions for `fractal record`"))
     checks.append((_has_hook(s, "PreToolUse", PRE_EDIT_HOOK), "PreToolUse hook blocks edits that would violate rules"))
+    checks.append((any(all(_matcher_covers(m, t) for t in GUARDED_BY_PRE_EDIT)
+                       for m in _hook_matchers(s, "PreToolUse", PRE_EDIT_HOOK)),
+                   "PreToolUse hook guards the rule store against Bash and NotebookEdit writes "
+                   "(re-run `fractal init` if not)"))
     checks.append((_has_hook(s, "SubagentStart", AGENT_HOOK), "SubagentStart hook gives started subagents the rules and facts"))
     checks.append((_has_hook(s, "SessionStart", SESSION_HOOK), "SessionStart hook gives the static instructions once per session"))
     checks.append((_has_hook(s, "PostToolUse", EDIT_HOOK), "PostToolUse hook re-checks rules after edits"))

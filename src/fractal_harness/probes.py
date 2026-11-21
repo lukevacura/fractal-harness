@@ -15,14 +15,25 @@ Probe shapes:
       # the ownership lint on nodes' exports applies to those IDs only (IDs in `concept` count too). Optional `exclude`/`exclude_paths` as for grep. Passes when
       # there is at least one match in `files` (`"min": 0` allows none) and none elsewhere.
 
+  {"type": "paths", "paths": ["**/proptest-regressions/**"], "expect": "absent"}
+  {"type": "paths", "paths": ["db/migrations/*"], "unless_name": "^[0-9]{3}_[a-z0-9_]+\\.sql$", "expect": "absent"}
+  {"type": "paths", "paths": ["db/migrations/*.sql"], "unique": "^[0-9]{3}"}
+      # counts FILES, not lines: those matching `paths` (globs, `!` excludes, `exclude_paths`), as a grep selects
+      # them: the repo's files (tracked, or untracked and not ignored; files a pending edit creates count). Optional:
+      # `unless_name` counts only files whose name does NOT fully match the regex (a naming convention);
+      # `unique` counts files whose name's match of the regex is shared with another file (duplicates). Both count
+      # violations and default `expect` to "absent"; otherwise `expect` is as for grep (default "present").
+
   {"type": "all", "probes": [<probe>, ...]}  # passes only if every sub-probe passes
   {"type": "test", "runner": "flutter" | "dart" | "pytest", "file": "test/x_test.dart"}
       # a behavioral probe: the test file passes. Slow (seconds): never run in the
       # millisecond hooks; batched per runner at turn end and at commit (see behavior.py)
 
-  {"type": "staged_paths", "forbid": "proptest-regressions/", "only": ["src/**", "tests/**"]}
+  {"type": "staged_paths", "forbid": "proptest-regressions/", "only": ["src/**", "tests/**"],
+   "frozen": ["db/migrations/*.sql"]}
       # a gate probe over the paths staged for commit: fails if any staged path matches the
-      # `forbid` regex, or matches none of the `only` globs (either key is optional, one is required)
+      # `forbid` regex, or matches none of the `only` globs, or is an existing file under a `frozen` glob that is
+      # modified, deleted or renamed (adding new files there is allowed: append-only). One key is required.
   {"type": "commit_message", "forbid": "\\b[ABD][0-9]+\\b", "require": "^Node: "}
       # a gate probe over the message being committed (comment lines stripped): fails if the
       # `forbid` regex matches or the `require` regex does not (multiline; either key optional)
@@ -104,7 +115,7 @@ EVIDENCE_MEANING = {
 def evidence_class(probe: dict | None) -> str | None:
     """What a passing probe establishes, or None for a claim with no probe (no mechanism at all).
 
-    exact: only_in, the commit gates, or a grep its author declared `"evidence": "exact"`.
+    exact: only_in, paths, the commit gates, or a grep its author declared `"evidence": "exact"`.
     proxy: any other grep, and a command probe declared `"evidence": "proxy"`.
     test: a test or command probe. doc-pinned: section/symbol, which only notice the text changing.
     A declared value is honored only where a deterministic check can back it (grep, command)."""
@@ -113,7 +124,7 @@ def evidence_class(probe: dict | None) -> str | None:
     kind = probe.get("type")
     if kind == "all":
         return max((evidence_class(p) or "doc-pinned" for p in probe["probes"]), key=EVIDENCE.index)
-    if kind in GATE_TYPES or kind == "only_in":
+    if kind in GATE_TYPES or kind in ("only_in", "paths"):
         return "exact"
     if kind in ("section", "symbol"):
         return "doc-pinned"
@@ -147,6 +158,12 @@ def evidence_gap(probe: dict | None) -> str | None:
 
 def validate(probe: dict) -> None:
     kind = probe.get("type")
+    if kind in ("grep", "only_in", "paths") and isinstance(probe.get("paths"), list):
+        bad = [g for g in probe["paths"] if isinstance(g, str) and not g.startswith("!")
+               and (g.startswith("/") or g.endswith("/"))]
+        if bad:      # the walk matches nothing for them: the rule would check nothing, silently
+            raise ProbeError(f"paths are repo-relative globs without a leading or trailing '/': {bad[0]!r} "
+                             f"(for a directory, use 'dir/**')")
     if not isinstance(probe.get("behavioral", False), bool):
         raise ProbeError('"behavioral" must be true or false')
     declared = probe.get("evidence")
@@ -191,14 +208,26 @@ def validate(probe: dict) -> None:
         d = probe.get("decision", [])
         if not isinstance(d, (str, list)) or not all(isinstance(x, str) for x in ([d] if isinstance(d, str) else d)):
             raise ProbeError("'decision' must be a decision ID or a list of them")
+    elif kind == "paths":
+        if not isinstance(probe.get("paths"), list) or not probe["paths"] or not all(isinstance(g, str) for g in probe["paths"]):
+            raise ProbeError("paths probe needs a non-empty 'paths' list of globs")
+        for k in ("unless_name", "unique"):
+            if k in probe:
+                try:
+                    re.compile(probe[k])
+                except (re.error, TypeError) as e:
+                    raise ProbeError(f"invalid {k} regex: {e}") from e
+        if "unless_name" in probe and "unique" in probe:
+            raise ProbeError("a paths probe takes 'unless_name' or 'unique', not both (use an `all` probe)")
+        _expectation(paths_expect(probe))
     elif kind in GATE_TYPES:
-        keys = ("forbid", "only") if kind == "staged_paths" else ("forbid", "require")
+        keys = ("forbid", "only", "frozen") if kind == "staged_paths" else ("forbid", "require")
         if not any(k in probe for k in keys):
             raise ProbeError(f"{kind} probe needs one of {', '.join(repr(k) for k in keys)}")
         for k in (k for k in keys if k in probe):
-            if k == "only":
+            if k in ("only", "frozen"):
                 if not isinstance(probe[k], list) or not all(isinstance(g, str) for g in probe[k]):
-                    raise ProbeError("'only' must be a list of globs")
+                    raise ProbeError(f"'{k}' must be a list of globs")
             else:
                 try:
                     re.compile(probe[k])
@@ -229,15 +258,15 @@ def validate(probe: dict) -> None:
 
 def run(probe: dict, root: Path, overlay: dict[str, str] | None = None,
         ctx: dict | None = None) -> ProbeResult:
-    """Run a probe. `overlay` maps repo-relative paths to substitute contents (grep only),
-    so audits can test probes against mutated code without touching the working tree. `ctx` is
+    """Run a probe. `overlay` maps repo-relative paths to substitute contents (grep, only_in, paths, section,
+    symbol), so audits and reclamation can test probes against changed code without touching the working tree. `ctx` is
     the commit in flight for gate probes: {"staged": [paths], "message": text}; a gate probe
     whose input is absent from `ctx` holds vacuously."""
     validate(probe)
     if probe["type"] in GATE_TYPES:
         return _run_gate(probe, ctx or {})
     if probe["type"] in ("section", "symbol"):
-        return _run_extract(probe, root)
+        return _run_extract(probe, root, overlay)
     if probe["type"] == "command":
         return _run_command(probe, root)
     if probe["type"] == "test":
@@ -256,6 +285,8 @@ def run(probe: dict, root: Path, overlay: dict[str, str] | None = None,
         return ProbeResult(True, f"all {len(results)} probes passed", matches)
     if probe["type"] == "only_in":
         return _run_only_in(probe, root, overlay)
+    if probe["type"] == "paths":
+        return _run_paths(probe, root, overlay)
     return _run_grep(probe, root, overlay)
 
 
@@ -288,31 +319,91 @@ def _expectation(expect: object) -> tuple[str, int]:
     raise ProbeError(f"invalid grep expectation: {expect!r}")
 
 
-def _scan(pattern: str, probe: dict, root: Path, overlay: dict[str, str] | None) -> tuple[int, list[tuple[str, int]]]:
-    """(files scanned, every (file, 0-based line) matching `pattern`) over the probe's paths."""
-    from .hashing import expand_glob
-    rx = re.compile(pattern)
-    exclude = re.compile(probe["exclude"]) if probe.get("exclude") else None
+def _selected(probe: dict, root: Path, overlay: dict[str, str] | None) -> set[Path]:
+    """The files a grep/only_in/paths probe covers: its `paths` globs, minus `!` paths and `exclude_paths`, plus
+    in-memory files (e.g. a Write creating a new file) a glob covers."""
+    from .hashing import expand_glob, visible
+    from .regions import matches
     files: set[Path] = set()
     include = [g for g in probe["paths"] if not g.startswith("!")]
     skip = [*probe.get("exclude_paths", []), *(g[1:] for g in probe["paths"] if g.startswith("!"))]
     for glob in include:
         files.update(root / f for f in expand_glob(root, glob))
-    from .regions import matches
-    if overlay:  # in-memory files (e.g. a Write creating a new file) count if a glob covers them
-        files.update(root / rel for rel in overlay if any(matches(g, rel) for g in include))
+    if overlay:
+        files.update(root / rel for rel in overlay if any(visible(root, g, rel) for g in include))
     if skip:
         files = {f for f in files if not any(matches(g, f.relative_to(root).as_posix()) for g in skip)}
+    return files
+
+
+def count(probe: dict, root: Path) -> int:
+    """What a grep (matching lines) or paths (files) probe counts on the current tree."""
+    if probe.get("type") == "grep":
+        return len(_scan(probe["pattern"], probe, root, None)[1])
+    if probe.get("type") == "paths":
+        return len(_paths_counted(probe, root, None)[1])
+    raise ProbeError(f"a {probe.get('type')!r} probe has no count")
+
+
+def _paths_counted(probe: dict, root: Path, overlay: dict[str, str] | None) -> tuple[list[str], list[str], str]:
+    """(the files the probe selects, the ones it counts, what they are). Files git ignores do not count (a Finder
+    `.DS_Store`, a local build artifact): a paths rule is about the files that are, or could be, in the repo."""
+    files = sorted(f.relative_to(root).as_posix() for f in _selected(probe, root, overlay))
+    if "unless_name" in probe:
+        rx = re.compile(probe["unless_name"])
+        counted, what = [f for f in files if not rx.fullmatch(f.rsplit("/", 1)[-1])], f"not named /{probe['unless_name']}/"
+    elif "unique" in probe:
+        rx = re.compile(probe["unique"])
+        keys: dict[str, list[str]] = {}
+        for f in files:
+            if m := rx.search(f.rsplit("/", 1)[-1]):
+                keys.setdefault(m.group(0), []).append(f)
+        counted, what = [f for fs in keys.values() if len(fs) > 1 for f in fs], f"sharing a /{probe['unique']}/ key"
+    else:
+        counted, what = files, "matching"
+    return files, counted, what
+
+
+def paths_expect(probe: dict):
+    """A paths probe's expectation. `unless_name` and `unique` count violations, so they default to "absent"."""
+    return probe.get("expect", "absent" if "unless_name" in probe or "unique" in probe else "present")
+
+
+def _run_paths(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> ProbeResult:
+    files, counted, what = _paths_counted(probe, root, overlay)
+    op, n = _expectation(paths_expect(probe))
+    count = len(counted)
+    ok = {"count": count == n, "min": count >= n, "max": count <= n}[op]
+    hits = [(f, 0) for f in counted[:20]]
+    if ok and not files and ("unless_name" in probe or "unique" in probe):
+        return ProbeResult(True, f"{VACUOUS}the paths match no files (expected {op} {n})", [], vacuous=True)
+    return ProbeResult(ok, f"{count} file(s) {what} of {len(files)} (expected {op} {n})"
+                           + (f": {', '.join(counted[:5])}" if counted and not ok else ""), hits)
+
+
+def _scan(pattern: str, probe: dict, root: Path, overlay: dict[str, str] | None) -> tuple[int, list[tuple[str, int]]]:
+    """(files scanned, every (file, 0-based line) matching `pattern`) over the probe's paths."""
+    rx = re.compile(pattern)
+    exclude = re.compile(probe["exclude"]) if probe.get("exclude") else None
+    files = _selected(probe, root, overlay)
+    from .hashing import scoped
     hits: list[tuple[str, int]] = []
+
+    def scan_text(rel: str, text: str) -> list[tuple[str, int]]:
+        return [(rel, i) for i, line in enumerate(text.splitlines())
+                if rx.search(line) and not (exclude and exclude.search(line))]
+
+    def scan_file(path: Path, rel: str) -> list[tuple[str, int]]:
+        try:
+            return scan_text(rel, path.read_text(errors="replace"))
+        except OSError:
+            return []
     for path in sorted(files):
         rel = path.relative_to(root).as_posix()
-        try:
-            text = overlay[rel] if overlay and rel in overlay else path.read_text(errors="replace")
-        except OSError:
-            continue
-        for i, line in enumerate(text.splitlines()):
-            if rx.search(line) and not (exclude and exclude.search(line)):
-                hits.append((rel, i))
+        if overlay and rel in overlay:
+            hits.extend(scan_text(rel, overlay[rel]))
+        else:       # within a stable_files() scope a file on disk is scanned once per pattern
+            hits.extend(scoped(("scan", str(root), pattern, probe.get("exclude"), rel), lambda: scan_file(path, rel)))
     return len(files), hits
 
 
@@ -354,6 +445,11 @@ def _run_gate(probe: dict, ctx: dict) -> ProbeResult:
                 bad.append(f"{rel} (forbidden: /{probe['forbid']}/)")
             elif "only" in probe and not any(matches(g, rel) for g in probe["only"]):
                 bad.append(f"{rel} (outside {probe['only']})")
+        changes = ctx.get("staged_status") or {}
+        for rel, how in sorted(changes.items()):
+            if how != "A" and any(matches(g, rel) for g in probe.get("frozen", [])):
+                bad.append(f"{rel} ({ {'M': 'modified', 'D': 'deleted', 'R': 'renamed'}.get(how, how) } but frozen: "
+                           "files there may only be added)")
         if bad:
             return ProbeResult(False, "staged: " + "; ".join(bad[:10]))
         return ProbeResult(True, f"{len(ctx['staged'])} staged paths allowed")
@@ -367,10 +463,19 @@ def _run_gate(probe: dict, ctx: dict) -> ProbeResult:
     return ProbeResult(True, "commit message allowed")
 
 
-def _run_extract(probe: dict, root: Path) -> ProbeResult:
+def _run_extract(probe: dict, root: Path, overlay: dict[str, str] | None = None) -> ProbeResult:
     from .symbols import SymbolError, digest, section_of, symbol_of
+    extract = section_of if probe["type"] == "section" else symbol_of
+    rel = probe["ref"].partition("::")[0]
     try:
-        text = (section_of if probe["type"] == "section" else symbol_of)(root, probe["ref"])
+        if overlay and rel in overlay:              # the file's pending content, read from a scratch copy of it alone
+            import tempfile
+            with tempfile.TemporaryDirectory() as d:
+                (Path(d) / rel).parent.mkdir(parents=True, exist_ok=True)
+                (Path(d) / rel).write_text(overlay[rel])
+                text = extract(Path(d), probe["ref"])
+        else:
+            text = extract(root, probe["ref"])
     except SymbolError as e:
         return ProbeResult(False, str(e))
     if digest(text) != probe["sha"]:

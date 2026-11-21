@@ -8,6 +8,14 @@
     friction_threshold = 5       # a local rule blocked this many times within the window raises a `conflict` event
     friction_window_days = 14    # (heuristic signal; permissive defaults; see conflict.py)
     human_nodes = ["core"]       # nodes whose conflicts only a human resolves (a conflict at root always does)
+    root_signal = "tty"          # how a root decision is confirmed: tty (default) | flag (see root_signal.py)
+
+Pinned policy (`fractal pin`, a root decision): the keys that decide who may change rules -- accept_policy,
+human_nodes, root_signal -- are pinned in the store (.fractal/policy.pin). Once pinned, an edit to fractal.toml (or
+removing it) does not take effect for those keys until a human pins again: `load` returns the pinned values and
+lists the difference in `policy_drift` (reported by `fractal check`). Without a pin, the file is the policy, as
+before. SOUND for the CLI's own reads; a writer who also rewrites the pin file is not detected (the hooks' store
+guard blocks the obvious paths: HEURISTIC).
 
 A path written `<root>:<path>` (e.g. `docs:specs/foo.md`) names a file under a named root. A plain
 path is relative to the repo root, exactly as before. Unknown tables are ignored (forward compatible);
@@ -19,14 +27,21 @@ Resolution is pure path arithmetic plus a containment check, so it is SOUND (det
 
 from __future__ import annotations
 
+import json
 import re
+import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 
 CONFIG_FILE = "fractal.toml"
 ACCEPT_POLICIES = ("human_only", "local", "local_with_audit")
-OWNED = {"roots": None, "policy": {"accept_policy", "friction_threshold", "friction_window_days", "human_nodes"}, "jobs": None, "brief": None}   # table -> allowed keys (None: any name is a key)
+ROOT_SIGNALS = ("tty", "flag")       # root_signal.SIGNALS (kept here so config has no import of it)
+PINNED_KEYS = ("accept_policy", "human_nodes", "root_signal")
+PIN_FILE = "policy.pin"
+OWNED = {"roots": None, "policy": {"accept_policy", "friction_threshold", "friction_window_days", "human_nodes",
+                                   "root_signal"}, "jobs": None, "brief": None}   # table -> allowed keys (None: any name is a key)
 JOBS_KEYS = {"backend", "ssh"}
 SSH_KEYS = {"host", "dir", "prefix", "ssh", "options"}
 BRIEF_SECTIONS = ("task", "reporting", "heavy")
@@ -50,6 +65,8 @@ class Config:
     friction_threshold: int = 5          # [policy]: blocks of one local rule within the window that raise a conflict
     friction_window_days: float = 14     # [policy]: the window; a heuristic signal, it only raises events
     human_nodes: tuple = ()              # [policy]: nodes whose conflicts only a human resolves
+    root_signal: str | None = None       # [policy]: tty | flag; None = root_signal.DEFAULT
+    policy_drift: dict = field(default_factory=dict)   # pinned key -> {"file": value in fractal.toml, "pinned": value used}
     jobs: dict = field(default_factory=dict)       # [jobs]: backend = "local" | "ssh"; [jobs.ssh]: host, dir, prefix, ssh, options
     brief: dict = field(default_factory=dict)      # [brief]: report_dir, report_to, task/reporting/heavy (+ _extra)
     warnings: list[str] = field(default_factory=list)
@@ -86,8 +103,72 @@ _cache: dict[tuple[str, int, int], Config] = {}
 
 
 def load(repo: Path | str) -> Config:
-    """The repo's config; defaults when the file is absent. Raises ConfigError (not a traceback) when malformed."""
+    """The repo's config; defaults when the file is absent. Raises ConfigError (not a traceback) when malformed.
+    The pinned policy keys come from the pin when one exists (see the module docstring)."""
     repo = Path(repo)
+    cfg = _load_file(repo)
+    main = _store_dir(str(repo.resolve())).parent
+    if main != repo.resolve():
+        # a linked worktree or a subdirectory shares the main checkout's store: that checkout's policy governs it,
+        # not a fractal.toml an agent can write next to its own working copy
+        m = _load_file(main)
+        cfg = replace(cfg, accept_policy=m.accept_policy, human_nodes=m.human_nodes, root_signal=m.root_signal)
+    return _apply_pin(repo, cfg)
+
+
+def policy_values(cfg: Config) -> dict:
+    """The pinnable policy keys as fractal.toml states them (before any pin is applied)."""
+    return {"accept_policy": cfg.accept_policy, "human_nodes": list(cfg.human_nodes), "root_signal": cfg.root_signal}
+
+
+@lru_cache(maxsize=256)
+def _store_dir(repo: str) -> Path:
+    from .cache import STORE_DIR, store_root
+    return store_root(Path(repo)) / STORE_DIR
+
+
+def pin_path(repo: Path | str) -> Path:
+    return _store_dir(str(Path(repo).resolve())) / PIN_FILE
+
+
+def read_pin(repo: Path | str) -> dict | None:
+    f = pin_path(repo)
+    if not f.is_file():
+        return None
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, ValueError) as e:
+        raise ConfigFileError(f"{f} is unreadable ({e}): restore it, or a human re-pins with `fractal pin`") from e
+    return data if isinstance(data, dict) else None
+
+
+def write_pin(repo: Path | str) -> dict:
+    """Pin fractal.toml's current policy keys (the caller has the root's confirmation)."""
+    values = {**policy_values(_load_file(Path(repo))), "ts": time.time()}
+    f = pin_path(repo)
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(values, indent=1) + "\n")
+    return values
+
+
+def _apply_pin(repo: Path, cfg: Config) -> Config:
+    pin = read_pin(repo)
+    if pin is None:
+        return cfg
+    file_vals, drift, out = policy_values(cfg), {}, {}
+    for k in PINNED_KEYS:
+        pv = pin[k] if k in pin else file_vals[k]
+        if pv != file_vals[k]:
+            drift[k] = {"file": file_vals[k], "pinned": pv}
+        out[k] = tuple(pv or ()) if k == "human_nodes" else pv
+    if not drift:
+        return cfg
+    warnings = [*cfg.warnings, *(f"{CONFIG_FILE}: [policy] {k} = {v['file']!r} is not pinned; using the pinned "
+                                 f"{v['pinned']!r} until a human runs `fractal pin`" for k, v in drift.items())]
+    return replace(cfg, **out, policy_drift=drift, warnings=warnings)
+
+
+def _load_file(repo: Path) -> Config:
     f = repo / CONFIG_FILE
     if not f.is_file():
         return Config(repo=repo)
@@ -115,6 +196,11 @@ def load(repo: Path | str) -> Config:
             raise ConfigFileError(f"{CONFIG_FILE}: accept_policy must be one of {', '.join(ACCEPT_POLICIES)}, "
                               f"got {pol['accept_policy']!r}")
         cfg.accept_policy = pol["accept_policy"]
+    if "root_signal" in pol:
+        if pol["root_signal"] not in ROOT_SIGNALS:
+            raise ConfigFileError(f"{CONFIG_FILE}: root_signal must be one of {', '.join(ROOT_SIGNALS)}, "
+                                  f"got {pol['root_signal']!r}")
+        cfg.root_signal = pol["root_signal"]
     _parse_conflict_policy(pol, cfg)
     for k in sorted(set(pol) - OWNED["policy"]):
         cfg.warnings.append(f"{CONFIG_FILE}: unknown key [policy] {k} (ignored)")

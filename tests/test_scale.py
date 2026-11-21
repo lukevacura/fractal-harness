@@ -28,10 +28,13 @@ def test_glob_does_not_descend_into_ignored_dirs(tmp_path):
     assert expand_glob(tmp_path, "bench/**/*.rs") == ["bench/run.rs"]
 
 
-def test_glob_pointing_into_an_ignored_dir_still_sees_it(tmp_path):
+def test_glob_pointing_into_an_ignored_dir_sees_nothing(tmp_path):
+    """One universe: every probe sees the repo's files only, so the proofs' pattern reasoning holds (loss.py). A rule
+    over an ignored directory checks nothing, and the probe says so (vacuous)."""
     _tree(tmp_path)
-    assert expand_glob(tmp_path, "bench/data/**/*.rs") == ["bench/data/d.rs"]
-    assert expand_glob(tmp_path, "target/debug/*.rs") == ["target/debug/x.rs"]
+    assert expand_glob(tmp_path, "bench/data/**/*.rs") == []
+    assert expand_glob(tmp_path, "target/debug/*.rs") == []
+    assert expand_glob(tmp_path, "target/debug/x.rs") == []
 
 
 def test_glob_matches_pathlib_in_a_plain_directory(tmp_path):

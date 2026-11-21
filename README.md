@@ -9,8 +9,9 @@ need to work within them, in front of the right agent at the right moment, and k
 true as the code changes.
 
 - **Rules (invariants)** are layered. Agents propose them; a node's agent may accept a rule
-  inside its own files (if `fractal.toml` allows it); a parent layer can override it; the human
-  is the base case at the root and the arbiter when agents disagree.
+  inside its own subtree's files (if `fractal.toml` allows it); a parent layer can override it
+  only when no information is lost; the human is the base case at the root and the arbiter when
+  agents disagree or a change would lose information.
 - **Facts** (knowledge, workflows, interfaces) are machine-maintained: learned from sessions,
   re-checked when their files change, repaired cheaply.
 - Every claim is tied to the files it depends on and checked by a deterministic **probe**.
@@ -35,7 +36,8 @@ Then review what the agent proposed and enforce the rules you agree with, in you
 
 ```sh
 fractal invariants --audit  # proposed / enforced / rejected / overridden, with probe audit verdicts
-fractal accept <id>         # you, at the root (needs an interactive terminal, or --yes)
+fractal accept <id>         # you, at the root: it asks you to confirm on your terminal
+fractal pin                 # once, and after you edit [policy]: pins older rules' revisions and the policy
 ```
 
 Everything beyond the basics (named roots, accept policy, jobs, briefs) is optional and configured
@@ -84,15 +86,58 @@ proposed ──accept──→ enforced ──code breaks it──→ violated
 fractal propose "core never imports from cmds" --read core/io.py \
   --probe '{"type":"grep","pattern":"^from cmds","paths":["core/**/*.py"],"expect":"absent"}'
 fractal accept <id>                   # the human at the root
-fractal accept <id> --as <node>       # a node's agent, for a rule inside that node's own files
+fractal accept <id> --as <node>       # a node's agent, for a rule inside that node's files or its descendants'
 fractal override <id> --reason "..."  # a higher layer demotes a lower layer's rule (--by <node>|root, --undo)
+fractal change <id> --probe '{...}'|--drop --reason "..."   # any change to an enforced rule (--by <node>|root)
 fractal reject <id>
+fractal queue                         # everything awaiting you, as what each decision would change
 ```
 
-- **The human is the base case.** `--as <node>` accepts only a rule whose scope is inside the
-  node's files, whose probe runs and passes, and only where `accept_policy` in `fractal.toml` allows it
-  (`human_only` is the default; `local`, `local_with_audit`). Identity is not authenticated: `--as` is a
-  convention the policy gates, not a credential.
+`fractal queue` lists every decision waiting for a human (proposals, arbitration requests and conflicts held at root
+or on a `human_nodes` node, rules changed outside the CLI, unpinned policy edits) with the net change in information
+each would make, re-checked when shown:
+
+```
+[1] CONTRADICTION  proposal 4b1e…  no legacy imports anywhere
+      ! contradicts enforced rule [a90c…] "mid imports legacy" (@root): …
+[2] adds information  proposal 800f…  CapacityError and friends are defined only in capacity.rs
+      + newly enforces: no lines matching /(struct CapacityError|…)/ in crates/**/* (except crates/core/src/capacity.rs)
+      + newly enforces: at least 4 lines matching /(struct CapacityError|…)/ in crates/core/src/capacity.rs
+[3] adds nothing  proposal 2928…  Core numeric code never calls mul_add
+      = already enforced by [b0f0…]: no lines matching /mul_add|fmadd|vfma/ in crates/core/src/**/*.rs
+```
+
+Contradictions and global losses come first, then additions, then rules that cannot be compared (command probes:
+"unknown"), then rules that add nothing. "Adds nothing" is claimed only when every part of the rule is proven already
+enforced; "newly enforces" can overstate (a part only a command rule covers is listed). Command and test probes are
+re-run with `--slow`. Two rules that conflict through different patterns are not detected.
+
+Every change to the rule set is judged by one quantity, its **delta**: what it newly forbids and what it newly
+allows, comparing the rules in effect before and after (precedence included). A part of a removed rule that other
+rules still forbid is **absorbed**; one that nothing still forbids, or that can't be proven (commands and tests can't
+be compared), is a **global loss**. The queue shows the delta; reclamation proposes changes whose delta is empty.
+Rules are compared on their typed parts (grep, `only_in`, `paths`, commit gates), paths as glob patterns, never as
+today's files. Contradiction uses the same comparison: two rules contradict when no state satisfies both.
+
+That works because every probe reads the same files: the repo's files, meaning tracked files plus untracked ones git
+doesn't ignore. Nothing under a git-ignored directory is read (even by `build/**`: such a rule checks nothing, and
+`check` says so), and nothing under a symlinked directory. In `paths` a literal names one file; in skips (`!`,
+`exclude_paths`), `only_in` files and commit gates it names that file or the directory under it. Paths are
+repo-relative, with no leading or trailing `/`.
+
+One law decides who may make a change (`accept --as`, `override --by`, `retire`, `narrow`, `ratchet`, `change --by`):
+
+- **No loss.** An agent never lets through what was forbidden. A loss is the human's: `fractal conflict raise` files it.
+- **Standing.** To drop or reshape a rule, the agent's node holds it or ranks above it, and `accept_policy` allows
+  agents (`human_only` is the default; `local`, `local_with_audit`). Never a root rule. A ratchet needs no standing:
+  it only moves a debt rule's bounds toward the target the human already ruled.
+- **Region.** A rule a node holds depends only on files that node (or its descendants) owns.
+
+Everything else is the root's: you, in your terminal, shown the same delta. Identity is not authenticated: `--as`
+and `--by` are a convention the policy gates, not a credential.
+
+- **The human is the base case.** `--as <node>` also needs a probe that runs, passes and checks something, and
+  one no higher layer's rule contradicts.
 - **Local rules can be overridden by parents.** A rule that survives unchallenged may simply not need challenging yet.
   Root rules are paramount: precedence applies in the hooks, `check` and `manifest`.
 - Re-asserting a rule never changes the state it was given.
@@ -104,8 +149,8 @@ fractal reject <id>
 
 When a local rule clashes with a higher layer, or keeps blocking work, that is information, not noise. Blocks are
 logged; a rule blocked `friction_threshold` times within `friction_window_days` raises a `conflict` event (a
-heuristic signal that only raises events). Exact grep contradictions with a higher-layer rule are caught at accept time
-(sound for that case only).
+heuristic signal that only raises events). A contradiction with a higher layer's rule is caught at accept time:
+sound when the two rules' file patterns nest, a warning when they only overlap in today's files.
 
 ```sh
 fractal conflict list               # awaiting a decision
@@ -141,12 +186,44 @@ Probes: `{"type":"grep","pattern":…,"paths":[globs],"expect":"present"|"absent
 (line-based), `{"type":"command","run":…}`, or `{"type":"all","probes":[…]}`. Every path a
 probe scans is a dependency. Globs follow `Path.glob` semantics.
 
+Prefer a typed probe to a shell command: the checker can reason about typed probes (whether a change to a rule loses
+information), and a command it cannot, so every change to a command rule needs you.
+
+```json
+{"type":"only_in","pattern":"UnsafeCell","paths":["src/**/*.rs"],"files":["src/sync.rs"]}
+{"type":"paths","paths":["**/proptest-regressions/**"],"expect":"absent"}
+{"type":"paths","paths":["db/migrations/*"],"unless_name":"[0-9]{3}_[a-z0-9_]+\\.sql","expect":"absent"}
+{"type":"paths","paths":["db/migrations/*.sql"],"unique":"^[0-9]{3}"}
+{"type":"staged_paths","frozen":["db/migrations/*.sql"]}
+```
+
+`paths` counts the repo's files (a tracked file counts even if `.gitignore` matches it; a file an edit is about to
+create counts too): files that must not
+exist, a naming convention (`unless_name` counts the files whose whole name does not match), or a key no two files
+share (`unique`). `frozen` is checked at commit: files there may be added, never modified, deleted or renamed.
+
+```sh
+fractal lift <id> --probe '<typed json>' --reason "..."   # (human) replace a rule's probe; shows both results
+```
+
+**Debt.** A rule worth having that the code already breaks is kept, not dropped:
+
+```sh
+fractal propose "no legacy imports" --probe '{"type":"grep",...,"expect":"absent"}' --debt
+fractal ratchet <id>      # lowers each bound to today's count; restores "absent" at zero
+```
+
+`--debt` stores each violated absent/max bound as `{"max": <today's count>}` with the original expectation as its
+target. The rule forbids anything worse than today. Lowering a bound only forbids more, so any layer may ratchet;
+raising one is a loss and needs you. `fractal propose` and `fractal invariants` also say when a proposal is
+violated now or contradicts another rule.
+
 Every rule and fact shows an **evidence class**, what a pass establishes. Only `[exact]` is a guarantee the agent
 need not re-check; the others say what remains to verify:
 
 | Class | Probe | What a pass means |
 |---|---|---|
-| `exact` | `only_in`, commit gates, or a grep with `"evidence":"exact"` (human-declared) | the probe decides the property |
+| `exact` | `only_in`, `paths`, commit gates, or a grep with `"evidence":"exact"` (human-declared) | the probe decides the property |
 | `proxy` | any other grep | a pattern approximates it |
 | `test` | `test`, `command` | a test passes; `fractal invariants` adds `mutation-checked by <node>` when a still-valid killed verdict names the test |
 | `doc-pinned` | `section`, `symbol` | the text is unchanged; the code is not checked |
@@ -247,6 +324,17 @@ ones together as a last check); `--apply` writes only what verified to your work
 nothing. It needs a clean tree and tests that pass first. Passing is required, not proof: reference scanning is a word
 match and tests can be weak. Deleting an export stales its node's children; the plan says so.
 
+The rule set is reclaimed too, and first (`--class rules`): an enforced rule is **redundant** when everything it
+forbids is still forbidden by the other rules in effect (the same proof as absorption, so typed probes only; a command
+rule is never a candidate). Candidates are judged together, so of two identical rules only one goes; node rules go
+before root rules and newer before older, so the older ruling is kept. `--apply` retires redundant node rules (demoted
+with history, `fractal override --undo` restores them); a redundant root rule is listed with the `fractal override`
+you run in your terminal, whose prompt says it loses no information. A **vacuous** rule (its globs match no file
+today) is reported but not proposed: it still forbids files added later.
+
+Code reclamation keeps every enforced rule passing, not only the tests: a deletion that a rule needs (a presence or
+`only_in` rule on the item) is blocked, each deletion alone and all of them together before `--apply`.
+
 ## Contract changes across worktrees
 
 `fractal impact <node>` compares the node's exports with the merge-base against the default branch (your working tree
@@ -285,6 +373,8 @@ accept_policy = "human_only" # human_only | local | local_with_audit
 friction_threshold = 5
 friction_window_days = 14
 human_nodes = ["core"]       # conflicts on these nodes are only ever decided by a human
+root_signal = "tty"          # how a root decision is confirmed: tty (your terminal; default) | flag (--yes, scripts)
+                             # once pinned, edits to accept_policy, human_nodes, root_signal apply after `fractal pin`
 
 [jobs]
 backend = "local"            # or "ssh", with [jobs.ssh] host / dir / prefix

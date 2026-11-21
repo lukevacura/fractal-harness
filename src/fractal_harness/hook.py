@@ -3,9 +3,11 @@
   prompt     (UserPromptSubmit) before acting: inject the enforced RULES that govern the code
              the task likely touches (repo-wide rules, rules governing files linked to the
              prompt), then verified FACTS matching the prompt, each with its evidence.
-  pre-edit   (PreToolUse on Edit/Write/MultiEdit) while acting: apply the proposed edit in
-             memory and run the enforced rules that scan that file; a violating edit is
-             blocked before it is written.
+  pre-edit   (PreToolUse on Edit/Write/MultiEdit/NotebookEdit/Bash) while acting: block any write
+             to the rule store or fractal.toml that bypasses the CLI, and any agent run of a
+             human-only CLI verb (store_guard.py, heuristic for Bash); then
+             apply a proposed Edit/Write/MultiEdit in memory and run the enforced rules that
+             scan that file; a violating edit is blocked before it is written.
   edit       (PostToolUse) backstop after any edit: re-check the rules that scan the file,
              including command probes the in-memory check cannot run.
   session    (SessionStart) the static instructions, once per session (and again after a compaction), so the
@@ -26,6 +28,7 @@ import os
 import sys
 from pathlib import Path
 
+from . import store_guard
 from .authority import effective, overrides_note
 from .cache import STORE_DIR, ClaimCache, dependencies, store_root
 from .probes import VACUOUS
@@ -486,6 +489,15 @@ def _governing_rules(cache: ClaimCache, rel: str, set_aside: dict | None = None)
     return [e for e in enforced if e.probe and not is_slow(e.probe) and affects(dependencies(e), rel)]
 
 
+def _drift_messages(cache: ClaimCache, rules_: list[Edge]) -> list[str]:
+    """Governing rules changed outside the CLI (rules.py `drifted`): their probe is not what a human accepted, so the
+    edit is not checked against it; stop and ask."""
+    from .rules import drifted
+    return [f"  [{e.id}] {e.post}\n    this enforced rule was changed outside the fractal CLI (its content is not "
+            f"revision {pinned}, which was accepted), so it cannot be trusted to check this edit. Stop and ask the "
+            "user: they restore the store, or re-accept the rule." for e, pinned in drifted(cache.store, rules_)]
+
+
 def edit_violations(root: Path, rel: str) -> tuple[int, list[str]]:
     """After an edit: re-check the enforced rules that scan `rel`; update their status."""
     from . import probes
@@ -493,7 +505,7 @@ def edit_violations(root: Path, rel: str) -> tuple[int, list[str]]:
     try:
         beat: dict = {}
         rules = _governing_rules(cache, rel, beat)
-        messages = []
+        messages = _drift_messages(cache, rules)
         for e in rules:
             result = probes.run(e.probe, cache.root)
             if not result.passed:
@@ -543,9 +555,10 @@ def pre_edit_violations(root: Path, rel: str, content: str, generated: int = 0,
     cache = ClaimCache(root, run_slow=False)
     try:
         beat: dict = {}
-        rules = [e for e in _governing_rules(cache, rel, beat) if _in_memory_checkable(e.probe)]
+        governing = _governing_rules(cache, rel, beat)
+        rules = [e for e in governing if _in_memory_checkable(e.probe)]
         overlay = {rel: content}
-        messages = []
+        messages = _drift_messages(cache, governing)
         for e in rules:
             result = probes.run(e.probe, cache.root, overlay)
             if not result.passed:
@@ -563,7 +576,7 @@ def pre_edit_violations(root: Path, rel: str, content: str, generated: int = 0,
 def _in_memory_checkable(probe: dict) -> bool:
     if probe.get("type") == "all":
         return all(_in_memory_checkable(p) for p in probe["probes"])
-    return probe.get("type") in ("grep", "only_in")
+    return probe.get("type") in ("grep", "only_in", "paths")
 
 
 def pre_edit_hook(stdin: str) -> tuple[int, str]:
@@ -574,7 +587,15 @@ def pre_edit_hook(stdin: str) -> tuple[int, str]:
     try:
         data = json.loads(stdin or "{}")
         tool = data.get("tool_name")
-        if tool not in ("Edit", "Write", "MultiEdit"):
+        if tool in store_guard.GUARDED_TOOLS:    # the store is written only through the CLI
+            root = _root(data)
+            cwd = Path(data.get("cwd") or root).resolve()
+            blocked = store_guard.check(tool, data.get("tool_input") or {}, cwd, root)
+            if blocked:
+                what, why, store = blocked
+                store_guard.log_block(store, tool, what, why)
+                return 2, store_guard.block_message(tool, what, why)
+        if tool not in ("Edit", "Write", "MultiEdit"):   # Bash and NotebookEdit stop here
             return 0, ""
         root = _root(data)
         if not _has_store(root):

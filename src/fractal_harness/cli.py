@@ -75,6 +75,118 @@ def _probe(args: argparse.Namespace) -> dict | None:
     return probe
 
 
+def _loss_note(root: Path, args) -> str:
+    """For a human decision that takes enforced rules out of force: whether it loses information (loss.py)."""
+    ids = (args.ids if args.cmd == "reject" else [args.id] if args.cmd == "override" and not args.undo else [])
+    if not ids:
+        return ""
+    from .rules import global_loss
+    cache = ClaimCache(root)
+    try:
+        notes = []
+        for i in ids:
+            e = cache.store.get(i)
+            if e is None or not e.enforced:
+                continue
+            lost, by, why = global_loss(cache, e, None, leaves_enforced=True)
+            notes.append(f"[{i}] GLOBAL LOSS: {why}" if lost else f"[{i}] no information loss: absorbed by {', '.join(by)}")
+        return ("\n  " + "\n  ".join(notes)) if notes else ""
+    finally:
+        cache.close()
+
+
+def _proposal_findings(cache, e, with_state: bool = True) -> list[str]:
+    """What a human should know about a proposal before ruling on it: it is violated now, or it contradicts another
+    rule (onboarding surfaces these instead of dropping the rule)."""
+    from .authority import contradiction
+    from .regions import tracked_files
+    out = []
+    if with_state and e.status == "failed":
+        out.append(f"VIOLATED NOW: {e.detail}. Fix the code, or propose it with --debt to keep it as a ratchet")
+    files = None
+    for o in cache.store.all():
+        if o.id == e.id or o.kind != "invariant" or o.rule_state not in ("enforced", "proposed"):
+            continue
+        files = tracked_files(cache.root) if files is None else files
+        c = contradiction(o.probe, e.probe, files)
+        if c and c.kind != "unseen":
+            out.append(f"{'CONTRADICTS' if c.sound else 'may conflict with'} {o.rule_state} rule [{o.id}] "
+                       f"\"{o.post[:60]}\": {c.why}" + ("" if c.sound else " (heuristic)"))
+    return out
+
+
+def _lift_preview(root: Path, args) -> str:
+    """Check a lift before asking the human, and say what it changes: both probes' results now, and the loss."""
+    from . import probes
+    from .rules import global_loss
+    new = json.loads(args.probe)
+    probes.validate(new)
+    cache = ClaimCache(root)
+    try:
+        e = cache.store.get(args.id)
+        if e is None or e.kind != "invariant":
+            raise CacheError(f"{args.id} is not an invariant")
+        if e.rule_state not in ("enforced", "proposed"):
+            raise CacheError(f"{args.id} is {e.rule_state}: only an enforced or proposed rule's probe is lifted")
+        old_r = probes.run(e.probe, root) if e.probe else probes.ProbeResult(True, "no probe: nothing checks it")
+        new_r = probes.run(new, root)
+        if not new_r.passed or new_r.vacuous:
+            raise CacheError(f"the new probe must pass on the current tree and check something: {new_r.detail}")
+        if not old_r.passed:
+            raise CacheError(f"the rule is violated now ({old_r.detail}): fix the code before changing how it is checked")
+        lost, by, why = global_loss(cache, e, new, leaves_enforced=False)
+        verdict = f"GLOBAL LOSS: {why}" if lost else f"no information loss: absorbed by {', '.join(by)}"
+        return (f"\n  old probe: {json.dumps(e.probe)}\n    now: {old_r.detail}"
+                f"\n  new probe: {json.dumps(new)}\n    now: {new_r.detail}\n  {verdict}")
+    finally:
+        cache.close()
+
+
+def _changed_probe(root: Path, args) -> dict | None:
+    """`fractal change`'s new probe (None for --drop), checked: it must run, pass now and check something."""
+    from . import probes
+    if args.drop:
+        return None
+    new = json.loads(args.probe)
+    probes.validate(new)
+    r = probes.run(new, root)
+    if not r.passed or r.vacuous:
+        raise CacheError(f"the new probe must pass on the current tree and check something: {r.detail}")
+    return new
+
+
+def _change_preview(root: Path, args) -> str:
+    """What a change newly forbids and newly allows (loss.change), for the human's confirmation."""
+    from .loss import change
+    new = _changed_probe(root, args)
+    cache = ClaimCache(root)
+    try:
+        e = cache.store.get(args.id)
+        if e is None or not e.enforced:
+            raise CacheError(f"{args.id} is not an enforced rule")
+        d = change(cache, {e.id: new})
+        lines = [f"+ newly enforces: {p.what}" for p in d.forbids]
+        lines += [f"+ newly enforces (not comparable): {w}" for _, w in d.unknown_forbids]
+        lines += [f"- newly allows: {p.what}" for p in d.allows]
+        lines += [f"- newly allows (not provable): {w}" for _, w in d.unknown_allows]
+        verdict = "no information loss" if d.lossless else "GLOBAL LOSS"
+        return "\n  " + "\n  ".join([*lines, verdict])
+    finally:
+        cache.close()
+
+
+def _human_gate(root: Path, what: str, yes: bool):
+    """A lazy root confirmation for decisions that only sometimes need a human (conflicts): called when one does."""
+    def gate() -> bool:
+        from .root_signal import RootSignalError, confirm
+        try:
+            confirm(root, what, yes)
+        except RootSignalError as e:
+            raise CacheError(str(e)) from e
+        return True
+    return gate
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="fractal", description=__doc__)
     p.add_argument("--root", help="target repo (default: $FRACTAL_ROOT or enclosing git repo)")
@@ -85,6 +197,30 @@ def main(argv: list[str] | None = None) -> int:
     pr = sub.add_parser("propose", help="propose an invariant (a rule the code must follow); a human accepts it")
     pr.add_argument("rule", help="the rule, stated so a violation is unambiguous")
     _probe_args(pr, "json probe that fails when the rule is violated")
+    pr.add_argument("--debt", action="store_true",
+                    help="the code breaks the rule today: keep it with each absent/max bound at today's count "
+                         "(lowered by `fractal ratchet`, never raised) instead of dropping it")
+    qu = sub.add_parser("queue", help="every decision awaiting a human, as the net change in information: what each "
+                                      "would newly forbid and newly allow (fresh verdicts)")
+    qu.add_argument("--slow", action="store_true", help="also re-run slow probes (commands, tests)")
+    rt = sub.add_parser("ratchet", help="lower a debt rule's bounds to today's counts (loses nothing: any layer may)")
+    rt.add_argument("ids", nargs="+")
+    rt.add_argument("--by", default="agent", help="who is ratcheting (recorded)")
+    lf = sub.add_parser("lift", help="(human) replace a rule's probe, e.g. a shell command by a typed probe the "
+                                     "checker can reason about; shows both results and whether information is lost")
+    lf.add_argument("id")
+    lf.add_argument("--probe", required=True, help="the new json probe")
+    lf.add_argument("--reason", required=True)
+    lf.add_argument("--yes", action="store_true", help="under root_signal = \"flag\": allow a non-interactive terminal")
+    ch = sub.add_parser("change", help="change an enforced rule's probe, or stop enforcing it, judged by one law: an "
+                                       "agent (--by NODE) only with no loss, standing and its own region; else the human")
+    ch.add_argument("id")
+    chw = ch.add_mutually_exclusive_group(required=True)
+    chw.add_argument("--probe", help="the new json probe")
+    chw.add_argument("--drop", action="store_true", help="stop enforcing it (demoted with history, not deleted)")
+    ch.add_argument("--by", default="root", metavar="NODE|root", help="the layer making the change (default: root, the human)")
+    ch.add_argument("--reason", required=True)
+    ch.add_argument("--yes", action="store_true", help="under root_signal = \"flag\": allow a non-interactive terminal")
     inv = sub.add_parser("invariants", help="list invariants by state: proposed, enforced, rejected")
     inv.add_argument("--state", choices=["proposed", "enforced", "rejected", "overridden"])
     inv.add_argument("--audit", action="store_true", help="show each rule's probe audit verdict")
@@ -102,6 +238,9 @@ def main(argv: list[str] | None = None) -> int:
     ov.add_argument("--reason", required=True)
     ov.add_argument("--undo", action="store_true", help="restore an overridden rule")
     ov.add_argument("--yes", action="store_true", help="allow a non-interactive terminal (scripts)")
+    pn = sub.add_parser("pin", help="(human) pin the revisions of rules ruled on before revisions were recorded, "
+                                    "and the policy keys in fractal.toml that decide who may change rules")
+    pn.add_argument("--yes", action="store_true", help="under root_signal = \"flag\": allow a non-interactive terminal")
     cf = sub.add_parser("conflict", help="contradiction as the signal: a local rule that clashes with, or keeps blocking "
                                          "work under, a higher layer is decided by the parent's agent (human only at root)")
     cfs = cf.add_subparsers(dest="conflict_cmd", required=True)
@@ -242,7 +381,7 @@ def main(argv: list[str] | None = None) -> int:
     cn = sub.add_parser("concepts", help="the registry of single-ownership claims: concept -> owner -> still true?")
     cn.add_argument("--write", metavar="FILE", help="also save it as markdown")
     rc = sub.add_parser("reclaim", help="propose (and with --verify/--apply, carry out) deleting what nothing reaches")
-    rc.add_argument("--class", dest="classes", action="append", choices=["metadata", "code", "store"],
+    rc.add_argument("--class", dest="classes", action="append", choices=["rules", "metadata", "code", "store"],
                     help="only this class (repeatable; default all)")
     rc.add_argument("--verify", action="store_true", help="run each code deletion in a scratch worktree with --cmd")
     rc.add_argument("--apply", action="store_true", help="write what is reclaimable to the working tree (implies --verify "
@@ -442,25 +581,87 @@ def main(argv: list[str] | None = None) -> int:
             counts = {v: sum(a.verdict == v for a in results) for v in ("ok", "partial", "weak", "n/a")}
             print(" ".join(f"{k}={v}" for k, v in counts.items()))
         return 1 if any(a.verdict == "weak" for a in results) else 0
-    human_only = (args.cmd == "reject" or (args.cmd == "accept" and not args.as_node)
-                  or (args.cmd == "override" and args.by == "root"))
-    if human_only and not (sys.stdin.isatty() or args.yes):
-        print(f"error: `fractal {args.cmd}` is a human decision; run it in an interactive terminal "
-              "(or pass --yes from a script you control)", file=sys.stderr)
-        return 2
+    human_only = (args.cmd in ("reject", "pin", "lift") or (args.cmd == "accept" and args.as_node in (None, "", "root"))
+                  or (args.cmd in ("override", "change") and args.by == "root"))
+    if args.cmd in ("lift", "change") and human_only:
+        try:
+            lift_note = (_lift_preview if args.cmd == "lift" else _change_preview)(root, args)
+        except (CacheError, ProbeError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    if human_only:
+        from .root_signal import RootSignalError, confirm
+        what = f"{args.cmd} " + (" ".join(args.ids) if hasattr(args, "ids") else getattr(args, "id", "") or
+                                 "unpinned rule revisions and the policy")
+        try:
+            confirm(root, (what.strip() + (lift_note if args.cmd in ("lift", "change") else _loss_note(root, args))),
+                    args.yes)
+        except RootSignalError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
 
     cache = ClaimCache(root)
     try:
         if args.cmd == "propose":
-            e = cache.put(args.rule, args.read, kind="invariant", probe=_probe(args))
+            probe = _probe(args)
+            if args.debt:
+                from .debt import DebtError, to_debt
+                if probe is None:
+                    raise CacheError("--debt needs a probe")
+                try:
+                    probe, notes = to_debt(probe, root)
+                except DebtError as x:
+                    raise CacheError(str(x)) from x
+            e = cache.put(args.rule, args.read, kind="invariant", probe=probe)
             _emit(args, [e])
-            if not args.json and e.rule_state == "proposed":
-                print(f"{'':20}proposed; a human enforces it with: fractal accept {e.id}")
+            if not args.json:
+                for n in notes if args.debt else []:
+                    print(f"{'':20}debt: {n}")
+                for f in _proposal_findings(cache, e):
+                    print(f"{'':20}{f}")
+                if e.rule_state == "proposed":
+                    print(f"{'':20}proposed; a human enforces it with: fractal accept {e.id}")
+        elif args.cmd == "queue":
+            from . import decisions
+            its = decisions.items(cache, root, slow=args.slow)
+            print(json.dumps([i.to_dict() for i in its], indent=2) if args.json else decisions.render(its), end="" if not args.json else "\n")
+        elif args.cmd == "ratchet":
+            from . import rules as rules_mod
+            from .authority import judge
+            from .debt import DebtError, outstanding, ratcheted
+            from .authority import _pure_ratchet
+            todo = []                         # every rule is checked before any is changed: all or nothing
+            for i in args.ids:
+                e = cache.store.get(i)
+                if e is None or e.kind != "invariant" or not outstanding(e.probe):
+                    raise CacheError(f"{i} is not a debt rule (see `fractal propose --debt`)")
+                try:
+                    new, notes = ratcheted(e.probe, root)
+                except DebtError as x:
+                    raise CacheError(f"{i}: {x}") from x
+                if not notes:
+                    print(f"{i}  unchanged: no count went down")
+                    continue
+                if e.rule_state == "proposed":     # a proposal is not in force: tightening it changes no rule
+                    if not _pure_ratchet(e.probe, new):
+                        raise CacheError(f"{i}: not a ratchet")
+                else:
+                    judge(cache, args.by, {i: new}, what=f"ratcheting [{i}]")    # the law: a pure ratchet, checked
+                todo.append((i, new, notes))
+            for i, new, notes in todo:
+                rules_mod.change_probe(cache, i, new, actor=args.by, action="ratchet", reason="; ".join(notes))
+                print(f"{i}  ratcheted: {'; '.join(notes)}")
+        elif args.cmd == "lift":
+            from . import rules as rules_mod
+            e = rules_mod.change_probe(cache, args.id, json.loads(args.probe), actor="human", action="lift",
+                                       reason=args.reason)
+            h = cache.store.rule_history(e.id)[-1]["detail"]
+            print(f"{e.id}  lifted ({'no information loss' if not h['loss'] else 'recorded as a loss'}): {e.post}")
         elif args.cmd in ("accept", "reject"):
             from . import authority
             state = "enforced" if args.cmd == "accept" else "rejected"
             for i in args.ids:
-                if args.cmd == "accept" and args.as_node:
+                if args.cmd == "accept" and args.as_node not in (None, "", "root"):
                     from .config import load as load_config
                     r = authority.accept_as(cache, root, i, args.as_node, load_config(root).accept_policy)
                     e, state = r["edge"], f"enforced@{args.as_node}"
@@ -469,17 +670,54 @@ def main(argv: list[str] | None = None) -> int:
                     if r["audit"]:
                         print(f"{'':20}audit (advisory): {r['audit']['verdict']} {'; '.join(r['audit']['findings'])}")
                 else:
-                    e = cache.set_rule(i, state)
-                    if args.cmd == "accept":
-                        authority.record_human_accept(cache, i)
+                    e = cache.set_rule(i, state)      # the human's step; recorded through the door (rules.py)
                 print(f"{e.id}  {state}: {e.post}" + (f"  (currently {e.status}: {e.detail})"
                                                        if e.status != "verified" else ""))
+        elif args.cmd == "pin":
+            from . import rules
+            from .config import load as load_config, policy_values, read_pin, write_pin
+            enforced = cache.invariants(("enforced",))
+            todo, drifted = rules.unpinned(cache.store, enforced), rules.drifted(cache.store, enforced)
+            for e in todo:
+                rules.pin(cache.store, e.id)
+                print(f"pinned   {e.id}  revision {rules.revision(e)}: {e.post[:90]}")
+            for e, pinned in drifted:
+                print(f"skipped  {e.id}  changed outside the CLI since revision {pinned} was accepted: not pinned. "
+                      f"Restore the store, or re-accept it (`fractal accept {e.id}`) once you have read it: {e.post[:60]}")
+            before = read_pin(root)
+            after = write_pin(root)
+            changed = [k for k in ("accept_policy", "human_nodes", "root_signal")
+                       if not before or before.get(k) != after[k]]
+            print(f"policy   pinned {', '.join(f'{k} = {after[k]!r}' for k in ('accept_policy', 'human_nodes', 'root_signal'))}"
+                  + (f" (changed: {', '.join(changed)})" if before and changed else ""))
+            print(f"{len(todo)} rule revision(s) pinned, {len(enforced) - len(todo) - len(drifted)} already pinned, "
+                  f"{len(drifted)} skipped")
+        elif args.cmd == "change":
+            from . import rules as rules_mod
+            from .authority import judge
+            from .config import load as load_config
+            new = _changed_probe(root, args)
+            if args.by != "root":
+                judge(cache, args.by, {args.id: new}, policy=load_config(root).accept_policy,
+                      what=f"{args.by} changing [{args.id}]")
+            actor = "human" if args.by == "root" else args.by
+            if new is None:
+                e = cache.store.get(args.id)
+                e = rules_mod.transition(cache, args.id, "overridden", authority=e.layer, actor=actor, action="change",
+                                         reason=args.reason)
+            else:
+                e = rules_mod.change_probe(cache, args.id, new, actor=actor, action="change", reason=args.reason)
+                cache.check(e.id)
+            h = cache.store.rule_history(e.id)[-1]["detail"]
+            print(f"{e.id}  {'dropped' if new is None else 'changed'} "
+                  f"({'no information loss' if not h['loss'] else 'recorded as a loss'}): {e.post}")
         elif args.cmd == "override":
             from . import authority
             from .config import load as load_config
             e = authority.override(cache, args.id, args.by, args.reason, load_config(root).accept_policy, args.undo)
             print(f"{e.id}  {e.rule_state}{'' if args.undo else ' (demoted, not deleted)'}: {e.post}")
         elif args.cmd == "invariants":
+            from .debt import summary as debt_summary
             from .ledger import mutation_checked
             from .probes import evidence_class, evidence_gap
             rules = cache.invariants((args.state,) if args.state else ("proposed", "enforced", "rejected", "overridden"))
@@ -511,6 +749,11 @@ def main(argv: list[str] | None = None) -> int:
                         print(f"{'':20}OVERRIDDEN by {h['who']}: {h['reason']}  (held by {e.layer}; `fractal override --undo` restores)")
                     if gap := evidence_gap(e.probe):
                         print(f"{'':20}gap: {gap}")
+                    if d := debt_summary(e.probe):
+                        print(f"{'':20}debt: {d} (`fractal ratchet {e.id}` lowers it)")
+                    if e.rule_state == "proposed":
+                        for f in _proposal_findings(cache, e, with_state=False):
+                            print(f"{'':20}{f}")
                     if by := checked(e):
                         print(f"{'':20}mutation-checked by {', '.join(by)}")
                     if e.status != "verified":
@@ -610,7 +853,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  {line}")
         elif args.cmd == "reclaim":
             from . import reclaim
-            cands = reclaim.sweep(cache, root, set(args.classes or ["metadata", "code", "store"]), args.branches)
+            cands = reclaim.sweep(cache, root, set(args.classes or ["rules", "metadata", "code", "store"]), args.branches)
             info = None
             if (args.verify or args.apply) and any(c.cls == "code" for c in cands):
                 cmd = args.test_cmd or os.environ.get("FRACTAL_MUTATE_CMD")
@@ -729,7 +972,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(text, end="")
         elif args.cmd == "conflict":
             from . import conflict
-            human = sys.stdin.isatty() or getattr(args, "yes", False)
+            human = _human_gate(root, f"conflict {args.conflict_cmd} {getattr(args, 'id', '')}".strip(),
+                                getattr(args, "yes", False))
             cc = args.conflict_cmd
             if cc == "list":
                 items = conflict.pending(cache, root)

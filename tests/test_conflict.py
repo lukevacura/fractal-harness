@@ -34,6 +34,13 @@ def _local(tmp_path, threshold=3, days=14, extra=""):
     return c, e
 
 
+def _absorber(c):
+    """A root rule that forbids what mid's local rule does: dropping or narrowing mid's rule then loses nothing."""
+    k = _propose(c, "f is defined in mid (root)", {**HAS_DEF})
+    c.set_rule(k.id, "enforced")
+    return k
+
+
 def _leaf(tmp_path, c):
     """A third layer: leaf (parent mid) owning src/leaf.py."""
     (tmp_path / "src" / "leaf.py").write_text("def h():\n    return 3\n")
@@ -328,6 +335,9 @@ def test_narrow_refuses_a_rule_with_no_grep_probe(tmp_path):
 def test_override_demotes_the_local_rule_by_the_handler(tmp_path):
     c, e = _local(tmp_path)
     cid = _friction(tmp_path, c, e)
+    with pytest.raises(ConflictError, match="global loss"):
+        conflict.resolve(c, tmp_path, cid, "override", "rule was wrong")
+    _absorber(c)
     conflict.resolve(c, tmp_path, cid, "override", "rule was wrong")
     assert c.store.get(e.id).rule_state == "overridden"
     acts = [(h["action"], h["who"]) for h in c.store.rule_history(e.id)]

@@ -180,6 +180,11 @@ def _find(cache: ClaimCache, root: Path, cid: str) -> dict:
     raise ConflictError(f"{cid} is not a conflict awaiting a decision (see `fractal conflict list`)")
 
 
+def _confirmed(human) -> bool:
+    """`human` is a bool, or a callable the CLI passes that asks the root signal only when a decision needs it."""
+    return bool(human()) if callable(human) else bool(human)
+
+
 def _actor(c: dict, as_node: str | None, human: bool, cfg) -> str:
     if c["state"] == "awaiting_human":
         raise ConflictError(f"{c['id']} is an arbitration request: only a human can resolve it "
@@ -189,7 +194,7 @@ def _actor(c: dict, as_node: str | None, human: bool, cfg) -> str:
     if actor == ROOT or must_be_human:
         if actor != ROOT:
             raise ConflictError(f"{c['handler']} is flagged for a human (or is root): this takes a human decision")
-        if not human:
+        if not _confirmed(human):
             raise ConflictError("this is a human decision: run it in an interactive terminal (or pass --yes from a script you control)")
     elif actor != c["handler"]:
         raise ConflictError(f"{c['id']} is handled by {c['handler']}, not {actor}")
@@ -247,13 +252,16 @@ def resolve(cache: ClaimCache, root: Path, cid: str, action: str, reason: str, *
         raise ConflictError(f"{action} applies to an enforced rule; {e.id} is not one (use keep)")
     if action == "override":
         from .authority import override
-        override(cache, e.id, actor, reason, cfg.accept_policy)
+        try:
+            override(cache, e.id, actor, reason, cfg.accept_policy)
+        except ConflictError:
+            raise
+        except AuthorityError as x:
+            raise ConflictError(str(x)) from x
         _record(cache, c, "overridden", "override", actor, reason)
         return {**c, "state": "overridden"}
     if not exclude:
         raise ConflictError("narrow needs --exclude PATH (a path or glob the rule stops applying to)")
-    if actor != ROOT and not outranks(actor, e.layer, cache.store.all_nodes()):
-        raise ConflictError(f"{actor} does not outrank {e.layer}, which holds {e.id}")
     new = narrowed_probe(e.probe, exclude)
     try:
         r = probes.run(new, cache.root)
@@ -263,8 +271,15 @@ def resolve(cache: ClaimCache, root: Path, cid: str, action: str, reason: str, *
         raise ConflictError(f"refused: the narrowed probe would check nothing ({r.detail[len(probes.VACUOUS):]})")
     if not r.passed:
         raise ConflictError(f"refused: the narrowed rule would not hold now ({r.detail}); narrowing must leave a rule that checks something and passes")
+    if actor != ROOT:
+        from .authority import judge
+        try:
+            judge(cache, actor, {e.id: new}, policy=cfg.accept_policy, what=f"{actor} narrowing [{e.id}]")
+        except AuthorityError as x:
+            raise ConflictError(str(x)) from x
     old = e.probe
-    cache.store.set_probe(e.id, new)
+    from .rules import change_probe
+    change_probe(cache, e.id, new, actor=actor, action="narrow", reason=reason, detail={"exclude": sorted(exclude)})
     cache.check(e.id)
     _record(cache, c, "narrowed", "narrow", actor, reason, extra={"exclude": sorted(exclude), "old_probe": old, "new_probe": new})
     return {**c, "state": "narrowed"}
@@ -331,7 +346,7 @@ def arbitrate(cache: ClaimCache, cid: str, outcome: str, reason: str, *, human: 
     (do that with `fractal override`/`reject`/`accept`; this records the decision and why)."""
     if outcome not in ("upheld", "revised"):
         raise ConflictError("outcome must be upheld or revised")
-    if not human:
+    if not _confirmed(human):
         raise ConflictError("arbitration is a human decision: run it in an interactive terminal (or pass --yes from a script you control)")
     reason = _need_reason(reason)
     row = cache.store.conflict_get(cid)
